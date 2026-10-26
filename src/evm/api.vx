@@ -171,7 +171,7 @@ fn gas_fee(c: *mut Ctx, env: *mut VxEnv) -> U256 {
 }
 
 fn result_alloc() -> *mut VxResult {
-  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<VxResult>() as u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<VxResult>() as u64) };
   let r: *mut VxResult = raw;
   return r;
 }
@@ -188,9 +188,9 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
     if (acc_flags(c, i) & mask) != 0u64 { na = na + 1u64; }
     i = i + 1u64;
   }
-  let araw: *mut i8 = unsafe { calloc(na + 1u64, sizeof<OutAccount>() as u64) };
+  let araw: *mut i8 = unsafe { vx_calloc(na + 1u64, sizeof<OutAccount>() as u64) };
   let accs: *mut OutAccount = araw;
-  let sraw: *mut i8 = unsafe { calloc(cx.sl_n + 1u64, sizeof<OutSlot>() as u64) };
+  let sraw: *mut i8 = unsafe { vx_calloc(cx.sl_n + 1u64, sizeof<OutSlot>() as u64) };
   let slots: *mut OutSlot = sraw;
   let mut ai: u64 = 0u64;
   let mut so: u64 = 0u64;
@@ -222,7 +222,7 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
   r.slots = slots;
   r.slot_count = so;
   // Logs.
-  let lraw: *mut i8 = unsafe { calloc(cx.lg_n + 1u64, sizeof<OutLog>() as u64) };
+  let lraw: *mut i8 = unsafe { vx_calloc(cx.lg_n + 1u64, sizeof<OutLog>() as u64) };
   let logs: *mut OutLog = lraw;
   let mut li: u64 = 0u64;
   while li < cx.lg_n {
@@ -241,8 +241,7 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
   r.log_count = cx.lg_n;
 }
 
-pub fn evmvx_transact(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
-  let c: *mut Ctx = ctx_new(host, env);
+fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let e: &mut VxEnv = unsafe { &mut env[0u64] };
   let tabs: *mut OpTabs = tabs_new(e.spec);
   let res: *mut VxResult = result_alloc();
@@ -374,7 +373,7 @@ fn run_tx_call(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: *m
   }
   let input: *mut u8 = dup_bytes(e.data, e.data_len);
   let pid: u64 = precompile_id(to, c);
-  let oraw: *mut i8 = unsafe { calloc(1u64, sizeof<ChildOut>() as u64) };
+  let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
   let o: *mut ChildOut = oraw;
   if pid != 0u64 {
     run_child_precompile(c, pid, input, e.data_len, gas, o);
@@ -410,7 +409,7 @@ fn run_tx_call(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: *m
   r.output_len = oc.out_len;
   mfree(oc.out);
   mfree(input);
-  unsafe { free(oraw); }
+  unsafe { vx_free(oraw); }
 }
 
 // Runs a top-level contract creation.
@@ -487,9 +486,9 @@ pub fn evmvx_result_free(res: *mut VxResult) -> void {
   let a: *mut i8 = r.accounts;
   let s: *mut i8 = r.slots;
   let l: *mut i8 = r.logs;
-  unsafe { free(a); free(s); free(l); }
+  unsafe { vx_free(a); vx_free(s); vx_free(l); }
   let rp: *mut i8 = res;
-  unsafe { free(rp); }
+  unsafe { vx_free(rp); }
 }
 
 // Struct sizes the Vx side sees, for a layout check against the Rust harness.
@@ -509,8 +508,7 @@ pub fn evmvx_abi_sizes(out: *mut u64) -> void {
 // env.gas_limit gas, without validation, fees, nonce bump, authorizations or
 // refunds. Used by the block layer for EIP-2935, EIP-4788, EIP-7002 and
 // EIP-7251.
-pub fn evmvx_system_call(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
-  let c: *mut Ctx = ctx_new(host, env);
+fn system_call_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let e: &mut VxEnv = unsafe { &mut env[0u64] };
   let tabs: *mut OpTabs = tabs_new(e.spec);
   let res: *mut VxResult = result_alloc();
@@ -528,4 +526,30 @@ pub fn evmvx_system_call(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
   finalize_state(c);
   collect_state(c, res);
   return res;
+}
+
+// Entry points. The host variants read state through the evmvx_host_*
+// callbacks; the db variants read it from a StateDb and make no host calls.
+
+pub fn evmvx_transact(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
+  return transact_with(ctx_new(host, env), env);
+}
+
+pub fn evmvx_system_call(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
+  return system_call_with(ctx_new(host, env), env);
+}
+
+fn ctx_new_db(db: *mut StateDb, env: *mut VxEnv) -> *mut Ctx {
+  let c: *mut Ctx = ctx_new(null_i8(), env);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  cx.db = db;
+  return c;
+}
+
+pub fn evmvx_transact_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
+  return transact_with(ctx_new_db(db, env), env);
+}
+
+pub fn evmvx_system_call_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
+  return system_call_with(ctx_new_db(db, env), env);
 }

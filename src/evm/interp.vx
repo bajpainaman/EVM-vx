@@ -1,12 +1,36 @@
 // The interpreter loop: fetch, charge static gas, check the stack, dispatch.
 
-fn run_frame(c: *mut Ctx, f: *mut Frame) -> u64 {
-  let traw: *mut i8 = unsafe { calloc(2u64, 8u64) };
+// Runs `root` and every frame it calls on an explicit frame stack, so the
+// native stack depth stays constant whatever the call depth. A CALL/CREATE
+// suspends its frame (R_SUSPEND) with the child linked from it; when a child
+// ends, its parent resumes from the saved continuation. Returns root's result.
+fn run_frame(c: *mut Ctx, root: *mut Frame) -> u64 {
+  let traw: *mut i8 = unsafe { vx_calloc(2u64, 8u64) };
   let tmp: *mut u64 = traw;
-  let sraw: *mut i8 = unsafe { calloc(1u64, sizeof<SdResult>() as u64) };
+  let sraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<SdResult>() as u64) };
   let sd: *mut SdResult = sraw;
-  let res: u64 = run_loop(c, f, tmp, sd);
-  unsafe { free(traw); free(sraw); }
+  let root_depth: u64 = frame_depth(root);
+  let mut cur: *mut Frame = root;
+  let mut res: u64 = R_STOP;
+  let mut unwinding: bool = false;
+  loop {
+    if unwinding { res = R_FATAL; } else { res = run_loop(c, cur, tmp, sd); }
+    if res == R_SUSPEND {
+      let fr: &mut Frame = unsafe { &mut cur[0u64] };
+      let child: *mut Frame = fr.k_child;
+      let cr: &mut Frame = unsafe { &mut child[0u64] };
+      cr.parent = cur;
+      cur = child;
+    } else {
+      if frame_depth(cur) == root_depth { break; }
+      let cf: &mut Frame = unsafe { &mut cur[0u64] };
+      let parent: *mut Frame = cf.parent;
+      resume_parent(c, parent, cur, res);
+      cur = parent;
+      if is_fatal(c) { unwinding = true; }
+    }
+  }
+  unsafe { vx_free(traw); vx_free(sraw); }
   return res;
 }
 

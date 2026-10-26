@@ -377,7 +377,7 @@ fn ripemd_block(h: *mut u64, blk: *mut u8) -> void {
 
 // RIPEMD-160 of n bytes at p, written as 20 bytes to out.
 fn ripemd160(p: *mut u8, n: u64, out: *mut u8) -> void {
-  let hraw: *mut i8 = unsafe { calloc(5u64, 8u64) };
+  let hraw: *mut i8 = unsafe { vx_calloc(5u64, 8u64) };
   let h: *mut u64 = hraw;
   unsafe { h[0u64] = 1732584193u64; }
   unsafe { h[1u64] = 4023233417u64; }
@@ -422,7 +422,7 @@ fn ripemd160(p: *mut u8, n: u64, out: *mut u8) -> void {
     i = i + 1u64;
   }
   mfree(last);
-  unsafe { free(hraw); }
+  unsafe { vx_free(hraw); }
 }
 
 // 0x03: 600 + 120 per word; the 20-byte hash is left padded to 32 bytes.

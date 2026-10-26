@@ -97,7 +97,7 @@ def main():
     w('')
     w('// RIPEMD-160 of n bytes at p, written as 20 bytes to out.')
     w('fn ripemd160(p: *mut u8, n: u64, out: *mut u8) -> void {')
-    w('  let hraw: *mut i8 = unsafe { calloc(5u64, 8u64) };')
+    w('  let hraw: *mut i8 = unsafe { vx_calloc(5u64, 8u64) };')
     w('  let h: *mut u64 = hraw;')
     for i, v in enumerate(H0):
         w(f'  unsafe {{ h[{i}u64] = {v}u64; }}')
@@ -139,7 +139,7 @@ def main():
     i = i + 1u64;
   }
   mfree(last);
-  unsafe { free(hraw); }
+  unsafe { vx_free(hraw); }
 }
 
 // 0x03: 600 + 120 per word; the 20-byte hash is left padded to 32 bytes.

@@ -21,9 +21,83 @@ pub struct Host {
     /// Known block hashes by number (blockchain tests). Missing numbers fall
     /// back to revm EmptyDB's keccak256 of the decimal number.
     pub block_hashes: HashMap<u64, B256>,
+    /// Address of an attached Vx StateDb (EVMVX_DB=1 mode), or 0. When set,
+    /// transactions run with a null host, so a stray callback would crash.
+    pub db: usize,
+}
+
+/// Frees an attached db. Hosts are only cloned before attach_db, so no two
+/// hosts share one.
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.detach_db();
+    }
+}
+
+/// EVMVX_DB=1 runs the engine on a Vx-side StateDb instead of host callbacks.
+pub fn db_mode() -> bool {
+    std::env::var_os("EVMVX_DB").is_some()
 }
 
 impl Host {
+    /// Loads this state into a fresh Vx StateDb and attaches it.
+    pub fn attach_db(&mut self) {
+        unsafe {
+            let db = evmvx_db_new();
+            for (a, acc) in &self.accounts {
+                let aw: Word = (*a).into();
+                let bw: Word = acc.balance.into();
+                evmvx_db_put_account(db, &aw, &bw, acc.nonce, acc.code.as_ptr(), acc.code.len() as u64);
+                for (k, v) in &acc.storage {
+                    let kw: Word = (*k).into();
+                    let vw: Word = (*v).into();
+                    evmvx_db_put_slot(db, &aw, &kw, &vw);
+                }
+            }
+            for (n, h) in &self.block_hashes {
+                let hw: Word = (*h).into();
+                evmvx_db_put_block_hash(db, *n, &hw);
+            }
+            self.db = db as usize;
+        }
+    }
+
+    pub fn detach_db(&mut self) {
+        if self.db != 0 {
+            unsafe { evmvx_db_free(self.db as *mut c_void) };
+            self.db = 0;
+        }
+    }
+
+    /// Runs one transaction through the db or the host callbacks.
+    pub fn transact(&mut self, env: &VxEnv) -> *mut VxResult {
+        unsafe {
+            if self.db != 0 {
+                evmvx_transact_db(self.db as *mut c_void, env)
+            } else {
+                evmvx_transact(self as *mut Host as *mut c_void, env)
+            }
+        }
+    }
+
+    pub fn system_call(&mut self, env: &VxEnv) -> *mut VxResult {
+        unsafe {
+            if self.db != 0 {
+                evmvx_system_call_db(self.db as *mut c_void, env)
+            } else {
+                evmvx_system_call(self as *mut Host as *mut c_void, env)
+            }
+        }
+    }
+
+    pub fn set_block_hash(&mut self, n: u64, h: B256) {
+        self.block_hashes.insert(n, h);
+        if self.db != 0 {
+            let hw: Word = h.into();
+            unsafe { evmvx_db_put_block_hash(self.db as *mut c_void, n, &hw) };
+        }
+    }
+
     pub fn insert(&mut self, a: Address, balance: U256, nonce: u64, code: Bytes, storage: HashMap<U256, U256>) {
         let code_hash = if code.is_empty() { KECCAK_EMPTY } else { keccak256(&code) };
         self.accounts.insert(a, Acct { balance, nonce, code_hash, code, storage });
@@ -32,6 +106,11 @@ impl Host {
     /// revm Journal::balance_incr followed by a commit: the account is loaded
     /// and touched, so after EIP-161 an empty account is removed.
     pub fn balance_incr(&mut self, a: Address, amount: U256, eip161: bool) {
+        if self.db != 0 {
+            let aw: Word = a.into();
+            let mw: Word = amount.into();
+            unsafe { evmvx_db_balance_incr(self.db as *mut c_void, &aw, &mw, eip161 as u64) };
+        }
         match self.accounts.get_mut(&a) {
             Some(acc) => {
                 acc.balance += amount;
@@ -51,6 +130,14 @@ impl Host {
     /// Applies one transaction's account changes, following revm
     /// CacheState::apply_account_state.
     pub fn commit(&mut self, r: &VxResult) {
+        self.commit_rust(r);
+        // Last: db_apply replaces code buffers that r's pointers can alias.
+        if self.db != 0 {
+            unsafe { evmvx_db_apply(self.db as *mut c_void, r) };
+        }
+    }
+
+    fn commit_rust(&mut self, r: &VxResult) {
         let accounts = unsafe { slice(r.accounts, r.account_count) };
         let slots = unsafe { slice(r.slots, r.slot_count) };
         for a in accounts {

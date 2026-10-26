@@ -151,9 +151,9 @@ fn pc_blake2f(input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void
   if !pc_charge(out, rounds, gas_limit) { return; }
   let fb: u8 = unsafe { input[212u64] };
   if fb > 1u8 { pc_set(out, PC_ERROR, gas_limit, none, 0u64); return; }
-  let vraw: *mut i8 = unsafe { calloc(16u64, 8u64) };
+  let vraw: *mut i8 = unsafe { vx_calloc(16u64, 8u64) };
   let v: *mut u64 = vraw;
-  let mraw: *mut i8 = unsafe { calloc(16u64, 8u64) };
+  let mraw: *mut i8 = unsafe { vx_calloc(16u64, 8u64) };
   let m: *mut u64 = mraw;
   let mut i: u64 = 0u64;
   while i < 8u64 {
@@ -177,7 +177,7 @@ fn pc_blake2f(input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void
     let x: u64 = unsafe { v[14u64] };
     unsafe { v[14u64] = x ^ 18446744073709551615u64; }
   }
-  let hraw: *mut i8 = unsafe { calloc(8u64, 8u64) };
+  let hraw: *mut i8 = unsafe { vx_calloc(8u64, 8u64) };
   let h: *mut u64 = hraw;
   i = 0u64;
   while i < 8u64 {
@@ -203,6 +203,6 @@ fn pc_blake2f(input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void
     }
     i = i + 1u64;
   }
-  unsafe { free(vraw); free(mraw); free(hraw); }
+  unsafe { vx_free(vraw); vx_free(mraw); vx_free(hraw); }
   pc_set(out, PC_OK, rounds, o, 64u64);
 }

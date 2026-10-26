@@ -148,7 +148,7 @@ fn ecdsa_recover(h: U256, recid: u64, r: U256, s: U256, out20: *mut u8) -> bool 
   mfree(pk);
   mfree(hbuf);
   let bufx_raw: *mut i8 = bufx;
-  unsafe { free(bufx_raw); }
+  unsafe { vx_free(bufx_raw); }
   return true;
 }
 

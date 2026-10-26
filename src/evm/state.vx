@@ -60,6 +60,8 @@ struct LogMeta {
 
 struct Ctx {
   host: *mut i8,
+  // When set, state reads come from this Vx-side database, never the host.
+  db: *mut StateDb,
   env: *mut VxEnv,
   spec: u64,
   fatal: u64,
@@ -134,14 +136,14 @@ fn set_last_cold(c: *mut Ctx, v: bool) -> void {
 }
 
 fn calloc_words(n: u64) -> *mut U256 {
-  let raw: *mut i8 = unsafe { calloc(n, 32u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(n, 32u64) };
   let p: *mut U256 = raw;
   return p;
 }
 
 fn realloc_words(p: *mut U256, old_n: u64, new_n: u64) -> *mut U256 {
   let raw: *mut i8 = p;
-  let q: *mut i8 = unsafe { realloc(raw, new_n * 32u64) };
+  let q: *mut i8 = unsafe { vx_realloc(raw, new_n * 32u64) };
   let r: *mut U256 = q;
   let mut i: u64 = old_n;
   while i < new_n {
@@ -152,11 +154,11 @@ fn realloc_words(p: *mut U256, old_n: u64, new_n: u64) -> *mut U256 {
 }
 
 fn realloc_raw(p: *mut i8, size: u64) -> *mut i8 {
-  return unsafe { realloc(p, size) };
+  return unsafe { vx_realloc(p, size) };
 }
 
 fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
-  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<Ctx>() as u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Ctx>() as u64) };
   let c: *mut Ctx = raw;
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
   let e: &mut VxEnv = unsafe { &mut env[0u64] };
@@ -164,33 +166,33 @@ fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
   cx.env = env;
   cx.spec = e.spec;
   cx.scratch = calloc_words(8u64);
-  let ha: *mut i8 = unsafe { calloc(1u64, sizeof<HostAccount>() as u64) };
+  let ha: *mut i8 = unsafe { vx_calloc(1u64, sizeof<HostAccount>() as u64) };
   cx.hacc = ha;
   cx.ac_cap = 16u64;
   cx.ac_addr = calloc_words(16u64);
   cx.ac_bal = calloc_words(16u64);
   cx.ac_hash = calloc_words(16u64);
-  let am: *mut i8 = unsafe { calloc(16u64, sizeof<AcctMeta>() as u64) };
+  let am: *mut i8 = unsafe { vx_calloc(16u64, sizeof<AcctMeta>() as u64) };
   cx.ac_meta = am;
   cx.amap = map_new();
   cx.sl_cap = 16u64;
   cx.sl_key = calloc_words(16u64);
   cx.sl_orig = calloc_words(16u64);
   cx.sl_cur = calloc_words(16u64);
-  let sm: *mut i8 = unsafe { calloc(16u64, sizeof<SlotMeta>() as u64) };
+  let sm: *mut i8 = unsafe { vx_calloc(16u64, sizeof<SlotMeta>() as u64) };
   cx.sl_meta = sm;
   cx.smap = map_new();
   cx.ts_cap = 16u64;
   cx.ts_val = calloc_words(16u64);
   cx.tmap = map_new();
   cx.j_cap = 64u64;
-  let jr: *mut i8 = unsafe { calloc(64u64, sizeof<JEntry>() as u64) };
+  let jr: *mut i8 = unsafe { vx_calloc(64u64, sizeof<JEntry>() as u64) };
   cx.j = jr;
   cx.j_val = calloc_words(64u64);
   cx.lg_cap = 8u64;
   cx.lg_addr = calloc_words(8u64);
   cx.lg_topics = calloc_words(32u64);
-  let lm: *mut i8 = unsafe { calloc(8u64, sizeof<LogMeta>() as u64) };
+  let lm: *mut i8 = unsafe { vx_calloc(8u64, sizeof<LogMeta>() as u64) };
   cx.lg_meta = lm;
   cx.almap = map_new();
   cx.almap_slots = map_new();
@@ -472,7 +474,9 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
   let sp: *mut U256 = cx.scratch;
   unsafe { sp[0u64] = a; }
   let ha: *mut HostAccount = cx.hacc;
-  let st: u64 = unsafe { evmvx_host_account(cx.host, sp, ha) };
+  let mut st: u64 = HOST_MISSING;
+  if is_null_mut(cx.db) { st = unsafe { evmvx_host_account(cx.host, sp, ha) }; }
+  else { st = db_account(cx.db, a, ha); }
   let mut i: u64 = 0u64;
   if st == HOST_OK {
     let h: &mut HostAccount = unsafe { &mut ha[0u64] };
@@ -670,9 +674,13 @@ fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
     unsafe { sp[0u64] = a; sp[1u64] = k; }
     let kp: *mut U256 = offset_mut(sp, 1i64);
     let vp: *mut U256 = offset_mut(sp, 2i64);
-    let st: u64 = unsafe { evmvx_host_storage(cx.host, sp, kp, vp) };
-    if st == HOST_ERROR { set_fatal(c); }
-    v = unsafe { sp[2u64] };
+    if is_null_mut(cx.db) {
+      let st: u64 = unsafe { evmvx_host_storage(cx.host, sp, kp, vp) };
+      if st == HOST_ERROR { set_fatal(c); }
+      v = unsafe { sp[2u64] };
+    } else {
+      v = db_storage(cx.db, a, k);
+    }
   }
   let s: u64 = slot_push(c, i, a, k, v);
   if cold { journal_simple(c, J_STORAGE_WARMED, s); }

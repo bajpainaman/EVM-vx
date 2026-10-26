@@ -147,7 +147,7 @@ fn sha256_block(h: *mut u64, blk: *mut u8, wbuf: *mut u64) -> void {
 
 // SHA-256 of n bytes at p, written as 32 bytes to out.
 fn sha256(p: *mut u8, n: u64, out: *mut u8) -> void {
-  let hraw: *mut i8 = unsafe { calloc(8u64, 8u64) };
+  let hraw: *mut i8 = unsafe { vx_calloc(8u64, 8u64) };
   let h: *mut u64 = hraw;
   unsafe { h[0u64] = 1779033703u64; }
   unsafe { h[1u64] = 3144134277u64; }
@@ -157,7 +157,7 @@ fn sha256(p: *mut u8, n: u64, out: *mut u8) -> void {
   unsafe { h[5u64] = 2600822924u64; }
   unsafe { h[6u64] = 528734635u64; }
   unsafe { h[7u64] = 1541459225u64; }
-  let wraw: *mut i8 = unsafe { calloc(64u64, 8u64) };
+  let wraw: *mut i8 = unsafe { vx_calloc(64u64, 8u64) };
   let wbuf: *mut u64 = wraw;
   let mut off: u64 = 0u64;
   while n - off >= 64u64 {
@@ -192,7 +192,7 @@ fn sha256(p: *mut u8, n: u64, out: *mut u8) -> void {
     i = i + 1u64;
   }
   mfree(last);
-  unsafe { free(hraw); free(wraw); }
+  unsafe { vx_free(hraw); vx_free(wraw); }
 }
 
 // 0x02: 60 + 12 per word.

@@ -1,0 +1,356 @@
+// A Vx-side state database. With one attached (evmvx_transact_db), the engine
+// reads accounts, storage and block hashes from it and never calls back into
+// the host, so the core has no host calls in its execution path (GPU-ready).
+// It is also the committed-state base that Block-STM's multi-version store
+// will sit on.
+//
+// Storage clearing uses a per-account generation: a slot is visible only when
+// its generation matches its account's, so wiping an account's storage is O(1).
+
+struct DbAcct {
+  nonce: u64,
+  code: *mut u8,
+  code_len: u64,
+  gen: u64,
+  live: u64,
+}
+
+struct StateDb {
+  amap: *mut Map,
+  an: u64,
+  acap: u64,
+  aaddr: *mut U256,
+  abal: *mut U256,
+  ahash: *mut U256,
+  ameta: *mut DbAcct,
+  smap: *mut Map,
+  sn: u64,
+  scap: u64,
+  sval: *mut U256,
+  sgen: *mut u64,
+  bmap: *mut Map,
+  bn: u64,
+  bcap: u64,
+  bhash: *mut U256,
+}
+
+fn db_new() -> *mut StateDb {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<StateDb>() as u64) };
+  let db: *mut StateDb = raw;
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  d.amap = map_new();
+  d.acap = 16u64;
+  d.aaddr = calloc_words(16u64);
+  d.abal = calloc_words(16u64);
+  d.ahash = calloc_words(16u64);
+  let am: *mut i8 = unsafe { vx_calloc(16u64, sizeof<DbAcct>() as u64) };
+  d.ameta = am;
+  d.smap = map_new();
+  d.scap = 16u64;
+  d.sval = calloc_words(16u64);
+  let sg: *mut i8 = unsafe { vx_calloc(16u64, 8u64) };
+  d.sgen = sg;
+  d.bmap = map_new();
+  d.bcap = 16u64;
+  d.bhash = calloc_words(16u64);
+  return db;
+}
+
+// Index of the account record for address a, creating an empty dead record
+// when there is none.
+fn db_acc_slot(db: *mut StateDb, a: U256) -> u64 {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let found: u64 = map_get(d.amap, a, u256_zero());
+  if found != MAP_NONE { return found; }
+  if d.an == d.acap {
+    let nc: u64 = d.acap * 2u64;
+    d.aaddr = realloc_words(d.aaddr, d.acap, nc);
+    d.abal = realloc_words(d.abal, d.acap, nc);
+    d.ahash = realloc_words(d.ahash, d.acap, nc);
+    let old: *mut i8 = d.ameta;
+    let nm: *mut i8 = realloc_raw(old, nc * (sizeof<DbAcct>() as u64));
+    d.ameta = nm;
+    d.acap = nc;
+  }
+  let i: u64 = d.an;
+  let pa: *mut U256 = d.aaddr;
+  let pb: *mut U256 = d.abal;
+  let ph: *mut U256 = d.ahash;
+  unsafe { pa[i] = a; pb[i] = u256_zero(); ph[i] = keccak_empty(); }
+  let pm: *mut DbAcct = d.ameta;
+  let none: *mut u8 = null_u8();
+  unsafe { pm[i] = DbAcct { nonce: 0u64, code: none, code_len: 0u64, gen: 0u64, live: 0u64 }; }
+  d.an = i + 1u64;
+  map_put(d.amap, a, u256_zero(), i);
+  return i;
+}
+
+fn db_meta(db: *mut StateDb, i: u64) -> *mut DbAcct {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  return offset_mut(d.ameta, i as i64);
+}
+
+// Sets an account's fields; code is copied. The storage is kept.
+fn db_set_account(db: *mut StateDb, a: U256, bal: U256, nonce: u64, hash: U256, code: *mut u8, code_len: u64) -> void {
+  let i: u64 = db_acc_slot(db, a);
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let pb: *mut U256 = d.abal;
+  let ph: *mut U256 = d.ahash;
+  unsafe { pb[i] = bal; ph[i] = hash; }
+  let mp: *mut DbAcct = db_meta(db, i);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  m.nonce = nonce;
+  // Copy before freeing: a result's code pointer can be this very buffer.
+  let nc: *mut u8 = dup_bytes(code, code_len);
+  mfree(m.code);
+  m.code = nc;
+  m.code_len = code_len;
+  m.live = 1u64;
+}
+
+// Removes an account and all its storage.
+fn db_delete_account(db: *mut StateDb, a: U256) -> void {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let i: u64 = map_get(d.amap, a, u256_zero());
+  if i == MAP_NONE { return; }
+  let pb: *mut U256 = d.abal;
+  let ph: *mut U256 = d.ahash;
+  unsafe { pb[i] = u256_zero(); ph[i] = keccak_empty(); }
+  let mp: *mut DbAcct = db_meta(db, i);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  m.nonce = 0u64;
+  mfree(m.code);
+  m.code = zalloc(1u64);
+  m.code_len = 0u64;
+  m.gen = m.gen + 1u64;
+  m.live = 0u64;
+}
+
+fn db_wipe_storage(db: *mut StateDb, a: U256) -> void {
+  let i: u64 = db_acc_slot(db, a);
+  let mp: *mut DbAcct = db_meta(db, i);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  m.gen = m.gen + 1u64;
+}
+
+fn db_set_slot(db: *mut StateDb, a: U256, k: U256, v: U256) -> void {
+  let ai: u64 = db_acc_slot(db, a);
+  let mp: *mut DbAcct = db_meta(db, ai);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  let gen: u64 = m.gen;
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let mut s: u64 = map_get(d.smap, a, k);
+  if s == MAP_NONE {
+    if d.sn == d.scap {
+      let nc: u64 = d.scap * 2u64;
+      d.sval = realloc_words(d.sval, d.scap, nc);
+      let old: *mut i8 = d.sgen;
+      let ng: *mut i8 = realloc_raw(old, nc * 8u64);
+      d.sgen = ng;
+      d.scap = nc;
+    }
+    s = d.sn;
+    d.sn = s + 1u64;
+    map_put(d.smap, a, k, s);
+  }
+  let pv: *mut U256 = d.sval;
+  let pg: *mut u64 = d.sgen;
+  unsafe { pv[s] = v; pg[s] = gen; }
+}
+
+// ---- Reads used by the engine ----
+
+// Fills ha with the account and returns HOST_OK, or HOST_MISSING.
+fn db_account(db: *mut StateDb, a: U256, ha: *mut HostAccount) -> u64 {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let i: u64 = map_get(d.amap, a, u256_zero());
+  if i == MAP_NONE { return HOST_MISSING; }
+  let mp: *mut DbAcct = db_meta(db, i);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  if m.live == 0u64 { return HOST_MISSING; }
+  let pb: *mut U256 = d.abal;
+  let ph: *mut U256 = d.ahash;
+  let bal: U256 = unsafe { pb[i] };
+  let hash: U256 = unsafe { ph[i] };
+  unsafe { ha[0u64] = HostAccount { balance: bal, nonce: m.nonce, code_hash: hash, code: m.code, code_len: m.code_len }; }
+  return HOST_OK;
+}
+
+fn db_storage(db: *mut StateDb, a: U256, k: U256) -> U256 {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let s: u64 = map_get(d.smap, a, k);
+  if s == MAP_NONE { return u256_zero(); }
+  let ai: u64 = map_get(d.amap, a, u256_zero());
+  if ai == MAP_NONE { return u256_zero(); }
+  let mp: *mut DbAcct = db_meta(db, ai);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  let pg: *mut u64 = d.sgen;
+  let g: u64 = unsafe { pg[s] };
+  if g != m.gen { return u256_zero(); }
+  let pv: *mut U256 = d.sval;
+  return unsafe { pv[s] };
+}
+
+fn db_set_block_hash(db: *mut StateDb, n: u64, h: U256) -> void {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let key: U256 = u256_from_u64(n);
+  let mut i: u64 = map_get(d.bmap, key, u256_zero());
+  if i == MAP_NONE {
+    if d.bn == d.bcap {
+      let nc: u64 = d.bcap * 2u64;
+      d.bhash = realloc_words(d.bhash, d.bcap, nc);
+      d.bcap = nc;
+    }
+    i = d.bn;
+    d.bn = i + 1u64;
+    map_put(d.bmap, key, u256_zero(), i);
+  }
+  let ph: *mut U256 = d.bhash;
+  unsafe { ph[i] = h; }
+}
+
+// A stored hash, or revm EmptyDB's fallback: keccak256 of the decimal number.
+fn db_block_hash(db: *mut StateDb, n: u64) -> U256 {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let i: u64 = map_get(d.bmap, u256_from_u64(n), u256_zero());
+  if i != MAP_NONE {
+    let ph: *mut U256 = d.bhash;
+    return unsafe { ph[i] };
+  }
+  let buf: *mut u8 = zalloc(24u64);
+  let mut len: u64 = 0u64;
+  let mut x: u64 = n;
+  if x == 0u64 {
+    unsafe { buf[0u64] = 48u8; }
+    len = 1u64;
+  }
+  while x > 0u64 {
+    unsafe { buf[len] = (48u64 + x % 10u64) as u8; }
+    len = len + 1u64;
+    x = x / 10u64;
+  }
+  // The digits were written least significant first; reverse them.
+  let mut lo: u64 = 0u64;
+  let mut hi: u64 = len - 1u64;
+  while lo < hi {
+    let t: u8 = unsafe { buf[lo] };
+    unsafe { buf[lo] = buf[hi]; buf[hi] = t; }
+    lo = lo + 1u64;
+    hi = hi - 1u64;
+  }
+  let h: U256 = keccak256(buf, len);
+  mfree(buf);
+  return h;
+}
+
+// Commits a transaction result, with the same rules as the harness's
+// Host::commit (revm CacheState semantics).
+fn db_apply(db: *mut StateDb, res: *mut VxResult) -> void {
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  let accs: *mut OutAccount = r.accounts;
+  let slots: *mut OutSlot = r.slots;
+  let mut ai: u64 = 0u64;
+  while ai < r.account_count {
+    let a: &mut OutAccount = unsafe { &mut accs[ai] };
+    ai = ai + 1u64;
+    if (a.flags & ACC_TOUCHED) == 0u64 { } else {
+      let addr: U256 = a.address;
+      if (a.flags & ACC_SELFDESTRUCTED) != 0u64 {
+        db_delete_account(db, addr);
+      } else {
+        let hash: U256 = a.code_hash;
+        let empty_code: bool = u256_eq(hash, keccak_empty()) || u256_is_zero(hash);
+        let is_empty: bool = a.nonce == 0u64 && u256_is_zero(a.balance) && empty_code;
+        let created: bool = (a.flags & ACC_CREATED) != 0u64;
+        if !created && is_empty {
+          db_delete_account(db, addr);
+        } else {
+          if created { db_wipe_storage(db, addr); }
+          db_set_account(db, addr, a.balance, a.nonce, hash, a.code, a.code_len);
+          let mut si: u64 = a.slot_start;
+          let end: u64 = a.slot_start + a.slot_count;
+          while si < end {
+            let s: &mut OutSlot = unsafe { &mut slots[si] };
+            if !u256_eq(s.original, s.present) { db_set_slot(db, addr, s.key, s.present); }
+            si = si + 1u64;
+          }
+        }
+      }
+    }
+  }
+}
+
+// revm Journal::balance_incr then commit, for withdrawals and block rewards:
+// after EIP-161 an account left empty is removed.
+fn db_balance_incr(db: *mut StateDb, a: U256, amount: U256, eip161: bool) -> void {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let i: u64 = map_get(d.amap, a, u256_zero());
+  let mut live: bool = false;
+  if i != MAP_NONE {
+    let mp: *mut DbAcct = db_meta(db, i);
+    let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+    live = m.live != 0u64;
+  }
+  if live {
+    let pb: *mut U256 = d.abal;
+    let nb: U256 = u256_add(unsafe { pb[i] }, amount);
+    unsafe { pb[i] = nb; }
+    let mp2: *mut DbAcct = db_meta(db, i);
+    let m2: &mut DbAcct = unsafe { &mut mp2[0u64] };
+    let ph: *mut U256 = d.ahash;
+    let hash: U256 = unsafe { ph[i] };
+    if eip161 && m2.nonce == 0u64 && u256_is_zero(nb) && u256_eq(hash, keccak_empty()) { db_delete_account(db, a); } else { }
+  } else {
+    if eip161 && u256_is_zero(amount) { return; }
+    let none: *mut u8 = zalloc(1u64);
+    db_set_account(db, a, amount, 0u64, keccak_empty(), none, 0u64);
+    mfree(none);
+  }
+}
+
+// ---- Exports for the host ----
+
+pub fn evmvx_db_new() -> *mut StateDb { return db_new(); }
+
+pub fn evmvx_db_put_account(db: *mut StateDb, addr: *mut U256, bal: *mut U256, nonce: u64, code: *mut u8, code_len: u64) -> void {
+  let mut hash: U256 = keccak_empty();
+  if code_len > 0u64 { hash = keccak256(code, code_len); }
+  db_set_account(db, unsafe { addr[0u64] }, unsafe { bal[0u64] }, nonce, hash, code, code_len);
+}
+
+pub fn evmvx_db_put_slot(db: *mut StateDb, addr: *mut U256, key: *mut U256, val: *mut U256) -> void {
+  db_set_slot(db, unsafe { addr[0u64] }, unsafe { key[0u64] }, unsafe { val[0u64] });
+}
+
+pub fn evmvx_db_put_block_hash(db: *mut StateDb, n: u64, h: *mut U256) -> void {
+  db_set_block_hash(db, n, unsafe { h[0u64] });
+}
+
+pub fn evmvx_db_apply(db: *mut StateDb, res: *mut VxResult) -> void { db_apply(db, res); }
+
+pub fn evmvx_db_balance_incr(db: *mut StateDb, addr: *mut U256, amount: *mut U256, eip161: u64) -> void {
+  db_balance_incr(db, unsafe { addr[0u64] }, unsafe { amount[0u64] }, eip161 != 0u64);
+}
+
+pub fn evmvx_db_free(db: *mut StateDb) -> void {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let mut i: u64 = 0u64;
+  while i < d.an {
+    let mp: *mut DbAcct = db_meta(db, i);
+    let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+    mfree(m.code);
+    i = i + 1u64;
+  }
+  map_free(d.amap);
+  map_free(d.smap);
+  map_free(d.bmap);
+  let p1: *mut i8 = d.aaddr;
+  let p2: *mut i8 = d.abal;
+  let p3: *mut i8 = d.ahash;
+  let p4: *mut i8 = d.ameta;
+  let p5: *mut i8 = d.sval;
+  let p6: *mut i8 = d.sgen;
+  let p7: *mut i8 = d.bhash;
+  let p8: *mut i8 = db;
+  unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); vx_free(p5); vx_free(p6); vx_free(p7); vx_free(p8); }
+}

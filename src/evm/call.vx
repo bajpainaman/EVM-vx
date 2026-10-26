@@ -1,9 +1,10 @@
 // CALL, CALLCODE, DELEGATECALL, STATICCALL, CREATE and CREATE2.
 //
-// A child frame runs inline through run_frame (recursive tree-walker), rather
-// than revm's explicit suspend/resume. Depth is bounded by 1024, so the native
-// stack depth is bounded too. Gas, value transfer, the 63/64 rule, the stipend,
-// journaling and the return-data buffer follow revm handler/src/frame.rs.
+// A child frame does not run on the native stack: the opcode saves a
+// continuation in its frame and returns R_SUSPEND, run_frame runs the child,
+// then resume_call / resume_create finish the opcode. Gas, value transfer,
+// the 63/64 rule, the stipend, journaling and the return-data buffer follow
+// revm handler/src/frame.rs.
 
 const CALL_DEPTH_LIMIT: u64 = 1024u64;
 const OP_CALL: u64 = 241u64;
@@ -80,40 +81,9 @@ fn resolve_delegated(c: *mut Ctx, f: *mut Frame, i: u64, code_idx: *mut u64) -> 
   return true;
 }
 
-// Builds and runs a child message call into account `acct_idx`, whose code is
-// `code_idx`. Fills `o`. caller/target/value set the child's frame words.
-fn run_child_call(c: *mut Ctx, parent: *mut Frame, acct_idx: u64, code_idx: u64,
-                  target: U256, caller: U256, value: U256, input: *mut u8, input_len: u64,
-                  gas: u64, is_static: bool, o: *mut ChildOut) -> void {
-  let code: *mut u8 = acc_code(c, code_idx);
-  let clen: u64 = acc_code_len(c, code_idx);
-  let r: &mut ChildOut = unsafe { &mut o[0u64] };
-  if clen == 0u64 {
-    r.result = R_STOP;
-    r.gas_left = gas;
-    r.refund = 0i64;
-    r.out = zalloc(1u64);
-    r.out_len = 0u64;
-    return;
-  }
-  let jd: *mut u8 = acc_jumpdests(c, code_idx);
-  let child: *mut Frame = frame_new(code, clen, jd, gas, input, input_len, target, caller, value,
-                                    is_static, frame_depth(parent) + 1u64, acct_idx, frame_tabs(parent));
-  let res: u64 = run_frame(c, child);
-  let cf: &mut Frame = unsafe { &mut child[0u64] };
-  r.result = res;
-  r.gas_left = 0u64;
-  if r_is_ok_or_revert(res) { r.gas_left = cf.gas; }
-  r.refund = 0i64;
-  if r_is_ok(res) { r.refund = cf.refund; }
-  r.out = dup_bytes(cf.out, cf.out_len);
-  r.out_len = cf.out_len;
-  frame_free(child);
-}
-
 // Runs a precompile as a child call, filling `o`.
 fn run_child_precompile(c: *mut Ctx, pid: u64, input: *mut u8, input_len: u64, gas: u64, o: *mut ChildOut) -> void {
-  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<PcOut>() as u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<PcOut>() as u64) };
   let po: *mut PcOut = raw;
   precompile_run(c, pid, input, input_len, gas, po);
   let p: &mut PcOut = unsafe { &mut po[0u64] };
@@ -138,7 +108,7 @@ fn run_child_precompile(c: *mut Ctx, pid: u64, input: *mut u8, input_len: u64, g
   r.refund = 0i64;
   let d: *mut u8 = p.data;
   mfree(d);
-  unsafe { free(raw); }
+  unsafe { vx_free(raw); }
 }
 
 fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
@@ -216,14 +186,14 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
   let is_static: bool = frame_is_static(f) || op == OP_STATICCALL;
 
   let input: *mut u8 = mem_slice_dup(f, in_off, in_len);
-  let oraw: *mut i8 = unsafe { calloc(1u64, sizeof<ChildOut>() as u64) };
+  let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
   let o: *mut ChildOut = oraw;
 
   // Depth limit: nothing runs, gas returns, push 0.
   if frame_depth(f) + 1u64 > CALL_DEPTH_LIMIT {
     finish_call(c, f, o, false, child_gas, out_off, out_len, R_CALL_TOO_DEEP);
     mfree(input);
-    unsafe { free(oraw); }
+    unsafe { vx_free(oraw); }
     return R_CONTINUE;
   }
 
@@ -240,7 +210,7 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
       journal_revert(c, jn, ln);
       finish_call(c, f, o, false, child_gas, out_off, out_len, R_OUT_OF_FUNDS);
       mfree(input);
-      unsafe { free(oraw); }
+      unsafe { vx_free(oraw); }
       return R_CONTINUE;
     }
   }
@@ -248,15 +218,83 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
   let pid: u64 = precompile_id(to, c);
   if pid != 0u64 {
     run_child_precompile(c, pid, input, in_len, child_gas, o);
+  } else if acc_code_len(c, code_idx) == 0u64 {
+    // No code: the call succeeds at once with all its gas.
+    let r0: &mut ChildOut = unsafe { &mut o[0u64] };
+    r0.result = R_STOP;
+    r0.gas_left = child_gas;
+    r0.refund = 0i64;
+    r0.out = zalloc(1u64);
+    r0.out_len = 0u64;
   } else {
-    run_child_call(c, f, acct_idx, code_idx, target_addr, caller_addr, child_value, input, in_len, child_gas, is_static, o);
+    // Suspend this frame; run_frame runs the child, then resume_call.
+    let child: *mut Frame = frame_new(acc_code(c, code_idx), acc_code_len(c, code_idx), acc_jumpdests(c, code_idx),
+                                      child_gas, input, in_len, target_addr, caller_addr, child_value,
+                                      is_static, frame_depth(f) + 1u64, acct_idx, frame_tabs(f));
+    let fr: &mut Frame = unsafe { &mut f[0u64] };
+    fr.k_kind = K_CALL;
+    fr.k_out_off = out_off;
+    fr.k_out_len = out_len;
+    fr.k_jn = jn;
+    fr.k_ln = ln;
+    fr.k_buf_a = input;
+    fr.k_child = child;
+    unsafe { vx_free(oraw); }
+    return R_SUSPEND;
   }
+  call_complete(c, f, o, jn, ln, out_off, out_len);
+  mfree(input);
+  unsafe { vx_free(oraw); }
+  return R_CONTINUE;
+}
+
+// Reverts the call's checkpoint unless it succeeded, then applies its result.
+fn call_complete(c: *mut Ctx, f: *mut Frame, o: *mut ChildOut, jn: u64, ln: u64, out_off: u64, out_len: u64) -> void {
   let r: &mut ChildOut = unsafe { &mut o[0u64] };
   if r_is_ok(r.result) { } else { journal_revert(c, jn, ln); }
   commit_call(c, f, o, out_off, out_len);
+}
+
+// Collects a finished child frame's result into a fresh ChildOut and frees
+// the child. The caller frees the ChildOut and its out buffer.
+fn take_child(child: *mut Frame, res: u64) -> *mut ChildOut {
+  let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
+  let o: *mut ChildOut = oraw;
+  let cf: &mut Frame = unsafe { &mut child[0u64] };
+  let r: &mut ChildOut = unsafe { &mut o[0u64] };
+  r.result = res;
+  r.gas_left = 0u64;
+  if r_is_ok_or_revert(res) { r.gas_left = cf.gas; }
+  r.refund = 0i64;
+  if r_is_ok(res) { r.refund = cf.refund; }
+  r.out = dup_bytes(cf.out, cf.out_len);
+  r.out_len = cf.out_len;
+  mfree(cf.out);
+  frame_free(child);
+  return o;
+}
+
+// Resumes a frame suspended by CALL/CALLCODE/DELEGATECALL/STATICCALL.
+fn resume_call(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -> void {
+  let o: *mut ChildOut = take_child(child, res);
+  let p: &mut Frame = unsafe { &mut parent[0u64] };
+  let jn: u64 = p.k_jn;
+  let ln: u64 = p.k_ln;
+  let out_off: u64 = p.k_out_off;
+  let out_len: u64 = p.k_out_len;
+  let input: *mut u8 = p.k_buf_a;
+  p.k_kind = K_NONE;
+  call_complete(c, parent, o, jn, ln, out_off, out_len);
   mfree(input);
-  unsafe { free(oraw); }
-  return R_CONTINUE;
+  let oraw: *mut i8 = o;
+  unsafe { vx_free(oraw); }
+}
+
+// Dispatches a finished child's result to the continuation its parent saved.
+fn resume_parent(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -> void {
+  let p: &mut Frame = unsafe { &mut parent[0u64] };
+  if p.k_kind == K_CREATE { resume_create(c, parent, child, res); }
+  else { resume_call(c, parent, child, res); }
 }
 
 // Pushes 0 for a call that never ran (depth, funds), returns its gas, clears
@@ -360,7 +398,28 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
   let child: *mut Frame = frame_new(init, len, jd, child_gas, zalloc(1u64), 0u64,
                                     created, caller_addr, value, false,
                                     frame_depth(f) + 1u64, created_idx, frame_tabs(f));
-  let res: u64 = run_frame(c, child);
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  fr.k_kind = K_CREATE;
+  fr.k_jn = jn;
+  fr.k_ln = ln;
+  fr.k_idx = created_idx;
+  fr.k_buf_a = init;
+  fr.k_buf_b = jd;
+  fr.k_child = child;
+  return R_SUSPEND;
+}
+
+// Resumes a frame suspended by CREATE/CREATE2 once the init code has run.
+fn resume_create(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -> void {
+  let f: *mut Frame = parent;
+  let p: &mut Frame = unsafe { &mut parent[0u64] };
+  let jn: u64 = p.k_jn;
+  let ln: u64 = p.k_ln;
+  let created_idx: u64 = p.k_idx;
+  let init: *mut u8 = p.k_buf_a;
+  let jd: *mut u8 = p.k_buf_b;
+  p.k_kind = K_NONE;
+  let created: U256 = acc_addr(c, created_idx);
   let cf: &mut Frame = unsafe { &mut child[0u64] };
   let mut gas_left: u64 = 0u64;
   if r_is_ok_or_revert(res) { gas_left = cf.gas; }
@@ -369,6 +428,7 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
   let outp: *mut u8 = dup_bytes(cf.out, cf.out_len);
   let outl: u64 = cf.out_len;
   let cinput: *mut u8 = cf.input;
+  mfree(cf.out);
   frame_free(child);
   mfree(cinput);
   mfree(jd);
@@ -399,8 +459,8 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
     stack_push(f, u256_zero());
   }
   mfree(outp);
-  return R_CONTINUE;
 }
+
 
 // revm return_create: size and 0xEF checks, code-deposit gas, set the code.
 // Writes the remaining gas to gleft and returns R_RETURN on success, or

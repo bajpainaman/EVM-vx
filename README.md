@@ -2,9 +2,15 @@
 
 A research-stage project to execute Ethereum transactions in parallel in [Vx](https://github.com/vx-lang/Vx), while preserving the results of sequential execution.
 
-**Current status: a working sequential EVM, checked against the official Ethereum state tests.** `src/evm/` holds an EVM written in Vx: every opcode for Frontier through Osaka, per-fork gas, a journaled state with revert, CALL/CREATE, the transaction handler, EIP-7702 authorizations and most precompiles. `harness/` runs the EEST state-test fixtures through it and checks state and logs roots the way revm's `revme statetest` does.
+**Current status: a working sequential EVM, checked against the official Ethereum state tests.** `src/evm/` holds an EVM written in Vx: every opcode for Frontier through Osaka, per-fork gas, a journaled state with revert, CALL/CREATE, the transaction handler, EIP-7702 authorizations and most precompiles. `harness/` runs the EEST state tests and blockchain tests through it and checks state and logs roots the way revm's `revme statetest` and `revme btest` do.
 
-Not yet done: the bn254 (0x06–0x08), KZG (0x0a) and BLS12-381 (0x0b–0x11) precompiles, block-level execution (blockchain tests), and the parallel executor. No performance claim is made; the 20× goal is still an ambition.
+Three choices let the core move to a GPU or other device without a rewrite:
+
+- **No native recursion.** CALL and CREATE suspend the calling frame, and `run_frame` runs every frame on an explicit stack. The native stack depth stays the same at any call depth.
+- **No host calls during execution.** With a `StateDb` attached (`evmvx_transact_db`), the engine reads accounts, storage and block hashes from Vx memory and never calls back into the host.
+- **One allocator.** Every allocation goes through `vx_malloc`, `vx_calloc`, `vx_realloc` and `vx_free` in `src/evm/libc.vx`, so a device build can swap in an arena by changing one file.
+
+Not yet done: the bn254 (0x06–0x08), KZG (0x0a) and BLS12-381 (0x0b–0x11) precompiles, and the parallel executor. No performance claim is made; the 20× goal is still an ambition.
 
 ## Run the tests
 
@@ -16,6 +22,8 @@ python3 scripts/fetch-fixtures.py                # EEST v5.4.0, devnet and legac
 cd harness && cargo build --release
 target/release/evmvx-test statetest <fixtures>/main/develop/fixtures/state_tests/cancun
 EVMVX_DIFF=1 target/release/evmvx-test statetest <dir>   # on failure, diff against revm
+target/release/evmvx-test btest <fixtures>/main/develop/fixtures/blockchain_tests/cancun
+EVMVX_DB=1 target/release/evmvx-test btest <dir>         # run on a Vx StateDb, no host callbacks
 
 scripts/build-testlib.sh 2                       # unit-test library with stub host callbacks
 python3 tests/u256/run.py                        # 25 word opcodes vs. a Python-int oracle

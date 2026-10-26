@@ -36,8 +36,11 @@ fn run_case(
     cache: &revm::database::CacheState,
 ) -> Outcome {
     let mut host = host.clone();
+    if host::db_mode() {
+        host.attach_db();
+    }
     let eb = env::build(spec, cfg, block, tx);
-    let res = unsafe { evmvx_transact(&mut host as *mut Host as *mut _, &eb.env) };
+    let res = host.transact(&eb.env);
     let r = unsafe { &*res };
     let outcome = match r.status {
         RES_HOST_FAILURE => Outcome::Fail(format!("host failure (reason {})", r.reason)),
@@ -63,6 +66,7 @@ fn run_case(
         }
     };
     unsafe { evmvx_result_free(res) };
+    host.detach_db();
     outcome
 }
 

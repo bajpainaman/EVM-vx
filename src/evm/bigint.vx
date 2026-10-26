@@ -6,14 +6,14 @@ const LIMB_MASK: u128 = 18446744073709551615u128;
 fn limbs_alloc(n: u64) -> *mut u64 {
   let mut m: u64 = n;
   if m == 0u64 { m = 1u64; }
-  let raw: *mut i8 = unsafe { calloc(m, 8u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(m, 8u64) };
   let p: *mut u64 = raw;
   return p;
 }
 
 fn limbs_free(p: *mut u64) -> void {
   let raw: *mut i8 = p;
-  unsafe { free(raw); }
+  unsafe { vx_free(raw); }
 }
 
 fn limb(p: *mut u64, i: u64) -> u64 { return unsafe { p[i] }; }

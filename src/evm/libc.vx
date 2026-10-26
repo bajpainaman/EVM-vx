@@ -13,18 +13,27 @@ extern "C" {
   fn memcmp(a: *mut i8, b: *mut i8, n: u64) -> i32;
 }
 
+// The engine's only allocator: every allocation goes through these four.
+// On the CPU they call the C library. A device build replaces just these
+// bodies (for example with a bump arena set aside before launch), so the
+// rest of the engine never calls the C allocator directly.
+fn vx_malloc(n: u64) -> *mut i8 { return unsafe { malloc(n) }; }
+fn vx_calloc(n: u64, size: u64) -> *mut i8 { return unsafe { calloc(n, size) }; }
+fn vx_realloc(p: *mut i8, n: u64) -> *mut i8 { return unsafe { realloc(p, n) }; }
+fn vx_free(p: *mut i8) -> void { unsafe { free(p); } }
+
 // Zeroed allocation. At least one byte, so the result is never a null "empty" buffer.
 fn zalloc(n: u64) -> *mut u8 {
   let mut m: u64 = n;
   if m == 0u64 { m = 1u64; }
-  let p: *mut i8 = unsafe { calloc(m, 1u64) };
+  let p: *mut i8 = unsafe { vx_calloc(m, 1u64) };
   let q: *mut u8 = p;
   return q;
 }
 
 fn mfree(p: *mut u8) -> void {
   let q: *mut i8 = p;
-  unsafe { free(q); }
+  unsafe { vx_free(q); }
 }
 
 fn copy_bytes(d: *mut u8, s: *mut u8, n: u64) -> void {
@@ -57,7 +66,7 @@ fn bytes_eq(a: *mut u8, b: *mut u8, n: u64) -> bool {
 // Grows a buffer to new_cap bytes; the added bytes are zero.
 fn grow_bytes(p: *mut u8, old_cap: u64, new_cap: u64) -> *mut u8 {
   let raw: *mut i8 = p;
-  let q: *mut i8 = unsafe { realloc(raw, new_cap) };
+  let q: *mut i8 = unsafe { vx_realloc(raw, new_cap) };
   let r: *mut u8 = q;
   if new_cap > old_cap {
     let tail: *mut u8 = offset_mut(r, old_cap as i64);

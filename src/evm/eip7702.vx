@@ -104,6 +104,6 @@ fn apply_auth_list(c: *mut Ctx, env: *mut VxEnv) -> u64 {
     k = k + 1u64;
   }
   let wr: *mut i8 = who;
-  unsafe { free(wr); }
+  unsafe { vx_free(wr); }
   return refunded * 12500u64;
 }

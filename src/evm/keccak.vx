@@ -204,7 +204,7 @@ fn bswap64(x: u64) -> u64 {
 
 // Keccak-256 of n bytes at p, as a big-endian word (hash byte 0 is the top byte).
 fn keccak256(p: *mut u8, n: u64) -> U256 {
-  let raw: *mut i8 = unsafe { calloc(25u64, 8u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(25u64, 8u64) };
   let st: *mut u64 = raw;
   let mut off: u64 = 0u64;
   while n - off >= 136u64 {
@@ -228,7 +228,7 @@ fn keccak256(p: *mut u8, n: u64) -> U256 {
   let h = U256 { l0: bswap64(unsafe { st[3] }), l1: bswap64(unsafe { st[2] }),
                  l2: bswap64(unsafe { st[1] }), l3: bswap64(unsafe { st[0] }) };
   mfree(last);
-  unsafe { free(raw); }
+  unsafe { vx_free(raw); }
   return h;
 }
 

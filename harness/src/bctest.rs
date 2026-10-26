@@ -96,7 +96,7 @@ enum TxRun {
 
 fn run_tx(host: &mut Host, spec: SpecId, cfg: &CfgEnv, block: &BlockEnv, tx: &TxEnv) -> TxRun {
     let eb = env::build(spec, cfg, block, tx);
-    let res = unsafe { evmvx_transact(host as *mut Host as *mut _, &eb.env) };
+    let res = host.transact(&eb.env);
     let r = unsafe { &*res };
     let out = match r.status {
         RES_HOST_FAILURE => TxRun::Host(format!("host failure (reason {})", r.reason)),
@@ -121,7 +121,7 @@ fn system_call(host: &mut Host, spec: SpecId, cfg: &CfgEnv, block: &BlockEnv, to
         ..TxEnv::default()
     };
     let eb = env::build(spec, cfg, block, &tx);
-    let res = unsafe { evmvx_system_call(host as *mut Host as *mut _, &eb.env) };
+    let res = host.system_call(&eb.env);
     let r = unsafe { &*res };
     let out = if r.status == RES_HOST_FAILURE {
         Err(format!("system call to {to} failed (reason {})", r.reason))
@@ -152,7 +152,10 @@ fn run_case(case: &BlockchainTestCase) -> Result<bool, String> {
         let storage = acc.storage.iter().map(|(k, v)| (*k, *v)).collect();
         host.insert(*addr, acc.balance, acc.nonce.to::<u64>(), acc.code.clone(), storage);
     }
-    host.block_hashes.insert(0, case.genesis_block_header.hash);
+    host.set_block_hash(0, case.genesis_block_header.hash);
+    if crate::host::db_mode() {
+        host.attach_db();
+    }
     let spec = fork_to_spec_id(case.network);
     let mut cfg = CfgEnv::default();
     cfg.set_spec_and_mainnet_gas_params(spec);
@@ -261,7 +264,7 @@ fn run_case(case: &BlockchainTestCase) -> Result<bool, String> {
             system_call(&mut host, spec, &cfg, &block_env, CONSOLIDATION_REQUEST_ADDRESS, Bytes::new())
                 .map_err(|e| format!("block {bi}: {e}"))?;
         }
-        host.block_hashes.insert(block_env.number.to::<u64>(), block_hash.unwrap_or_default());
+        host.set_block_hash(block_env.number.to::<u64>(), block_hash.unwrap_or_default());
         parent_block_hash = block_hash;
         if let Some(x) = this_excess {
             parent_excess_blob_gas = x;

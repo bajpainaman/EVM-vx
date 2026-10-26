@@ -4,6 +4,7 @@ bytes.vx
 keccak.vx
 map.vx
 abi.vx
+db.vx
 bytecode.vx
 optables.vx
 gasfn.vx

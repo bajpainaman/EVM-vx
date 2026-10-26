@@ -33,10 +33,10 @@ fn map_hash(a: U256, b: U256) -> u64 {
 
 fn map_alloc_arrays(m: *mut Map, cap: u64) -> void {
   let mr: &mut Map = unsafe { &mut m[0u64] };
-  let pa: *mut i8 = unsafe { calloc(cap, 32u64) };
-  let pb: *mut i8 = unsafe { calloc(cap, 32u64) };
-  let pv: *mut i8 = unsafe { calloc(cap, 8u64) };
-  let pu: *mut i8 = unsafe { calloc(cap, 1u64) };
+  let pa: *mut i8 = unsafe { vx_calloc(cap, 32u64) };
+  let pb: *mut i8 = unsafe { vx_calloc(cap, 32u64) };
+  let pv: *mut i8 = unsafe { vx_calloc(cap, 8u64) };
+  let pu: *mut i8 = unsafe { vx_calloc(cap, 1u64) };
   mr.ka = pa;
   mr.kb = pb;
   mr.vals = pv;
@@ -46,7 +46,7 @@ fn map_alloc_arrays(m: *mut Map, cap: u64) -> void {
 }
 
 fn map_new() -> *mut Map {
-  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<Map>() as u64) };
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Map>() as u64) };
   let m: *mut Map = raw;
   map_alloc_arrays(m, 64u64);
   return m;
@@ -104,7 +104,7 @@ fn map_grow(m: *mut Map) -> void {
   let fb: *mut i8 = okb;
   let fv: *mut i8 = ov;
   let fu: *mut i8 = ou;
-  unsafe { free(fa); free(fb); free(fv); free(fu); }
+  unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); }
 }
 
 // Inserts or overwrites (a, b) -> v.
@@ -143,5 +143,5 @@ fn map_free(m: *mut Map) -> void {
   let fv: *mut i8 = mr.vals;
   let fu: *mut i8 = mr.used;
   let fm: *mut i8 = m;
-  unsafe { free(fa); free(fb); free(fv); free(fu); free(fm); }
+  unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); vx_free(fm); }
 }

@@ -80,9 +80,13 @@ fn op_blockhash(c: *mut Ctx, f: *mut Frame) -> u64 {
   }
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
   let sp: *mut U256 = cx.scratch;
-  let st: u64 = unsafe { evmvx_host_block_hash(cx.host, u256_sat_u64(req), sp) };
-  if st != HOST_OK { return R_FATAL; }
-  stack_push(f, unsafe { sp[0u64] });
+  if is_null_mut(cx.db) {
+    let st: u64 = unsafe { evmvx_host_block_hash(cx.host, u256_sat_u64(req), sp) };
+    if st != HOST_OK { return R_FATAL; }
+    stack_push(f, unsafe { sp[0u64] });
+  } else {
+    stack_push(f, db_block_hash(cx.db, u256_sat_u64(req)));
+  }
   return R_CONTINUE;
 }
 

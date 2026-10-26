@@ -176,6 +176,17 @@ extern "C" {
     /// Runs a system call (no validation, fees, nonce bump or refunds).
     pub fn evmvx_system_call(host: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
     pub fn evmvx_result_free(r: *mut VxResult);
+    /// Vx-side state database (src/evm/db.vx). With one, the engine reads
+    /// state from it and never calls the evmvx_host_* callbacks.
+    pub fn evmvx_db_new() -> *mut core::ffi::c_void;
+    pub fn evmvx_db_put_account(db: *mut core::ffi::c_void, addr: *const Word, bal: *const Word, nonce: u64, code: *const u8, code_len: u64);
+    pub fn evmvx_db_put_slot(db: *mut core::ffi::c_void, addr: *const Word, key: *const Word, val: *const Word);
+    pub fn evmvx_db_put_block_hash(db: *mut core::ffi::c_void, n: u64, h: *const Word);
+    pub fn evmvx_db_apply(db: *mut core::ffi::c_void, r: *const VxResult);
+    pub fn evmvx_db_balance_incr(db: *mut core::ffi::c_void, addr: *const Word, amount: *const Word, eip161: u64);
+    pub fn evmvx_db_free(db: *mut core::ffi::c_void);
+    pub fn evmvx_transact_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
+    pub fn evmvx_system_call_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
     /// Struct sizes the Vx side sees, for a layout check at startup.
     pub fn evmvx_abi_sizes(out: *mut u64);
 }
