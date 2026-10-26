@@ -10,7 +10,9 @@ Three choices let the core move to a GPU or other device without a rewrite:
 - **No host calls during execution.** With a `StateDb` attached (`evmvx_transact_db`), the engine reads accounts, storage and block hashes from Vx memory and never calls back into the host.
 - **One allocator.** Every allocation goes through `vx_malloc`, `vx_calloc`, `vx_realloc` and `vx_free` in `src/evm/libc.vx`, so a device build can swap in an arena by changing one file.
 
-Not yet done: the bn254 (0x06–0x08), KZG (0x0a) and BLS12-381 (0x0b–0x11) precompiles, and the parallel executor. No performance claim is made; the 20× goal is still an ambition.
+The pairing-based precompiles (bn254 at 0x06–0x08, KZG at 0x0a, BLS12-381 at 0x0b–0x11) come from a stateless crypto provider, `evmvx_crypto_precompile`. That matches revm, which takes them from its `crypto()` backends. The harness backs the provider with revm's own precompiles. Every other precompile is written in Vx.
+
+Not yet done: the parallel executor, and native Vx versions of the pairing precompiles. No performance claim is made; the 20× goal is still an ambition.
 
 ## Run the tests
 

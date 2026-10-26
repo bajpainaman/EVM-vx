@@ -113,6 +113,11 @@ extern "C" {
   fn evmvx_host_account(host: *mut i8, addr: *mut U256, out: *mut HostAccount) -> u64;
   fn evmvx_host_storage(host: *mut i8, addr: *mut U256, key: *mut U256, out: *mut U256) -> u64;
   fn evmvx_host_block_hash(host: *mut i8, number: u64, out: *mut U256) -> u64;
+  // Stateless crypto provider for the pairing-based precompiles (see
+  // pc_crypto). Writes up to out_cap bytes to out, res[0] = gas used,
+  // res[1] = output length. Returns PC_OK, PC_OOG or PC_ERROR.
+  fn evmvx_crypto_precompile(id: u64, spec: u64, input: *mut u8, len: u64, gas_limit: u64,
+                             out: *mut u8, out_cap: u64, res: *mut u64) -> u64;
 }
 
 // Per-account output. flags uses the ACC_* bits from state.vx.

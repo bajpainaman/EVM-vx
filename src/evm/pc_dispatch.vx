@@ -6,4 +6,32 @@ fn precompile_run_ext(spec: u64, id: u64, input: *mut u8, len: u64, gas_limit: u
   if id == 5u64 { pc_modexp(spec, input, len, gas_limit, out); return; }
   if id == 9u64 { pc_blake2f(input, len, gas_limit, out); return; }
   if id == 256u64 { pc_p256verify(input, len, gas_limit, out); return; }
+  if (id >= 6u64 && id <= 8u64) || id == 10u64 || (id >= 11u64 && id <= 17u64) {
+    pc_crypto(spec, id, input, len, gas_limit, out);
+    return;
+  }
+}
+
+// bn254 (0x06-0x08), KZG point evaluation (0x0a) and BLS12-381 (0x0b-0x11)
+// come from the host's crypto provider, the way revm takes them from its
+// crypto() backends (arkworks, c-kzg, blst). The call reads only its input,
+// so it is also safe with a StateDb attached. The largest output (a BLS G2
+// point) is 256 bytes.
+const PC_CRYPTO_OUT_CAP: u64 = 256u64;
+
+fn pc_crypto(spec: u64, id: u64, input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void {
+  let buf: *mut u8 = zalloc(PC_CRYPTO_OUT_CAP);
+  let res: *mut u64 = limbs_alloc(2u64);
+  let st: u64 = unsafe { evmvx_crypto_precompile(id, spec, input, len, gas_limit, buf, PC_CRYPTO_OUT_CAP, res) };
+  let gas_used: u64 = unsafe { res[0u64] };
+  let olen: u64 = unsafe { res[1u64] };
+  limbs_free(res);
+  if st == PC_OK {
+    pc_set(out, PC_OK, gas_used, buf, olen);
+    return;
+  }
+  mfree(buf);
+  let none: *mut u8 = null_u8();
+  if st == PC_OOG { pc_set(out, PC_OOG, gas_limit, none, 0u64); }
+  else { pc_set(out, PC_ERROR, gas_limit, none, 0u64); }
 }

@@ -250,3 +250,48 @@ pub extern "C" fn evmvx_host_block_hash(host: *mut c_void, number: u64, out: *mu
     unsafe { *out = h.into() };
     HOST_OK
 }
+
+/// The crypto provider for the pairing-based precompiles: bn254 (0x06-0x08),
+/// KZG point evaluation (0x0a) and BLS12-381 (0x0b-0x11). It runs revm's own
+/// precompile for the active fork, the backends revm itself uses (arkworks,
+/// c-kzg, blst). It reads only its input, so it needs no host state.
+#[no_mangle]
+pub extern "C" fn evmvx_crypto_precompile(
+    id: u64,
+    spec: u64,
+    input: *const u8,
+    len: u64,
+    gas_limit: u64,
+    out: *mut u8,
+    out_cap: u64,
+    res: *mut u64,
+) -> u64 {
+    use revm::precompile::{PrecompileSpecId, PrecompileStatus, Precompiles};
+    use revm::primitives::hardfork::SpecId;
+    const PC_OK: u64 = 0;
+    const PC_OOG: u64 = 1;
+    const PC_ERROR: u64 = 2;
+    unsafe {
+        *res = 0;
+        *res.add(1) = 0;
+    }
+    let Ok(spec) = SpecId::try_from(spec as u8) else { return PC_ERROR };
+    let set = Precompiles::new(PrecompileSpecId::from_spec_id(spec));
+    let Some(pc) = set.get(&Address::with_last_byte(id as u8)) else { return PC_ERROR };
+    let input = unsafe { slice(input, len) };
+    match pc.execute(input, gas_limit, 0) {
+        Ok(o) => match o.status {
+            PrecompileStatus::Success if o.bytes.len() as u64 <= out_cap => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(o.bytes.as_ptr(), out, o.bytes.len());
+                    *res = o.gas_used;
+                    *res.add(1) = o.bytes.len() as u64;
+                }
+                PC_OK
+            }
+            PrecompileStatus::Halt(h) if h.is_oog() => PC_OOG,
+            _ => PC_ERROR,
+        },
+        Err(_) => PC_ERROR,
+    }
+}
