@@ -18,12 +18,34 @@ pub struct Acct {
 #[derive(Clone, Default)]
 pub struct Host {
     pub accounts: HashMap<Address, Acct>,
+    /// Known block hashes by number (blockchain tests). Missing numbers fall
+    /// back to revm EmptyDB's keccak256 of the decimal number.
+    pub block_hashes: HashMap<u64, B256>,
 }
 
 impl Host {
     pub fn insert(&mut self, a: Address, balance: U256, nonce: u64, code: Bytes, storage: HashMap<U256, U256>) {
         let code_hash = if code.is_empty() { KECCAK_EMPTY } else { keccak256(&code) };
         self.accounts.insert(a, Acct { balance, nonce, code_hash, code, storage });
+    }
+
+    /// revm Journal::balance_incr followed by a commit: the account is loaded
+    /// and touched, so after EIP-161 an empty account is removed.
+    pub fn balance_incr(&mut self, a: Address, amount: U256, eip161: bool) {
+        match self.accounts.get_mut(&a) {
+            Some(acc) => {
+                acc.balance += amount;
+                let empty = acc.balance.is_zero() && acc.nonce == 0 && acc.code_hash == KECCAK_EMPTY;
+                if empty && eip161 {
+                    self.accounts.remove(&a);
+                }
+            }
+            None => {
+                if !amount.is_zero() || !eip161 {
+                    self.insert(a, amount, 0, Bytes::new(), HashMap::new());
+                }
+            }
+        }
     }
 
     /// Applies one transaction's account changes, following revm
@@ -73,6 +95,18 @@ impl Host {
     }
 }
 
+/// The result's logs as revm Log values.
+pub fn logs_of(r: &VxResult) -> Vec<revm::primitives::Log> {
+    unsafe { slice(r.logs, r.log_count) }
+        .iter()
+        .map(|l| {
+            let topics = l.topics[..l.topic_count as usize].iter().map(|t| t.b256()).collect();
+            let data = Bytes::copy_from_slice(unsafe { slice(l.data, l.data_len) });
+            revm::primitives::Log { address: l.address.address(), data: revm::primitives::LogData::new_unchecked(topics, data) }
+        })
+        .collect()
+}
+
 pub unsafe fn slice<'a, T>(p: *const T, n: u64) -> &'a [T] {
     if n == 0 || p.is_null() {
         &[]
@@ -119,8 +153,13 @@ pub extern "C" fn evmvx_host_storage(host: *mut c_void, addr: *const Word, key: 
 /// State tests have no chain history; revm's EmptyDB answers with
 /// keccak256 of the decimal block number.
 #[no_mangle]
-pub extern "C" fn evmvx_host_block_hash(_host: *mut c_void, number: u64, out: *mut Word) -> u64 {
-    let h = keccak256(number.to_string().as_bytes());
+pub extern "C" fn evmvx_host_block_hash(host: *mut c_void, number: u64, out: *mut Word) -> u64 {
+    let host = unsafe { &*(host as *const Host) };
+    let h = host
+        .block_hashes
+        .get(&number)
+        .copied()
+        .unwrap_or_else(|| keccak256(number.to_string().as_bytes()));
     unsafe { *out = h.into() };
     HOST_OK
 }

@@ -173,6 +173,8 @@ pub const ACC_NOT_EXISTING: u64 = 16;
 extern "C" {
     /// Runs one transaction. `host` is passed back to the host callbacks.
     pub fn evmvx_transact(host: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
+    /// Runs a system call (no validation, fees, nonce bump or refunds).
+    pub fn evmvx_system_call(host: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
     pub fn evmvx_result_free(r: *mut VxResult);
     /// Struct sizes the Vx side sees, for a layout check at startup.
     pub fn evmvx_abi_sizes(out: *mut u64);

@@ -2,24 +2,21 @@
 //!
 //! Usage: evmvx-test statetest <path>... [--keep-going]
 
+mod bctest;
 mod diff;
+mod env;
 mod ffi;
 mod host;
 
 use ffi::*;
-use host::{slice, Host};
+use host::Host;
 use revm::{
-    context::{cfg::CfgEnv, either::Either},
-    context_interface::Cfg,
-    primitives::{hardfork::SpecId, keccak256, Bytes, Log, LogData, B256, U256},
+    context::cfg::CfgEnv,
+    primitives::{hardfork::SpecId, keccak256, Log, B256, U256},
     statetest_types::{SpecName, TestSuite},
 };
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-fn word_ptr(v: &[Word]) -> *const Word {
-    if v.is_empty() { std::ptr::null() } else { v.as_ptr() }
-}
 
 /// Outcome of one test case.
 enum Outcome {
@@ -39,82 +36,8 @@ fn run_case(
     cache: &revm::database::CacheState,
 ) -> Outcome {
     let mut host = host.clone();
-    let al_addrs: Vec<Word> = tx.access_list.0.iter().map(|i| i.address.into()).collect();
-    let al_nslots: Vec<u64> = tx.access_list.0.iter().map(|i| i.storage_keys.len() as u64).collect();
-    let al_slots: Vec<Word> = tx
-        .access_list
-        .0
-        .iter()
-        .flat_map(|i| i.storage_keys.iter().map(|k| Word::from(*k)))
-        .collect();
-    let blobs: Vec<Word> = tx.blob_hashes.iter().map(|h| (*h).into()).collect();
-    let auths: Vec<VxAuth> = tx
-        .authorization_list
-        .iter()
-        .filter_map(|a| match a {
-            Either::Left(s) => Some(VxAuth {
-                chain_id: (*s.chain_id()).into(),
-                address: (*s.address()).into(),
-                nonce: s.nonce(),
-                y_parity: s.y_parity() as u64,
-                r: s.r().into(),
-                s: s.s().into(),
-            }),
-            Either::Right(_) => None,
-        })
-        .collect();
-    let (blob_excess, blob_price, has_blob) = match &block.blob_excess_gas_and_price {
-        Some(b) => (b.excess_blob_gas, U256::from(b.blob_gasprice), 1),
-        None => (0, U256::ZERO, 0),
-    };
-    let mut flags = 0u64;
-    if cfg.tx_chain_id_check() {
-        flags |= CFG_TX_CHAIN_ID_CHECK;
-    }
-    let env = VxEnv {
-        spec: spec as u64,
-        chain_id: cfg.chain_id(),
-        cfg_flags: flags,
-        tx_gas_limit_cap: cfg.tx_gas_limit_cap(),
-        max_blobs_per_tx: cfg.max_blobs_per_tx().unwrap_or(0),
-        max_code_size: cfg.max_code_size() as u64,
-        max_initcode_size: cfg.max_initcode_size() as u64,
-        number: block.number.into(),
-        coinbase: block.beneficiary.into(),
-        timestamp: block.timestamp.into(),
-        block_gas_limit: block.gas_limit,
-        basefee: block.basefee,
-        difficulty: block.difficulty.into(),
-        prevrandao: block.prevrandao.unwrap_or_default().into(),
-        has_prevrandao: block.prevrandao.is_some() as u64,
-        excess_blob_gas: blob_excess,
-        blob_gasprice: blob_price.into(),
-        has_blob,
-        tx_type: tx.tx_type as u64,
-        caller: tx.caller.into(),
-        gas_limit: tx.gas_limit,
-        gas_price: U256::from(tx.gas_price).into(),
-        priority_fee: U256::from(tx.gas_priority_fee.unwrap_or(0)).into(),
-        has_priority_fee: tx.gas_priority_fee.is_some() as u64,
-        is_create: tx.kind.is_create() as u64,
-        to: tx.kind.to().copied().unwrap_or_default().into(),
-        value: tx.value.into(),
-        data: tx.data.as_ptr(),
-        data_len: tx.data.len() as u64,
-        nonce: tx.nonce,
-        has_tx_chain_id: tx.chain_id.is_some() as u64,
-        tx_chain_id: tx.chain_id.unwrap_or(0),
-        al_count: al_addrs.len() as u64,
-        al_addrs: word_ptr(&al_addrs),
-        al_nslots: if al_nslots.is_empty() { std::ptr::null() } else { al_nslots.as_ptr() },
-        al_slots: word_ptr(&al_slots),
-        blob_count: blobs.len() as u64,
-        blob_hashes: word_ptr(&blobs),
-        max_fee_per_blob_gas: U256::from(tx.max_fee_per_blob_gas).into(),
-        auth_count: auths.len() as u64,
-        auths: if auths.is_empty() { std::ptr::null() } else { auths.as_ptr() },
-    };
-    let res = unsafe { evmvx_transact(&mut host as *mut Host as *mut _, &env) };
+    let eb = env::build(spec, cfg, block, tx);
+    let res = unsafe { evmvx_transact(&mut host as *mut Host as *mut _, &eb.env) };
     let r = unsafe { &*res };
     let outcome = match r.status {
         RES_HOST_FAILURE => Outcome::Fail(format!("host failure (reason {})", r.reason)),
@@ -122,14 +45,7 @@ fn run_case(
         RES_INVALID_TX => Outcome::Fail(format!("unexpected invalid tx (reason {})", r.reason)),
         _ if expect_exception => Outcome::Fail("expected exception, tx executed".into()),
         _ => {
-            let logs: Vec<Log> = unsafe { slice(r.logs, r.log_count) }
-                .iter()
-                .map(|l| {
-                    let topics = l.topics[..l.topic_count as usize].iter().map(|t| t.b256()).collect();
-                    let data = Bytes::copy_from_slice(unsafe { slice(l.data, l.data_len) });
-                    Log { address: l.address.address(), data: LogData::new_unchecked(topics, data) }
-                })
-                .collect();
+            let logs: Vec<Log> = host::logs_of(r);
             host.commit(r);
             let logs_root = log_rlp_hash(&logs);
             let root = state_root(&host);
@@ -276,8 +192,9 @@ fn json_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("statetest") {
-        eprintln!("usage: evmvx-test statetest <path>... [--show N]");
+    let mode = args.first().map(String::as_str).unwrap_or_default().to_string();
+    if mode != "statetest" && mode != "btest" {
+        eprintln!("usage: evmvx-test statetest|btest <path>... [--show N]");
         std::process::exit(2);
     }
     let mut show = 20usize;
@@ -311,10 +228,21 @@ fn main() {
         .spawn(move || {
             let mut passed = 0;
             let mut fails = Vec::new();
+            let mut skipped = 0;
             for f in &files {
-                let (p, mut fl) = run_file(f);
-                passed += p;
-                fails.append(&mut fl);
+                if mode == "btest" {
+                    let (p, sk, mut fl) = bctest::run_file(f);
+                    passed += p;
+                    skipped += sk;
+                    fails.append(&mut fl);
+                } else {
+                    let (p, mut fl) = run_file(f);
+                    passed += p;
+                    fails.append(&mut fl);
+                }
+            }
+            if skipped > 0 {
+                println!("{skipped} cases skipped (transition forks, as revme does)");
             }
             for f in fails.iter().take(show) {
                 println!("FAIL {f}");
