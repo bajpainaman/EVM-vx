@@ -14,6 +14,19 @@ The pairing-based precompiles (bn254 at 0x06–0x08, KZG at 0x0a, BLS12-381 at 0
 
 Not yet done: the parallel executor, and native Vx versions of the pairing precompiles. No performance claim is made; the 20× goal is still an ambition.
 
+## Test results (2026-10-26)
+
+Every case passes against the official Ethereum fixtures, with the roots checked the way `revme` checks them:
+
+| Suite | Passed | Failed |
+|---|---|---|
+| EEST develop state tests, Frontier to Osaka | 63,314 | 0 |
+| EEST develop blockchain tests | 61,391 | 0 |
+| Legacy Cancun state tests | 108,134 | 0 |
+| Legacy Constantinople state tests | 20,690 | 0 |
+
+The skip list is revm's own (`skip_test` in `harness/src/main.rs`). Amsterdam (devnet) fixtures are not run yet.
+
 ## Run the tests
 
 The tests need the fixed Vx compiler (upstream dc6a460 plus the local fixes in [section 8 of the feasibility report](docs/research/feasibility.md#8-compiler-defects-fixes-and-upstream-issues)), LLVM/Clang 22, Rust and Python 3. Set `VXC` to the compiler wrapper if it is not at the default path in `scripts/vxc`. Compiler quirks the code works around are in [docs/VX_NOTES.md](docs/VX_NOTES.md).
