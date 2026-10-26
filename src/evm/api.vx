@@ -504,3 +504,28 @@ pub fn evmvx_abi_sizes(out: *mut u64) -> void {
     out[6u64] = sizeof<VxAuth>() as u64;
   }
 }
+
+// A system call (revm run_system_call): a call from env.caller to env.to with
+// env.gas_limit gas, without validation, fees, nonce bump, authorizations or
+// refunds. Used by the block layer for EIP-2935, EIP-4788, EIP-7002 and
+// EIP-7251.
+pub fn evmvx_system_call(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
+  let c: *mut Ctx = ctx_new(host, env);
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let tabs: *mut OpTabs = tabs_new(e.spec);
+  let res: *mut VxResult = result_alloc();
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  let caller_idx: u64 = acc_load(c, e.caller);
+  run_tx_call(c, env, caller_idx, e.gas_limit, tabs, res);
+  if is_fatal(c) { r.status = RES_HOST_FAILURE; return res; }
+  let gas_left: u64 = r.gas_used;
+  let result: u64 = r.reason;
+  r.gas_used = e.gas_limit - gas_left;
+  r.gas_refunded = 0u64;
+  if r_is_ok(result) { r.status = RES_SUCCESS; }
+  else if result == R_REVERT { r.status = RES_REVERT; }
+  else { r.status = RES_HALT; }
+  finalize_state(c);
+  collect_state(c, res);
+  return res;
+}

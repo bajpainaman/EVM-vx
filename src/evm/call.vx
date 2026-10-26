@@ -229,9 +229,13 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
 
   let jn: u64 = journal_len(c);
   let ln: u64 = log_len(c);
-  if has_transfer {
-    // CALL sends to `to`; CALLCODE's value stays with the executing account.
-    let err: u64 = transfer_loaded(c, frame_acct(f), acct_idx, value);
+  // revm CallValue::Transfer: every kind but DELEGATECALL transfers (zero for
+  // STATICCALL), which touches the recipient. CALL sends to `to`; CALLCODE's
+  // value stays with the executing account, so its transfer touches nothing.
+  if op != OP_DELEGATECALL {
+    let mut tv: U256 = u256_zero();
+    if has_transfer { tv = value; }
+    let err: u64 = transfer_loaded(c, frame_acct(f), acct_idx, tv);
     if err != 0u64 {
       journal_revert(c, jn, ln);
       finish_call(c, f, o, false, child_gas, out_off, out_len, R_OUT_OF_FUNDS);
@@ -239,9 +243,6 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
       unsafe { free(oraw); }
       return R_CONTINUE;
     }
-  } else if op == OP_CALL {
-    // A zero-value CALL still touches the recipient.
-    let _e: u64 = transfer_loaded(c, frame_acct(f), i, u256_zero());
   }
 
   let pid: u64 = precompile_id(to, c);
