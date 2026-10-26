@@ -12,7 +12,7 @@ Three choices let the core move to a GPU or other device without a rewrite:
 
 The pairing-based precompiles (bn254 at 0x06–0x08, KZG at 0x0a, BLS12-381 at 0x0b–0x11) come from a stateless crypto provider, `evmvx_crypto_precompile`. That matches revm, which takes them from its `crypto()` backends. The harness backs the provider with revm's own precompiles. Every other precompile is written in Vx.
 
-Not yet done: the parallel executor, and native Vx versions of the pairing precompiles. No performance claim is made; the 20× goal is still an ambition.
+Not yet done: the parallel executor, and native Vx versions of the pairing precompiles. See [What's next](#whats-next). No performance claim is made; the 20× goal is still an ambition.
 
 ## Test results (2026-10-26)
 
@@ -26,6 +26,18 @@ Every case passes against the official Ethereum fixtures, with the roots checked
 | Legacy Constantinople state tests | 20,690 | 0 |
 
 The skip list is revm's own (`skip_test` in `harness/src/main.rs`). Amsterdam (devnet) fixtures are not run yet.
+
+## What's next
+
+In order:
+
+1. **Three open decisions.** Each takes a few minutes.
+   - Merge `vx-evm` into `main` through a pull request.
+   - Report the Vx byte-index miscompile upstream. A read such as `buf[135]` through a `*mut u8` reads `buf[-121]`. The workaround is in [docs/VX_NOTES.md](docs/VX_NOTES.md).
+   - Run the Amsterdam devnet fixtures. Amsterdam is not on mainnet yet.
+2. **M4: the parallel executor.** The parallel executor is the project's primary goal: Block-STM-style execution with multi-version reads, parallel validation and fee-recipient deltas, plus a benchmark against revm. It builds on the explicit frame stack and the `StateDb`. Expect several days of work.
+3. **Native Vx pairing precompiles.** bn254, KZG and BLS12-381 still run revm's code through `evmvx_crypto_precompile`, which is a host call. They must move into Vx before any GPU work.
+4. **M5: the GPU step.** It depends on items 2 and 3. It also needs a test kernel to show whether the Vx GPU backend can compile the interpreter loop. Its GPU model today is `across` loops in `spawn on` regions.
 
 ## Run the tests
 
