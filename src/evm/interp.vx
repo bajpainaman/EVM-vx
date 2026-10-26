@@ -1,0 +1,102 @@
+// The interpreter loop: fetch, charge static gas, check the stack, dispatch.
+
+fn run_frame(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let traw: *mut i8 = unsafe { calloc(2u64, 8u64) };
+  let tmp: *mut u64 = traw;
+  let sraw: *mut i8 = unsafe { calloc(1u64, sizeof<SdResult>() as u64) };
+  let sd: *mut SdResult = sraw;
+  let res: u64 = run_loop(c, f, tmp, sd);
+  unsafe { free(traw); free(sraw); }
+  return res;
+}
+
+fn run_loop(c: *mut Ctx, f: *mut Frame, tmp: *mut u64, sd: *mut SdResult) -> u64 {
+  let spec: u64 = ctx_spec(c);
+  loop {
+    let fr: &mut Frame = unsafe { &mut f[0u64] };
+    if fr.pc >= fr.code_len { return R_STOP; }
+    let code: *mut u8 = fr.code;
+    let opb: u8 = unsafe { code[fr.pc] };
+    let op: u64 = opb as u64;
+    fr.pc = fr.pc + 1u64;
+    let tp: *mut OpTabs = fr.tabs;
+    let t: &mut OpTabs = unsafe { &mut tp[0u64] };
+    let actp: *mut u8 = t.act;
+    let a: u8 = unsafe { actp[op] };
+    if a == 0u8 { return R_OPCODE_NOT_FOUND; }
+    if a == 2u8 { return R_NOT_ACTIVATED; }
+    let gp: *mut u64 = t.gas;
+    let g: u64 = unsafe { gp[op] };
+    if g > fr.gas { return R_OOG; }
+    fr.gas = fr.gas - g;
+    let sip: *mut u8 = t.sin;
+    let sop: *mut u8 = t.sout;
+    let si: u64 = (unsafe { sip[op] }) as u64;
+    let so: u64 = (unsafe { sop[op] }) as u64;
+    if fr.sp < si { return R_STACK_UNDERFLOW; }
+    if fr.sp - si + so > STACK_LIMIT { return R_STACK_OVERFLOW; }
+    let r: u64 = dispatch(c, f, op, spec, tmp, sd);
+    if r != R_CONTINUE { return r; }
+    if is_fatal(c) { return R_FATAL; }
+  }
+  return R_STOP;
+}
+
+fn ctx_spec(c: *mut Ctx) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.spec;
+}
+
+fn dispatch(c: *mut Ctx, f: *mut Frame, op: u64, spec: u64, tmp: *mut u64, sd: *mut SdResult) -> u64 {
+  if op >= 95u64 && op <= 127u64 { return op_push(f, op - 95u64); }
+  if op >= 128u64 && op <= 143u64 { return op_dup(f, op - 127u64); }
+  if op >= 144u64 && op <= 159u64 { return op_swap(f, op - 143u64); }
+  if op >= 160u64 && op <= 164u64 { return op_log(c, f, op - 160u64); }
+  let o: i32 = op as i32;
+  match o {
+    0 => { return R_STOP; }
+    8 => { return op_ternary_mod(f, op); }
+    9 => { return op_ternary_mod(f, op); }
+    10 => { return op_exp(f, spec); }
+    21 => { return op_unary(f, op); }
+    25 => { return op_unary(f, op); }
+    30 => { return op_unary(f, op); }
+    32 => { return op_keccak(f); }
+    49 => { return op_balance(c, f); }
+    53 => { return op_calldataload(f); }
+    55 => { return op_copy(f, 0u64, tmp); }
+    57 => { return op_copy(f, 1u64, tmp); }
+    59 => { return op_extcodesize(c, f); }
+    60 => { return op_extcodecopy(c, f, tmp); }
+    62 => { return op_copy(f, 2u64, tmp); }
+    63 => { return op_extcodehash(c, f); }
+    64 => { return op_blockhash(c, f); }
+    71 => { return op_selfbalance(c, f); }
+    73 => { return op_blobhash(c, f); }
+    80 => { let _v: U256 = stack_pop(f); return R_CONTINUE; }
+    81 => { return op_mload(f); }
+    82 => { return op_mstore(f, false); }
+    83 => { return op_mstore(f, true); }
+    84 => { return op_sload(c, f); }
+    85 => { return op_sstore(c, f); }
+    86 => { return op_jump(f, false); }
+    87 => { return op_jump(f, true); }
+    91 => { return R_CONTINUE; }
+    92 => { return op_tload(c, f); }
+    93 => { return op_tstore(c, f); }
+    94 => { return op_mcopy(f); }
+    240 => { return op_create(c, f, false); }
+    241 => { return op_call(c, f, op); }
+    242 => { return op_call(c, f, op); }
+    243 => { return op_return(f, R_RETURN); }
+    244 => { return op_call(c, f, op); }
+    245 => { return op_create(c, f, true); }
+    250 => { return op_call(c, f, op); }
+    253 => { return op_return(f, R_REVERT); }
+    254 => { return R_INVALID_FE; }
+    255 => { return op_selfdestruct(c, f, sd); }
+    _ => {}
+  }
+  if (op >= 1u64 && op <= 29u64) { return op_binary(f, op); }
+  return op_env_push(c, f, op);
+}

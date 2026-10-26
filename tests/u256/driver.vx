@@ -1,0 +1,89 @@
+// Test driver: reads "count" then per case "opcode a b c" (each word as four
+// little-endian 16-hex-digit limbs, opcode as one 16-digit word) and prints
+// one result word per case. a is the top of the EVM stack.
+import evm::u256;
+
+extern "C" {
+  fn getchar() -> i32;
+  fn putchar(c: i32) -> i32;
+}
+
+fn read64() -> u64 {
+  let mut c: i32 = unsafe { getchar() };
+  while c <= 32 && c >= 0 { c = unsafe { getchar() }; }
+  let mut v: u64 = 0u64;
+  let mut j: i32 = 0;
+  while j < 16 {
+    let mut d: i32 = c - 48;
+    if c >= 97 { d = c - 87; }
+    v = (v << 4u64) | (d as u64);
+    j = j + 1;
+    c = unsafe { getchar() };
+  }
+  return v;
+}
+
+fn read_word() -> U256 {
+  let a = read64(); let b = read64(); let c = read64(); let d = read64();
+  return U256 { l0: a, l1: b, l2: c, l3: d };
+}
+
+fn write64(v: u64) -> void {
+  let mut j: i32 = 15;
+  while j >= 0 {
+    let d = ((v >> ((j * 4) as u64)) & 15u64) as i32;
+    let mut c = d + 48;
+    if d >= 10 { c = d + 87; }
+    unsafe { putchar(c); }
+    j = j - 1;
+  }
+}
+
+fn write_word(x: U256) -> void {
+  write64(x.l0); unsafe { putchar(32); }
+  write64(x.l1); unsafe { putchar(32); }
+  write64(x.l2); unsafe { putchar(32); }
+  write64(x.l3); unsafe { putchar(10); }
+}
+
+fn execute(op: u64, a: U256, b: U256, c: U256) -> U256 {
+  if op == 1u64 { return u256_add(a, b); }
+  if op == 2u64 { return u256_mul(a, b); }
+  if op == 3u64 { return u256_sub(a, b); }
+  if op == 4u64 { return u256_div(a, b); }
+  if op == 5u64 { return u256_sdiv(a, b); }
+  if op == 6u64 { return u256_mod(a, b); }
+  if op == 7u64 { return u256_smod(a, b); }
+  if op == 8u64 { return u256_addmod(a, b, c); }
+  if op == 9u64 { return u256_mulmod(a, b, c); }
+  if op == 10u64 { return u256_exp(a, b); }
+  if op == 11u64 { return u256_signextend(a, b); }
+  if op == 16u64 { return u256_from_bool(u256_lt(a, b)); }
+  if op == 17u64 { return u256_from_bool(u256_gt(a, b)); }
+  if op == 18u64 { return u256_from_bool(u256_slt(a, b)); }
+  if op == 19u64 { return u256_from_bool(u256_sgt(a, b)); }
+  if op == 20u64 { return u256_from_bool(u256_eq(a, b)); }
+  if op == 21u64 { return u256_from_bool(u256_is_zero(a)); }
+  if op == 22u64 { return u256_and(a, b); }
+  if op == 23u64 { return u256_or(a, b); }
+  if op == 24u64 { return u256_xor(a, b); }
+  if op == 25u64 { return u256_not(a); }
+  if op == 26u64 { return u256_byte(a, b); }
+  if op == 27u64 { return u256_shl(b, a); }
+  if op == 28u64 { return u256_shr(b, a); }
+  if op == 29u64 { return u256_sar(b, a); }
+  // Unknown opcodes print all ones so the oracle reports a mismatch.
+  return u256_max();
+}
+
+fn main() -> i32 {
+  let count = read64();
+  let mut i: u64 = 0u64;
+  while i < count {
+    let op = read64();
+    let a = read_word(); let b = read_word(); let c = read_word();
+    write_word(execute(op, a, b, c));
+    i = i + 1u64;
+  }
+  return 0;
+}

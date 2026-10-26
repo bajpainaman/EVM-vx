@@ -1,0 +1,94 @@
+// Environment, block and transaction opcodes.
+
+fn env_ref(c: *mut Ctx) -> *mut VxEnv { return ctx_env(c); }
+
+// revm effective_gas_price: the gas price for legacy and EIP-2930 transactions,
+// otherwise min(max fee, base fee + priority fee).
+fn effective_gas_price(c: *mut Ctx) -> U256 {
+  let ep: *mut VxEnv = env_ref(c);
+  let e: &mut VxEnv = unsafe { &mut ep[0u64] };
+  if e.tx_type == TX_LEGACY || e.tx_type == TX_EIP2930 { return e.gas_price; }
+  let mut prio: U256 = u256_zero();
+  if e.has_priority_fee != 0u64 { prio = e.priority_fee; }
+  let sum: U256 = u256_add(u256_from_u64(e.basefee), prio);
+  if u256_lt(sum, e.gas_price) { return sum; }
+  return e.gas_price;
+}
+
+// Opcodes that push a value read from the frame or the environment.
+fn op_env_push(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
+  let ep: *mut VxEnv = env_ref(c);
+  let e: &mut VxEnv = unsafe { &mut ep[0u64] };
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let mut v: U256 = u256_zero();
+  let o: i32 = op as i32;
+  match o {
+    48 => { v = frame_word(f, FW_TARGET); }
+    50 => { v = e.caller; }
+    51 => { v = frame_word(f, FW_CALLER); }
+    52 => { v = frame_word(f, FW_VALUE); }
+    54 => { v = u256_from_u64(fr.input_len); }
+    56 => { v = u256_from_u64(fr.code_len); }
+    58 => { v = effective_gas_price(c); }
+    61 => { v = u256_from_u64(fr.ret_len); }
+    65 => { v = e.coinbase; }
+    66 => { v = e.timestamp; }
+    67 => { v = e.number; }
+    68 => {
+      if spec_on(c, SPEC_MERGE) { v = e.prevrandao; } else { v = e.difficulty; }
+    }
+    69 => { v = u256_from_u64(e.block_gas_limit); }
+    70 => { v = u256_from_u64(e.chain_id); }
+    72 => { v = u256_from_u64(e.basefee); }
+    74 => { v = e.blob_gasprice; }
+    88 => { v = u256_from_u64(fr.pc - 1u64); }
+    89 => { v = u256_from_u64(fr.mem_len); }
+    90 => { v = u256_from_u64(fr.gas); }
+    _ => { v = u256_zero(); }
+  }
+  stack_push(f, v);
+  return R_CONTINUE;
+}
+
+fn op_blobhash(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let i: U256 = stack_pop(f);
+  let ep: *mut VxEnv = env_ref(c);
+  let e: &mut VxEnv = unsafe { &mut ep[0u64] };
+  if u256_fits_u64(i) && i.l0 < e.blob_count {
+    let hs: *mut U256 = e.blob_hashes;
+    stack_push(f, unsafe { hs[i.l0] });
+  } else {
+    stack_push(f, u256_zero());
+  }
+  return R_CONTINUE;
+}
+
+// BLOCKHASH: the hash of one of the 256 most recent blocks, else zero.
+fn op_blockhash(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let req: U256 = stack_pop(f);
+  let ep: *mut VxEnv = env_ref(c);
+  let e: &mut VxEnv = unsafe { &mut ep[0u64] };
+  let cur: U256 = e.number;
+  if u256_lt(cur, req) {
+    stack_push(f, u256_zero());
+    return R_CONTINUE;
+  }
+  let diff: u64 = u256_sat_u64(u256_sub(cur, req));
+  if diff == 0u64 || diff > 256u64 {
+    stack_push(f, u256_zero());
+    return R_CONTINUE;
+  }
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let sp: *mut U256 = cx.scratch;
+  let st: u64 = unsafe { evmvx_host_block_hash(cx.host, u256_sat_u64(req), sp) };
+  if st != HOST_OK { return R_FATAL; }
+  stack_push(f, unsafe { sp[0u64] });
+  return R_CONTINUE;
+}
+
+fn op_selfbalance(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let i: u64 = fr.acct;
+  stack_push(f, acc_bal(c, i));
+  return R_CONTINUE;
+}

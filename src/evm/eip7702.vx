@@ -1,0 +1,109 @@
+// EIP-7702 authorization lists (revm pre_execution::apply_auth_list, with the
+// signature rules of alloy-eip7702 recover_authority).
+
+// Writes the RLP encoding of an unsigned integer at buf + off; returns the new offset.
+fn rlp_put_uint(buf: *mut u8, off: u64, v: U256) -> u64 {
+  if u256_is_zero(v) {
+    unsafe { buf[off] = 128u8; }
+    return off + 1u64;
+  }
+  let n: u64 = u256_byte_len(v) as u64;
+  if n == 1u64 && v.l0 < 128u64 {
+    unsafe { buf[off] = v.l0 as u8; }
+    return off + 1u64;
+  }
+  unsafe { buf[off] = (128u64 + n) as u8; }
+  let tmp: *mut u8 = zalloc(32u64);
+  u256_store_be(tmp, v);
+  let src: *mut u8 = offset_mut(tmp, (32u64 - n) as i64);
+  let dst: *mut u8 = offset_mut(buf, (off + 1u64) as i64);
+  copy_bytes(dst, src, n);
+  mfree(tmp);
+  return off + 1u64 + n;
+}
+
+// keccak256(0x05 || rlp([chain_id, address, nonce])).
+fn auth_signing_hash(chain_id: U256, address: U256, nonce: u64) -> U256 {
+  let body: *mut u8 = zalloc(96u64);
+  let mut p: u64 = rlp_put_uint(body, 0u64, chain_id);
+  unsafe { body[p] = 148u8; }
+  let a: *mut u8 = offset_mut(body, (p + 1u64) as i64);
+  address_store(a, address);
+  p = p + 21u64;
+  p = rlp_put_uint(body, p, u256_from_u64(nonce));
+  let msg: *mut u8 = zalloc(128u64);
+  unsafe { msg[0u64] = 5u8; }
+  let mut h: u64 = 1u64;
+  if p < 56u64 {
+    unsafe { msg[1u64] = (192u64 + p) as u8; }
+    h = 2u64;
+  } else {
+    unsafe { msg[1u64] = 248u8; msg[2u64] = p as u8; }
+    h = 3u64;
+  }
+  let dst: *mut u8 = offset_mut(msg, h as i64);
+  copy_bytes(dst, body, p);
+  let hash: U256 = keccak256(msg, h + p);
+  mfree(body);
+  mfree(msg);
+  return hash;
+}
+
+// secp256k1n / 2.
+fn secp_n_half() -> U256 { return u256_shr(secp_n(), u256_one()); }
+
+// Recovers the authority of one signed authorization into *out. False when the
+// signature is invalid (bad parity, high s, or no recovery).
+fn recover_authority(a: *mut VxAuth, out: *mut U256) -> bool {
+  let au: &mut VxAuth = unsafe { &mut a[0u64] };
+  if au.y_parity > 1u64 { return false; }
+  if u256_gt(au.s, secp_n_half()) { return false; }
+  let h: U256 = auth_signing_hash(au.chain_id, au.address, au.nonce);
+  let addr: *mut u8 = zalloc(20u64);
+  let ok: bool = ecdsa_recover(h, au.y_parity, au.r, au.s, addr);
+  if ok { unsafe { out[0u64] = u256_load_be_n(addr, 20u64, 0u64, 20u64); } }
+  mfree(addr);
+  return ok;
+}
+
+// Applies the transaction's authorization list. Returns the gas refund for
+// authorities that already existed (12500 each, Prague).
+fn apply_auth_list(c: *mut Ctx, env: *mut VxEnv) -> u64 {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  if e.tx_type != TX_EIP7702 { return 0u64; }
+  let auths: *mut VxAuth = e.auths;
+  let chain: U256 = u256_from_u64(e.chain_id);
+  let who: *mut U256 = calloc_words(1u64);
+  let mut refunded: u64 = 0u64;
+  let mut k: u64 = 0u64;
+  while k < e.auth_count {
+    let ap: *mut VxAuth = offset_mut(auths, k as i64);
+    let au: &mut VxAuth = unsafe { &mut ap[0u64] };
+    let cid: U256 = au.chain_id;
+    let nonce: u64 = au.nonce;
+    let target: U256 = au.address;
+    let chain_ok: bool = u256_is_zero(cid) || u256_eq(cid, chain);
+    if chain_ok && nonce != 18446744073709551615u64 && recover_authority(ap, who) {
+      let authority: U256 = unsafe { who[0u64] };
+      let i: u64 = acc_load(c, authority);
+      let code: *mut u8 = acc_code(c, i);
+      let clen: u64 = acc_code_len(c, i);
+      let code_ok: bool = clen == 0u64 || is_delegation(code, clen);
+      if code_ok && nonce == acc_nonce(c, i) {
+        let existed: bool = !(acc_is_empty(c, i) && acc_has(c, i, ACC_NOT_EXISTING) && !acc_has(c, i, ACC_TOUCHED));
+        if existed { refunded = refunded + 1u64; }
+        if u256_is_zero(target) {
+          acc_set_code(c, i, keccak_empty(), zalloc(1u64), 0u64);
+        } else {
+          let d: *mut u8 = make_delegation(target);
+          acc_set_code(c, i, keccak256(d, 23u64), d, 23u64);
+        }
+        acc_bump_nonce(c, i);
+      }
+    }
+    k = k + 1u64;
+  }
+  let wr: *mut i8 = who;
+  unsafe { free(wr); }
+  return refunded * 12500u64;
+}

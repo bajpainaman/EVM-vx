@@ -1,0 +1,158 @@
+// Opcodes that read or write accounts, storage and logs (revm instructions/host.rs).
+
+const COLD_ACCOUNT_EXTRA: u64 = 2500u64;
+const COLD_SLOAD_EXTRA: u64 = 2000u64;
+
+// Loads an account for an opcode and charges the Berlin cold-access surcharge.
+// Returns the account index, or MAP_NONE when out of gas.
+fn access_account(c: *mut Ctx, f: *mut Frame, a: U256) -> u64 {
+  let i: u64 = acc_load(c, a);
+  if last_cold(c) && spec_on(c, SPEC_BERLIN) {
+    if !charge(f, COLD_ACCOUNT_EXTRA) { return MAP_NONE; }
+  }
+  return i;
+}
+
+fn op_balance(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let a: U256 = u256_to_address(stack_pop(f));
+  let i: u64 = access_account(c, f, a);
+  if i == MAP_NONE { return R_OOG; }
+  stack_push(f, acc_bal(c, i));
+  return R_CONTINUE;
+}
+
+fn op_extcodesize(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let a: U256 = u256_to_address(stack_pop(f));
+  let i: u64 = access_account(c, f, a);
+  if i == MAP_NONE { return R_OOG; }
+  stack_push(f, u256_from_u64(acc_code_len(c, i)));
+  return R_CONTINUE;
+}
+
+fn op_extcodehash(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let a: U256 = u256_to_address(stack_pop(f));
+  let i: u64 = access_account(c, f, a);
+  if i == MAP_NONE { return R_OOG; }
+  if acc_is_empty(c, i) { stack_push(f, u256_zero()); }
+  else { stack_push(f, acc_hash(c, i)); }
+  return R_CONTINUE;
+}
+
+fn op_extcodecopy(c: *mut Ctx, f: *mut Frame, tmp: *mut u64) -> u64 {
+  let a: U256 = u256_to_address(stack_pop(f));
+  let mem_off: U256 = stack_pop(f);
+  let code_off: U256 = stack_pop(f);
+  let lenw: U256 = stack_pop(f);
+  if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = lenw.l0;
+  let r: u64 = copy_prepare(f, mem_off, len, tmp);
+  if r != R_CONTINUE { return r; }
+  let i: u64 = access_account(c, f, a);
+  if i == MAP_NONE { return R_OOG; }
+  if len == 0u64 { return R_CONTINUE; }
+  let moff: u64 = unsafe { tmp[0u64] };
+  mem_set_data(f, moff, acc_code(c, i), acc_code_len(c, i), u256_sat_u64(code_off), len);
+  return R_CONTINUE;
+}
+
+fn op_sload(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let k: U256 = stack_pop(f);
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let i: u64 = fr.acct;
+  let v: U256 = sload(c, i, k);
+  if last_cold(c) && spec_on(c, SPEC_BERLIN) {
+    if !charge(f, COLD_SLOAD_EXTRA) { return R_OOG; }
+  }
+  stack_push(f, v);
+  return R_CONTINUE;
+}
+
+fn frame_is_static(f: *mut Frame) -> bool {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  return fr.is_static != 0u64;
+}
+
+fn frame_acct(f: *mut Frame) -> u64 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  return fr.acct;
+}
+
+fn op_sstore(c: *mut Ctx, f: *mut Frame) -> u64 {
+  if frame_is_static(f) { return R_STATE_CHANGE_STATIC; }
+  let k: U256 = stack_pop(f);
+  let v: U256 = stack_pop(f);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let spec: u64 = cx.spec;
+  if spec >= SPEC_ISTANBUL && frame_gas(f) <= 2300u64 { return R_REENTRANCY_OOG; }
+  if !charge(f, sstore_static(spec)) { return R_OOG; }
+  let i: u64 = frame_acct(f);
+  acc_touch(c, i);
+  let s: u64 = slot_load(c, i, k);
+  let cold: bool = last_cold(c) && spec >= SPEC_BERLIN;
+  let o: U256 = slot_orig(c, s);
+  let p: U256 = slot_cur(c, s);
+  sstore_write(c, s, v);
+  if !charge(f, sstore_dynamic(spec, o, p, v, cold)) { return R_OOG; }
+  add_refund(f, sstore_refund(spec, o, p, v));
+  return R_CONTINUE;
+}
+
+fn op_tload(c: *mut Ctx, f: *mut Frame) -> u64 {
+  let k: U256 = stack_pop(f);
+  stack_push(f, tload(c, frame_word(f, FW_TARGET), k));
+  return R_CONTINUE;
+}
+
+fn op_tstore(c: *mut Ctx, f: *mut Frame) -> u64 {
+  if frame_is_static(f) { return R_STATE_CHANGE_STATIC; }
+  let k: U256 = stack_pop(f);
+  let v: U256 = stack_pop(f);
+  tstore(c, frame_word(f, FW_TARGET), k, v);
+  return R_CONTINUE;
+}
+
+fn op_log(c: *mut Ctx, f: *mut Frame, n: u64) -> u64 {
+  if frame_is_static(f) { return R_STATE_CHANGE_STATIC; }
+  let off: U256 = stack_pop(f);
+  let lenw: U256 = stack_pop(f);
+  if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = lenw.l0;
+  if !charge(f, sat_add(sat_mul(8u64, len), 375u64 * n)) { return R_OOG; }
+  let mut data: *mut u8 = zalloc(1u64);
+  if len != 0u64 {
+    if !fits(off) { return R_INVALID_OPERAND_OOG; }
+    let r: u64 = mem_expand(f, off.l0, len);
+    if r != R_CONTINUE { return r; }
+    let fr: &mut Frame = unsafe { &mut f[0u64] };
+    let src: *mut u8 = offset_mut(fr.mem, off.l0 as i64);
+    mfree(data);
+    data = dup_bytes(src, len);
+  }
+  let mut t0: U256 = u256_zero();
+  let mut t1: U256 = u256_zero();
+  let mut t2: U256 = u256_zero();
+  let mut t3: U256 = u256_zero();
+  if n >= 1u64 { t0 = stack_pop(f); }
+  if n >= 2u64 { t1 = stack_pop(f); }
+  if n >= 3u64 { t2 = stack_pop(f); }
+  if n >= 4u64 { t3 = stack_pop(f); }
+  log_push(c, frame_word(f, FW_TARGET), n, t0, t1, t2, t3, data, len);
+  return R_CONTINUE;
+}
+
+fn op_selfdestruct(c: *mut Ctx, f: *mut Frame, res: *mut SdResult) -> u64 {
+  if frame_is_static(f) { return R_STATE_CHANGE_STATIC; }
+  let target: U256 = u256_to_address(stack_pop(f));
+  selfdestruct(c, frame_acct(f), target, res);
+  let r: &mut SdResult = unsafe { &mut res[0u64] };
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let spec: u64 = cx.spec;
+  let mut topup: bool = r.target_exists == 0u64;
+  if spec >= SPEC_SPURIOUS_DRAGON { topup = r.had_value != 0u64 && r.target_exists == 0u64; }
+  let mut g: u64 = 0u64;
+  if topup && spec >= SPEC_TANGERINE { g = g + 25000u64; }
+  if r.is_cold != 0u64 && spec >= SPEC_BERLIN { g = g + 2600u64; }
+  if !charge(f, g) { return R_OOG; }
+  if r.previously_destroyed == 0u64 && spec < SPEC_LONDON { add_refund(f, 24000i64); }
+  return R_SELFDESTRUCT;
+}

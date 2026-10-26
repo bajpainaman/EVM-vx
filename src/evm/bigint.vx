@@ -1,0 +1,253 @@
+// Arbitrary-length unsigned integers as little-endian u64 limb arrays.
+// Used by MODEXP. A number is (pointer, limb count); leading zero limbs are allowed.
+
+const LIMB_MASK: u128 = 18446744073709551615u128;
+
+fn limbs_alloc(n: u64) -> *mut u64 {
+  let mut m: u64 = n;
+  if m == 0u64 { m = 1u64; }
+  let raw: *mut i8 = unsafe { calloc(m, 8u64) };
+  let p: *mut u64 = raw;
+  return p;
+}
+
+fn limbs_free(p: *mut u64) -> void {
+  let raw: *mut i8 = p;
+  unsafe { free(raw); }
+}
+
+fn limb(p: *mut u64, i: u64) -> u64 { return unsafe { p[i] }; }
+
+fn set_limb_at(p: *mut u64, i: u64, v: u64) -> void { unsafe { p[i] = v; } }
+
+// Big-endian bytes to n = ceil(len / 8) limbs.
+fn limbs_from_be(b: *mut u8, len: u64) -> *mut u64 {
+  let n: u64 = (len + 7u64) / 8u64;
+  let p: *mut u64 = limbs_alloc(n);
+  let mut i: u64 = 0u64;
+  while i < len {
+    let byte: u8 = unsafe { b[len - 1u64 - i] };
+    let k: u64 = i / 8u64;
+    set_limb_at(p, k, limb(p, k) | ((byte as u64) << ((i % 8u64) * 8u64)));
+    i = i + 1u64;
+  }
+  return p;
+}
+
+// Writes the low out_len bytes of (p, n) big endian to out, zero padded on the left.
+fn limbs_to_be(p: *mut u64, n: u64, out: *mut u8, out_len: u64) -> void {
+  let mut i: u64 = 0u64;
+  while i < out_len {
+    let k: u64 = i / 8u64;
+    let mut byte: u64 = 0u64;
+    if k < n { byte = (limb(p, k) >> ((i % 8u64) * 8u64)) & 255u64; }
+    unsafe { out[out_len - 1u64 - i] = byte as u8; }
+    i = i + 1u64;
+  }
+}
+
+// Significant limbs (0 for zero).
+fn limbs_len(p: *mut u64, n: u64) -> u64 {
+  let mut k: u64 = n;
+  while k > 0u64 && limb(p, k - 1u64) == 0u64 { k = k - 1u64; }
+  return k;
+}
+
+fn clz64(x: u64) -> u64 {
+  let mut n: u64 = 0u64;
+  let mut v: u64 = x;
+  if v == 0u64 { return 64u64; }
+  while (v & 9223372036854775808u64) == 0u64 {
+    v = v << 1u64;
+    n = n + 1u64;
+  }
+  return n;
+}
+
+// r (an + bn limbs) = a * b.
+fn limbs_mul(a: *mut u64, an: u64, b: *mut u64, bn: u64, r: *mut u64) -> void {
+  let mut i: u64 = 0u64;
+  while i < an + bn {
+    set_limb_at(r, i, 0u64);
+    i = i + 1u64;
+  }
+  i = 0u64;
+  while i < an {
+    let ai: u128 = limb(a, i) as u128;
+    if ai != 0u128 {
+      let mut carry: u128 = 0u128;
+      let mut j: u64 = 0u64;
+      while j < bn {
+        let t: u128 = ai * (limb(b, j) as u128) + (limb(r, i + j) as u128) + carry;
+        set_limb_at(r, i + j, (t & LIMB_MASK) as u64);
+        carry = t >> 64u128;
+        j = j + 1u64;
+      }
+      set_limb_at(r, i + bn, carry as u64);
+    }
+    i = i + 1u64;
+  }
+}
+
+// rem (mn limbs) = u mod m, for un limbs of u. m must be nonzero.
+// Knuth, TAOCP vol. 2, 4.3.1, Algorithm D, computing only the remainder.
+fn limbs_mod(u: *mut u64, un_in: u64, m: *mut u64, mn_in: u64, rem: *mut u64) -> void {
+  let mut i: u64 = 0u64;
+  while i < mn_in {
+    set_limb_at(rem, i, 0u64);
+    i = i + 1u64;
+  }
+  let n: u64 = limbs_len(m, mn_in);
+  let ul: u64 = limbs_len(u, un_in);
+  if ul < n || (ul == n && limbs_lt(u, m, n)) {
+    i = 0u64;
+    while i < ul {
+      set_limb_at(rem, i, limb(u, i));
+      i = i + 1u64;
+    }
+    return;
+  }
+  if n == 1u64 {
+    let d: u128 = limb(m, 0u64) as u128;
+    let mut r: u128 = 0u128;
+    let mut k: u64 = ul;
+    while k > 0u64 {
+      k = k - 1u64;
+      r = ((r << 64u128) | (limb(u, k) as u128)) % d;
+    }
+    set_limb_at(rem, 0u64, r as u64);
+    return;
+  }
+  let s: u64 = clz64(limb(m, n - 1u64));
+  let vn: *mut u64 = limbs_alloc(n);
+  let unp: *mut u64 = limbs_alloc(ul + 1u64);
+  shl_limbs(m, n, s, vn, n);
+  shl_limbs(u, ul, s, unp, ul + 1u64);
+  let vtop: u128 = limb(vn, n - 1u64) as u128;
+  let vnext: u128 = limb(vn, n - 2u64) as u128;
+  let base: u128 = 1u128 << 64u128;
+  let mut j: u64 = ul - n + 1u64;
+  while j > 0u64 {
+    j = j - 1u64;
+    let num: u128 = ((limb(unp, j + n) as u128) << 64u128) | (limb(unp, j + n - 1u64) as u128);
+    let mut qhat: u128 = num / vtop;
+    let mut rhat: u128 = num % vtop;
+    loop {
+      if qhat < base && qhat * vnext <= ((rhat << 64u128) | (limb(unp, j + n - 2u64) as u128)) { break; }
+      qhat = qhat - 1u128;
+      rhat = rhat + vtop;
+      if rhat >= base { break; }
+    }
+    // un[j .. j + n] -= qhat * vn
+    let mut carry: u128 = 0u128;
+    let mut k: u64 = 0u64;
+    while k < n {
+      let p: u128 = qhat * (limb(vn, k) as u128) + carry;
+      carry = p >> 64u128;
+      let plo: u64 = (p & LIMB_MASK) as u64;
+      let x: u64 = limb(unp, j + k);
+      if x >= plo { set_limb_at(unp, j + k, x - plo); }
+      else {
+        set_limb_at(unp, j + k, ((x as u128) + base - (plo as u128)) as u64);
+        carry = carry + 1u128;
+      }
+      k = k + 1u64;
+    }
+    let top: u64 = limb(unp, j + n);
+    let c64: u64 = carry as u64;
+    set_limb_at(unp, j + n, top - c64);
+    if top < c64 {
+      // qhat was one too large: add vn back.
+      let mut c: u128 = 0u128;
+      k = 0u64;
+      while k < n {
+        let t: u128 = (limb(unp, j + k) as u128) + (limb(vn, k) as u128) + c;
+        set_limb_at(unp, j + k, (t & LIMB_MASK) as u64);
+        c = t >> 64u128;
+        k = k + 1u64;
+      }
+      set_limb_at(unp, j + n, limb(unp, j + n) + (c as u64));
+    }
+  }
+  // Remainder is un[0 .. n] >> s.
+  i = 0u64;
+  while i < n {
+    let lo: u64 = limb(unp, i);
+    let mut v: u64 = lo;
+    if s > 0u64 {
+      v = lo >> s;
+      if i + 1u64 < n + 1u64 { v = v | (limb(unp, i + 1u64) << (64u64 - s)); }
+    }
+    set_limb_at(rem, i, v);
+    i = i + 1u64;
+  }
+  limbs_free(vn);
+  limbs_free(unp);
+}
+
+// a < b, both n limbs.
+fn limbs_lt(a: *mut u64, b: *mut u64, n: u64) -> bool {
+  let mut k: u64 = n;
+  while k > 0u64 {
+    k = k - 1u64;
+    let x: u64 = limb(a, k);
+    let y: u64 = limb(b, k);
+    if x != y { return x < y; }
+  }
+  return false;
+}
+
+// out (out_n limbs) = (p, n) << s, 0 <= s < 64.
+fn shl_limbs(p: *mut u64, n: u64, s: u64, out: *mut u64, out_n: u64) -> void {
+  let mut i: u64 = 0u64;
+  while i < out_n {
+    let mut v: u64 = 0u64;
+    if i < n { v = limb(p, i) << s; }
+    if s > 0u64 && i >= 1u64 && i - 1u64 < n { v = v | (limb(p, i - 1u64) >> (64u64 - s)); }
+    set_limb_at(out, i, v);
+    i = i + 1u64;
+  }
+}
+
+// base ** exp mod m, written big endian into out (out_len bytes).
+// A zero modulus gives zero.
+fn modexp_bytes(base: *mut u8, bl: u64, exp: *mut u8, el: u64, md: *mut u8, ml: u64, out: *mut u8, out_len: u64) -> void {
+  zero_bytes(out, out_len);
+  let m: *mut u64 = limbs_from_be(md, ml);
+  let mn: u64 = (ml + 7u64) / 8u64;
+  if limbs_len(m, mn) == 0u64 {
+    limbs_free(m);
+    return;
+  }
+  let b0: *mut u64 = limbs_from_be(base, bl);
+  let bn: u64 = (bl + 7u64) / 8u64;
+  let b: *mut u64 = limbs_alloc(mn);
+  limbs_mod(b0, bn, m, mn, b);
+  let r: *mut u64 = limbs_alloc(mn);
+  let one: *mut u64 = limbs_alloc(1u64);
+  set_limb_at(one, 0u64, 1u64);
+  limbs_mod(one, 1u64, m, mn, r);
+  let prod: *mut u64 = limbs_alloc(2u64 * mn);
+  let mut i: u64 = 0u64;
+  while i < el {
+    let byte: u8 = unsafe { exp[i] };
+    let mut bit: u64 = 8u64;
+    while bit > 0u64 {
+      bit = bit - 1u64;
+      limbs_mul(r, mn, r, mn, prod);
+      limbs_mod(prod, 2u64 * mn, m, mn, r);
+      if ((byte as u64) >> bit) & 1u64 == 1u64 {
+        limbs_mul(r, mn, b, mn, prod);
+        limbs_mod(prod, 2u64 * mn, m, mn, r);
+      }
+    }
+    i = i + 1u64;
+  }
+  limbs_to_be(r, mn, out, out_len);
+  limbs_free(m);
+  limbs_free(b0);
+  limbs_free(b);
+  limbs_free(r);
+  limbs_free(one);
+  limbs_free(prod);
+}

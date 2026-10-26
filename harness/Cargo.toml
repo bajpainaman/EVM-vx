@@ -1,0 +1,28 @@
+[package]
+name = "evmvx-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Runs Ethereum state tests against the Vx EVM, with revm as a differential oracle"
+publish = false
+
+[[bin]]
+name = "evmvx-test"
+path = "src/main.rs"
+
+[dependencies]
+revm = { version = "=43.0.3", default-features = false, features = [
+    "std",
+    "c-kzg",
+    "blst",
+    "serde",
+    "test-types",
+    "map-foldhash",
+] }
+alloy-rlp = { version = "0.3.12", features = ["arrayvec", "derive"] }
+alloy-trie = { version = "0.9", features = ["ethereum"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+walkdir = "2.5"
+rand = "0.8"
+
+[profile.release]
+debug = 1

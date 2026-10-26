@@ -1,0 +1,815 @@
+// Journaled state for one transaction, following revm's JournalInner.
+//
+// Accounts, storage slots and transient slots live in growable arrays and are
+// found through Map. U256 fields are kept in parallel *mut U256 arrays
+// (structure of arrays) so memory-resident structs stay flat.
+
+// Account flag bits.
+const ACC_WARM: u64 = 1u64;
+const ACC_TOUCHED: u64 = 2u64;
+const ACC_CREATED: u64 = 4u64;
+const ACC_SELFDESTRUCTED: u64 = 8u64;
+const ACC_NOT_EXISTING: u64 = 16u64;
+
+// Journal entry kinds.
+const J_WARMED: u64 = 1u64;
+const J_TOUCHED: u64 = 2u64;
+const J_DESTROYED: u64 = 3u64;
+const J_BALANCE: u64 = 4u64;
+const J_TRANSFER: u64 = 5u64;
+const J_NONCE_CHANGE: u64 = 6u64;
+const J_NONCE_BUMP: u64 = 7u64;
+const J_CREATED: u64 = 8u64;
+const J_STORAGE_CHANGED: u64 = 9u64;
+const J_STORAGE_WARMED: u64 = 10u64;
+const J_TSTORE: u64 = 11u64;
+const J_CODE_CHANGE: u64 = 12u64;
+
+// Transfer errors (0 means success).
+const XFER_OUT_OF_FUNDS: u64 = 1u64;
+const XFER_OVERFLOW: u64 = 2u64;
+const XFER_COLLISION: u64 = 3u64;
+
+struct AcctMeta {
+  nonce: u64,
+  flags: u64,
+  code: *mut u8,
+  code_len: u64,
+  jd: *mut u8,
+}
+
+struct SlotMeta {
+  acct: u64,
+  warm: u64,
+}
+
+struct JEntry {
+  kind: u64,
+  a: u64,
+  b: u64,
+  x: u64,
+  p: *mut u8,
+  n: u64,
+}
+
+struct LogMeta {
+  topic_count: u64,
+  data: *mut u8,
+  data_len: u64,
+}
+
+struct Ctx {
+  host: *mut i8,
+  env: *mut VxEnv,
+  spec: u64,
+  fatal: u64,
+  last_cold: u64,
+  scratch: *mut U256,
+  hacc: *mut HostAccount,
+  // Accounts.
+  ac_n: u64,
+  ac_cap: u64,
+  ac_addr: *mut U256,
+  ac_bal: *mut U256,
+  ac_hash: *mut U256,
+  ac_meta: *mut AcctMeta,
+  amap: *mut Map,
+  // Storage slots.
+  sl_n: u64,
+  sl_cap: u64,
+  sl_key: *mut U256,
+  sl_orig: *mut U256,
+  sl_cur: *mut U256,
+  sl_meta: *mut SlotMeta,
+  smap: *mut Map,
+  // Transient slots.
+  ts_n: u64,
+  ts_cap: u64,
+  ts_val: *mut U256,
+  tmap: *mut Map,
+  // Journal.
+  j_n: u64,
+  j_cap: u64,
+  j: *mut JEntry,
+  j_val: *mut U256,
+  // Logs.
+  lg_n: u64,
+  lg_cap: u64,
+  lg_addr: *mut U256,
+  lg_topics: *mut U256,
+  lg_meta: *mut LogMeta,
+  // Access list: (address, 0) marks an address, (address, key) a slot.
+  almap: *mut Map,
+  almap_slots: *mut Map,
+}
+
+fn spec_on(c: *mut Ctx, s: u64) -> bool {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.spec >= s;
+}
+
+fn ctx_env(c: *mut Ctx) -> *mut VxEnv {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.env;
+}
+
+fn set_fatal(c: *mut Ctx) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  cx.fatal = 1u64;
+}
+
+fn is_fatal(c: *mut Ctx) -> bool {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.fatal != 0u64;
+}
+
+fn last_cold(c: *mut Ctx) -> bool {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.last_cold != 0u64;
+}
+
+fn set_last_cold(c: *mut Ctx, v: bool) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if v { cx.last_cold = 1u64; } else { cx.last_cold = 0u64; }
+}
+
+fn calloc_words(n: u64) -> *mut U256 {
+  let raw: *mut i8 = unsafe { calloc(n, 32u64) };
+  let p: *mut U256 = raw;
+  return p;
+}
+
+fn realloc_words(p: *mut U256, old_n: u64, new_n: u64) -> *mut U256 {
+  let raw: *mut i8 = p;
+  let q: *mut i8 = unsafe { realloc(raw, new_n * 32u64) };
+  let r: *mut U256 = q;
+  let mut i: u64 = old_n;
+  while i < new_n {
+    unsafe { r[i] = u256_zero(); }
+    i = i + 1u64;
+  }
+  return r;
+}
+
+fn realloc_raw(p: *mut i8, size: u64) -> *mut i8 {
+  return unsafe { realloc(p, size) };
+}
+
+fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
+  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<Ctx>() as u64) };
+  let c: *mut Ctx = raw;
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  cx.host = host;
+  cx.env = env;
+  cx.spec = e.spec;
+  cx.scratch = calloc_words(8u64);
+  let ha: *mut i8 = unsafe { calloc(1u64, sizeof<HostAccount>() as u64) };
+  cx.hacc = ha;
+  cx.ac_cap = 16u64;
+  cx.ac_addr = calloc_words(16u64);
+  cx.ac_bal = calloc_words(16u64);
+  cx.ac_hash = calloc_words(16u64);
+  let am: *mut i8 = unsafe { calloc(16u64, sizeof<AcctMeta>() as u64) };
+  cx.ac_meta = am;
+  cx.amap = map_new();
+  cx.sl_cap = 16u64;
+  cx.sl_key = calloc_words(16u64);
+  cx.sl_orig = calloc_words(16u64);
+  cx.sl_cur = calloc_words(16u64);
+  let sm: *mut i8 = unsafe { calloc(16u64, sizeof<SlotMeta>() as u64) };
+  cx.sl_meta = sm;
+  cx.smap = map_new();
+  cx.ts_cap = 16u64;
+  cx.ts_val = calloc_words(16u64);
+  cx.tmap = map_new();
+  cx.j_cap = 64u64;
+  let jr: *mut i8 = unsafe { calloc(64u64, sizeof<JEntry>() as u64) };
+  cx.j = jr;
+  cx.j_val = calloc_words(64u64);
+  cx.lg_cap = 8u64;
+  cx.lg_addr = calloc_words(8u64);
+  cx.lg_topics = calloc_words(32u64);
+  let lm: *mut i8 = unsafe { calloc(8u64, sizeof<LogMeta>() as u64) };
+  cx.lg_meta = lm;
+  cx.almap = map_new();
+  cx.almap_slots = map_new();
+  return c;
+}
+
+// ---- Account fields ----
+
+fn acc_meta(c: *mut Ctx, i: u64) -> *mut AcctMeta {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return offset_mut(cx.ac_meta, i as i64);
+}
+
+fn acc_addr(c: *mut Ctx, i: u64) -> U256 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.ac_addr;
+  return unsafe { p[i] };
+}
+
+fn acc_bal(c: *mut Ctx, i: u64) -> U256 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.ac_bal;
+  return unsafe { p[i] };
+}
+
+fn acc_set_bal_raw(c: *mut Ctx, i: u64, v: U256) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.ac_bal;
+  unsafe { p[i] = v; }
+}
+
+fn acc_hash(c: *mut Ctx, i: u64) -> U256 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.ac_hash;
+  return unsafe { p[i] };
+}
+
+fn acc_set_hash_raw(c: *mut Ctx, i: u64, v: U256) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.ac_hash;
+  unsafe { p[i] = v; }
+}
+
+fn acc_nonce(c: *mut Ctx, i: u64) -> u64 {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  return m.nonce;
+}
+
+fn acc_set_nonce_raw(c: *mut Ctx, i: u64, v: u64) -> void {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  m.nonce = v;
+}
+
+fn acc_flags(c: *mut Ctx, i: u64) -> u64 {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  return m.flags;
+}
+
+fn acc_has(c: *mut Ctx, i: u64, f: u64) -> bool { return (acc_flags(c, i) & f) != 0u64; }
+
+fn acc_set_flag(c: *mut Ctx, i: u64, f: u64) -> void {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  m.flags = m.flags | f;
+}
+
+fn acc_clear_flag(c: *mut Ctx, i: u64, f: u64) -> void {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  m.flags = m.flags & (f ^ 18446744073709551615u64);
+}
+
+fn acc_code(c: *mut Ctx, i: u64) -> *mut u8 {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  return m.code;
+}
+
+fn acc_code_len(c: *mut Ctx, i: u64) -> u64 {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  return m.code_len;
+}
+
+// Jump-destination bitmap for the account's code, computed once.
+fn acc_jumpdests(c: *mut Ctx, i: u64) -> *mut u8 {
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  let have: *mut u8 = m.jd;
+  if is_null_mut(have) {
+    let jd: *mut u8 = analyze_jumpdests(m.code, m.code_len);
+    m.jd = jd;
+  }
+  return m.jd;
+}
+
+fn code_hash_is_empty(h: U256) -> bool {
+  return u256_is_zero(h) || u256_eq(h, keccak_empty());
+}
+
+// revm AccountInfo::is_empty: no code, zero balance, zero nonce.
+fn acc_is_empty(c: *mut Ctx, i: u64) -> bool {
+  return code_hash_is_empty(acc_hash(c, i)) && u256_is_zero(acc_bal(c, i)) && acc_nonce(c, i) == 0u64;
+}
+
+// revm state_clear_aware_is_empty.
+fn acc_is_empty_aware(c: *mut Ctx, i: u64) -> bool {
+  if spec_on(c, SPEC_SPURIOUS_DRAGON) { return acc_is_empty(c, i); }
+  return acc_has(c, i, ACC_NOT_EXISTING) && !acc_has(c, i, ACC_TOUCHED);
+}
+
+// ---- Journal ----
+
+fn journal_push(c: *mut Ctx, kind: u64, a: u64, b: u64, x: u64, v: U256, p: *mut u8, n: u64) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.j_n == cx.j_cap {
+    let nc: u64 = cx.j_cap * 2u64;
+    let old: *mut i8 = cx.j;
+    let nj: *mut i8 = realloc_raw(old, nc * (sizeof<JEntry>() as u64));
+    cx.j = nj;
+    cx.j_val = realloc_words(cx.j_val, cx.j_cap, nc);
+    cx.j_cap = nc;
+  }
+  let jp: *mut JEntry = cx.j;
+  let k: u64 = cx.j_n;
+  unsafe { jp[k] = JEntry { kind: kind, a: a, b: b, x: x, p: p, n: n }; }
+  let vp: *mut U256 = cx.j_val;
+  unsafe { vp[k] = v; }
+  cx.j_n = k + 1u64;
+}
+
+fn journal_simple(c: *mut Ctx, kind: u64, a: u64) -> void {
+  let none: *mut u8 = null_u8();
+  journal_push(c, kind, a, 0u64, 0u64, u256_zero(), none, 0u64);
+}
+
+fn journal_len(c: *mut Ctx) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.j_n;
+}
+
+fn log_len(c: *mut Ctx) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return cx.lg_n;
+}
+
+// Undo journal entries back to length jn and drop logs past ln.
+fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
+  let sd: bool = spec_on(c, SPEC_SPURIOUS_DRAGON);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  cx.lg_n = ln;
+  while cx.j_n > jn {
+    let k: u64 = cx.j_n - 1u64;
+    let jp: *mut JEntry = cx.j;
+    let e: &mut JEntry = unsafe { &mut jp[k] };
+    let vp: *mut U256 = cx.j_val;
+    let v: U256 = unsafe { vp[k] };
+    let kind: u64 = e.kind;
+    let a: u64 = e.a;
+    if kind == J_WARMED {
+      acc_clear_flag(c, a, ACC_WARM);
+    } else if kind == J_TOUCHED {
+      // The RIPEMD-160 precompile stays touched (mainnet block 2675119).
+      let skip: bool = sd && u256_eq(acc_addr(c, a), u256_from_u64(3u64));
+      if !skip { acc_clear_flag(c, a, ACC_TOUCHED); }
+    } else if kind == J_DESTROYED {
+      if e.x == 0u64 { acc_clear_flag(c, a, ACC_SELFDESTRUCTED); }
+      acc_set_bal_raw(c, a, u256_add(acc_bal(c, a), v));
+      if e.b != a { acc_set_bal_raw(c, e.b, u256_sub(acc_bal(c, e.b), v)); }
+    } else if kind == J_BALANCE {
+      acc_set_bal_raw(c, a, v);
+    } else if kind == J_TRANSFER {
+      acc_set_bal_raw(c, a, u256_add(acc_bal(c, a), v));
+      acc_set_bal_raw(c, e.b, u256_sub(acc_bal(c, e.b), v));
+    } else if kind == J_NONCE_CHANGE {
+      acc_set_nonce_raw(c, a, e.x);
+    } else if kind == J_NONCE_BUMP {
+      let nn: u64 = acc_nonce(c, a);
+      if nn > 0u64 { acc_set_nonce_raw(c, a, nn - 1u64); }
+    } else if kind == J_CREATED {
+      acc_clear_flag(c, a, ACC_CREATED);
+      acc_set_nonce_raw(c, a, 0u64);
+    } else if kind == J_STORAGE_CHANGED {
+      slot_set_cur(c, a, v);
+    } else if kind == J_STORAGE_WARMED {
+      slot_set_warm(c, a, false);
+    } else if kind == J_TSTORE {
+      let tv: *mut U256 = cx.ts_val;
+      unsafe { tv[a] = v; }
+    } else if kind == J_CODE_CHANGE {
+      acc_set_hash_raw(c, a, v);
+      let mp: *mut AcctMeta = acc_meta(c, a);
+      let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+      m.code = e.p;
+      m.code_len = e.n;
+      let none: *mut u8 = null_u8();
+      m.jd = none;
+    }
+    cx.j_n = k;
+  }
+}
+
+fn acc_touch(c: *mut Ctx, i: u64) -> void {
+  if !acc_has(c, i, ACC_TOUCHED) {
+    acc_set_flag(c, i, ACC_TOUCHED);
+    journal_simple(c, J_TOUCHED, i);
+  }
+}
+
+// ---- Warm addresses ----
+
+fn al_has_address(c: *mut Ctx, a: U256) -> bool {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return map_get(cx.almap, a, u256_zero()) != MAP_NONE;
+}
+
+fn al_has_slot(c: *mut Ctx, a: U256, k: U256) -> bool {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return map_get(cx.almap_slots, a, k) != MAP_NONE;
+}
+
+// Addresses warm before execution: precompiles, the coinbase (Shanghai+) and the access list.
+fn preset_warm(c: *mut Ctx, a: U256) -> bool {
+  if is_precompile(a, c) { return true; }
+  if spec_on(c, SPEC_SHANGHAI) {
+    let e: &mut VxEnv = unsafe { &mut ctx_env(c)[0u64] };
+    if u256_eq(a, e.coinbase) { return true; }
+  }
+  return al_has_address(c, a);
+}
+
+// ---- Account loading ----
+
+fn acc_push(c: *mut Ctx, a: U256, bal: U256, nonce: u64, hash: U256, code: *mut u8, code_len: u64, flags: u64) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.ac_n == cx.ac_cap {
+    let nc: u64 = cx.ac_cap * 2u64;
+    cx.ac_addr = realloc_words(cx.ac_addr, cx.ac_cap, nc);
+    cx.ac_bal = realloc_words(cx.ac_bal, cx.ac_cap, nc);
+    cx.ac_hash = realloc_words(cx.ac_hash, cx.ac_cap, nc);
+    let old: *mut i8 = cx.ac_meta;
+    let nm: *mut i8 = realloc_raw(old, nc * (sizeof<AcctMeta>() as u64));
+    cx.ac_meta = nm;
+    cx.ac_cap = nc;
+  }
+  let i: u64 = cx.ac_n;
+  let pa: *mut U256 = cx.ac_addr;
+  let pb: *mut U256 = cx.ac_bal;
+  let ph: *mut U256 = cx.ac_hash;
+  unsafe { pa[i] = a; pb[i] = bal; ph[i] = hash; }
+  let pm: *mut AcctMeta = cx.ac_meta;
+  let none: *mut u8 = null_u8();
+  unsafe { pm[i] = AcctMeta { nonce: nonce, flags: flags, code: code, code_len: code_len, jd: none }; }
+  cx.ac_n = i + 1u64;
+  map_put(cx.amap, a, u256_zero(), i);
+  return i;
+}
+
+// Loads an account (warming it) and returns its index. last_cold reports whether the
+// access was cold. On a host error the context is marked fatal and index 0 of a
+// placeholder is still returned so callers can unwind.
+fn acc_load(c: *mut Ctx, a: U256) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let found: u64 = map_get(cx.amap, a, u256_zero());
+  if found != MAP_NONE {
+    if acc_has(c, found, ACC_WARM) {
+      set_last_cold(c, false);
+    } else {
+      set_last_cold(c, !preset_warm(c, a));
+      acc_set_flag(c, found, ACC_WARM);
+      journal_simple(c, J_WARMED, found);
+    }
+    return found;
+  }
+  let cold: bool = !preset_warm(c, a);
+  let sp: *mut U256 = cx.scratch;
+  unsafe { sp[0u64] = a; }
+  let ha: *mut HostAccount = cx.hacc;
+  let st: u64 = unsafe { evmvx_host_account(cx.host, sp, ha) };
+  let mut i: u64 = 0u64;
+  if st == HOST_OK {
+    let h: &mut HostAccount = unsafe { &mut ha[0u64] };
+    i = acc_push(c, a, h.balance, h.nonce, h.code_hash, h.code, h.code_len, ACC_WARM);
+  } else {
+    if st != HOST_MISSING { set_fatal(c); }
+    let none: *mut u8 = null_u8();
+    i = acc_push(c, a, u256_zero(), 0u64, keccak_empty(), none, 0u64, ACC_WARM | ACC_NOT_EXISTING);
+  }
+  if cold { journal_simple(c, J_WARMED, i); }
+  set_last_cold(c, cold);
+  return i;
+}
+
+// ---- Account mutation (journaled) ----
+
+fn acc_set_balance(c: *mut Ctx, i: u64, v: U256) -> void {
+  acc_touch(c, i);
+  let old: U256 = acc_bal(c, i);
+  if !u256_eq(old, v) {
+    let none: *mut u8 = null_u8();
+    journal_push(c, J_BALANCE, i, 0u64, 0u64, old, none, 0u64);
+    acc_set_bal_raw(c, i, v);
+  }
+}
+
+// Adds v; returns false on overflow (balance unchanged).
+fn acc_incr_balance(c: *mut Ctx, i: u64, v: U256) -> bool {
+  acc_touch(c, i);
+  let old: U256 = acc_bal(c, i);
+  let n: U256 = u256_add(old, v);
+  if u256_lt(n, old) { return false; }
+  acc_set_balance(c, i, n);
+  return true;
+}
+
+// Increments the nonce; returns false at u64::MAX (nonce unchanged).
+fn acc_bump_nonce(c: *mut Ctx, i: u64) -> bool {
+  acc_touch(c, i);
+  let n: u64 = acc_nonce(c, i);
+  if n == 18446744073709551615u64 { return false; }
+  acc_set_nonce_raw(c, i, n + 1u64);
+  journal_simple(c, J_NONCE_BUMP, i);
+  return true;
+}
+
+fn acc_set_code(c: *mut Ctx, i: u64, hash: U256, code: *mut u8, len: u64) -> void {
+  acc_touch(c, i);
+  let mp: *mut AcctMeta = acc_meta(c, i);
+  let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+  journal_push(c, J_CODE_CHANGE, i, 0u64, 0u64, acc_hash(c, i), m.code, m.code_len);
+  m.code = code;
+  m.code_len = len;
+  let none: *mut u8 = null_u8();
+  m.jd = none;
+  acc_set_hash_raw(c, i, hash);
+}
+
+// Moves value between two loaded accounts (revm transfer_loaded).
+fn transfer_loaded(c: *mut Ctx, from: u64, to: u64, v: U256) -> u64 {
+  if from == to {
+    if u256_gt(v, acc_bal(c, from)) { return XFER_OUT_OF_FUNDS; }
+    return 0u64;
+  }
+  if u256_is_zero(v) {
+    acc_touch(c, to);
+    return 0u64;
+  }
+  acc_touch(c, from);
+  let fb: U256 = acc_bal(c, from);
+  if u256_lt(fb, v) { return XFER_OUT_OF_FUNDS; }
+  acc_set_bal_raw(c, from, u256_sub(fb, v));
+  acc_touch(c, to);
+  let tb: U256 = acc_bal(c, to);
+  let nb: U256 = u256_add(tb, v);
+  if u256_lt(nb, tb) { return XFER_OVERFLOW; }
+  acc_set_bal_raw(c, to, nb);
+  let none: *mut u8 = null_u8();
+  journal_push(c, J_TRANSFER, from, to, 0u64, v, none, 0u64);
+  return 0u64;
+}
+
+// revm create_account_checkpoint, after the caller's checkpoint was taken.
+// Returns 0 or XFER_COLLISION / XFER_OVERFLOW; on error the caller reverts.
+fn create_account(c: *mut Ctx, caller: u64, target: u64, v: U256) -> u64 {
+  if !code_hash_is_empty_strict(acc_hash(c, target)) || acc_nonce(c, target) != 0u64 {
+    return XFER_COLLISION;
+  }
+  acc_set_flag(c, target, ACC_CREATED);
+  let none: *mut u8 = null_u8();
+  journal_push(c, J_CREATED, target, 0u64, 1u64, u256_zero(), none, 0u64);
+  if spec_on(c, SPEC_SPURIOUS_DRAGON) { acc_set_nonce_raw(c, target, 1u64); }
+  acc_touch(c, target);
+  if u256_is_zero(v) { return 0u64; }
+  let tb: U256 = acc_bal(c, target);
+  let nb: U256 = u256_add(tb, v);
+  if u256_lt(nb, tb) { return XFER_OVERFLOW; }
+  acc_set_bal_raw(c, target, nb);
+  acc_set_bal_raw(c, caller, u256_sub(acc_bal(c, caller), v));
+  journal_push(c, J_TRANSFER, caller, target, 0u64, v, none, 0u64);
+  return 0u64;
+}
+
+// revm compares the code hash with KECCAK_EMPTY only (a zero hash counts as code).
+fn code_hash_is_empty_strict(h: U256) -> bool { return u256_eq(h, keccak_empty()); }
+
+// ---- Storage ----
+
+fn slot_meta(c: *mut Ctx, s: u64) -> *mut SlotMeta {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  return offset_mut(cx.sl_meta, s as i64);
+}
+
+fn slot_cur(c: *mut Ctx, s: u64) -> U256 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.sl_cur;
+  return unsafe { p[s] };
+}
+
+fn slot_set_cur(c: *mut Ctx, s: u64, v: U256) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.sl_cur;
+  unsafe { p[s] = v; }
+}
+
+fn slot_orig(c: *mut Ctx, s: u64) -> U256 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.sl_orig;
+  return unsafe { p[s] };
+}
+
+fn slot_key(c: *mut Ctx, s: u64) -> U256 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let p: *mut U256 = cx.sl_key;
+  return unsafe { p[s] };
+}
+
+fn slot_set_warm(c: *mut Ctx, s: u64, w: bool) -> void {
+  let mp: *mut SlotMeta = slot_meta(c, s);
+  let m: &mut SlotMeta = unsafe { &mut mp[0u64] };
+  if w { m.warm = 1u64; } else { m.warm = 0u64; }
+}
+
+fn slot_is_warm(c: *mut Ctx, s: u64) -> bool {
+  let mp: *mut SlotMeta = slot_meta(c, s);
+  let m: &mut SlotMeta = unsafe { &mut mp[0u64] };
+  return m.warm != 0u64;
+}
+
+fn slot_push(c: *mut Ctx, acct: u64, a: U256, k: U256, v: U256) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.sl_n == cx.sl_cap {
+    let nc: u64 = cx.sl_cap * 2u64;
+    cx.sl_key = realloc_words(cx.sl_key, cx.sl_cap, nc);
+    cx.sl_orig = realloc_words(cx.sl_orig, cx.sl_cap, nc);
+    cx.sl_cur = realloc_words(cx.sl_cur, cx.sl_cap, nc);
+    let old: *mut i8 = cx.sl_meta;
+    let nm: *mut i8 = realloc_raw(old, nc * (sizeof<SlotMeta>() as u64));
+    cx.sl_meta = nm;
+    cx.sl_cap = nc;
+  }
+  let s: u64 = cx.sl_n;
+  let pk: *mut U256 = cx.sl_key;
+  let po: *mut U256 = cx.sl_orig;
+  let pc: *mut U256 = cx.sl_cur;
+  unsafe { pk[s] = k; po[s] = v; pc[s] = v; }
+  let pm: *mut SlotMeta = cx.sl_meta;
+  unsafe { pm[s] = SlotMeta { acct: acct, warm: 1u64 }; }
+  cx.sl_n = s + 1u64;
+  map_put(cx.smap, a, k, s);
+  return s;
+}
+
+// Finds or loads slot k of loaded account i (warming it); returns the slot index.
+// last_cold reports a cold access.
+fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
+  let a: U256 = acc_addr(c, i);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let found: u64 = map_get(cx.smap, a, k);
+  if found != MAP_NONE {
+    if slot_is_warm(c, found) {
+      set_last_cold(c, false);
+      return found;
+    }
+    let cold: bool = !al_has_slot(c, a, k);
+    slot_set_warm(c, found, true);
+    if cold { journal_simple(c, J_STORAGE_WARMED, found); }
+    set_last_cold(c, cold);
+    return found;
+  }
+  let cold: bool = !al_has_slot(c, a, k);
+  let mut v: U256 = u256_zero();
+  if !acc_has(c, i, ACC_CREATED) && !acc_has(c, i, ACC_NOT_EXISTING) {
+    let sp: *mut U256 = cx.scratch;
+    unsafe { sp[0u64] = a; sp[1u64] = k; }
+    let kp: *mut U256 = offset_mut(sp, 1i64);
+    let vp: *mut U256 = offset_mut(sp, 2i64);
+    let st: u64 = unsafe { evmvx_host_storage(cx.host, sp, kp, vp) };
+    if st == HOST_ERROR { set_fatal(c); }
+    v = unsafe { sp[2u64] };
+  }
+  let s: u64 = slot_push(c, i, a, k, v);
+  if cold { journal_simple(c, J_STORAGE_WARMED, s); }
+  set_last_cold(c, cold);
+  return s;
+}
+
+fn sload(c: *mut Ctx, i: u64, k: U256) -> U256 {
+  let s: u64 = slot_load(c, i, k);
+  return slot_cur(c, s);
+}
+
+// SSTORE effect; returns the slot index. Original and present values are read
+// from the slot before the call by the gas logic.
+fn sstore_write(c: *mut Ctx, s: u64, v: U256) -> void {
+  let cur: U256 = slot_cur(c, s);
+  if !u256_eq(cur, v) {
+    let none: *mut u8 = null_u8();
+    journal_push(c, J_STORAGE_CHANGED, s, 0u64, 0u64, cur, none, 0u64);
+    slot_set_cur(c, s, v);
+  }
+}
+
+// ---- Transient storage (EIP-1153) ----
+
+fn tslot_find(c: *mut Ctx, a: U256, k: U256, create: bool) -> u64 {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let found: u64 = map_get(cx.tmap, a, k);
+  if found != MAP_NONE || !create { return found; }
+  if cx.ts_n == cx.ts_cap {
+    let nc: u64 = cx.ts_cap * 2u64;
+    cx.ts_val = realloc_words(cx.ts_val, cx.ts_cap, nc);
+    cx.ts_cap = nc;
+  }
+  let t: u64 = cx.ts_n;
+  let tv: *mut U256 = cx.ts_val;
+  unsafe { tv[t] = u256_zero(); }
+  cx.ts_n = t + 1u64;
+  map_put(cx.tmap, a, k, t);
+  return t;
+}
+
+fn tload(c: *mut Ctx, a: U256, k: U256) -> U256 {
+  let t: u64 = tslot_find(c, a, k, false);
+  if t == MAP_NONE { return u256_zero(); }
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let tv: *mut U256 = cx.ts_val;
+  return unsafe { tv[t] };
+}
+
+fn tstore(c: *mut Ctx, a: U256, k: U256, v: U256) -> void {
+  let t: u64 = tslot_find(c, a, k, true);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let tv: *mut U256 = cx.ts_val;
+  let old: U256 = unsafe { tv[t] };
+  if !u256_eq(old, v) {
+    let none: *mut u8 = null_u8();
+    journal_push(c, J_TSTORE, t, 0u64, 0u64, old, none, 0u64);
+    unsafe { tv[t] = v; }
+  }
+}
+
+// ---- Logs ----
+
+fn log_push(c: *mut Ctx, a: U256, n: u64, t0: U256, t1: U256, t2: U256, t3: U256, data: *mut u8, len: u64) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.lg_n == cx.lg_cap {
+    let nc: u64 = cx.lg_cap * 2u64;
+    cx.lg_addr = realloc_words(cx.lg_addr, cx.lg_cap, nc);
+    cx.lg_topics = realloc_words(cx.lg_topics, cx.lg_cap * 4u64, nc * 4u64);
+    let old: *mut i8 = cx.lg_meta;
+    let nm: *mut i8 = realloc_raw(old, nc * (sizeof<LogMeta>() as u64));
+    cx.lg_meta = nm;
+    cx.lg_cap = nc;
+  }
+  let l: u64 = cx.lg_n;
+  let pa: *mut U256 = cx.lg_addr;
+  unsafe { pa[l] = a; }
+  let pt: *mut U256 = cx.lg_topics;
+  unsafe { pt[l * 4u64] = t0; pt[l * 4u64 + 1u64] = t1; pt[l * 4u64 + 2u64] = t2; pt[l * 4u64 + 3u64] = t3; }
+  let pm: *mut LogMeta = cx.lg_meta;
+  unsafe { pm[l] = LogMeta { topic_count: n, data: data, data_len: len }; }
+  cx.lg_n = l + 1u64;
+}
+
+// ---- SELFDESTRUCT (revm JournalInner::selfdestruct) ----
+
+// Results of the last selfdestruct, read by the opcode's gas logic.
+struct SdResult {
+  had_value: u64,
+  target_exists: u64,
+  previously_destroyed: u64,
+  is_cold: u64,
+}
+
+fn selfdestruct(c: *mut Ctx, i: u64, target_addr: U256, out: *mut SdResult) -> void {
+  let t: u64 = acc_load(c, target_addr);
+  let cold: bool = last_cold(c);
+  let empty: bool = acc_is_empty_aware(c, t);
+  if i != t {
+    acc_touch(c, t);
+    acc_set_bal_raw(c, t, u256_add(acc_bal(c, t), acc_bal(c, i)));
+  }
+  let bal: U256 = acc_bal(c, i);
+  let previously: bool = acc_has(c, i, ACC_SELFDESTRUCTED);
+  let mut status: u64 = 0u64;
+  if previously { status = 2u64; }
+  let none: *mut u8 = null_u8();
+  if acc_has(c, i, ACC_CREATED) || !spec_on(c, SPEC_CANCUN) {
+    acc_set_flag(c, i, ACC_SELFDESTRUCTED);
+    acc_set_bal_raw(c, i, u256_zero());
+    journal_push(c, J_DESTROYED, i, t, status, bal, none, 0u64);
+  } else if i != t {
+    acc_set_bal_raw(c, i, u256_zero());
+    journal_push(c, J_TRANSFER, i, t, 0u64, bal, none, 0u64);
+  }
+  let r: &mut SdResult = unsafe { &mut out[0u64] };
+  if u256_is_zero(bal) { r.had_value = 0u64; } else { r.had_value = 1u64; }
+  if empty { r.target_exists = 0u64; } else { r.target_exists = 1u64; }
+  if previously { r.previously_destroyed = 1u64; } else { r.previously_destroyed = 0u64; }
+  if cold { r.is_cold = 1u64; } else { r.is_cold = 0u64; }
+}
+
+// revm JournalInner::finalize. Before Spurious Dragon (EIP-161) a touched empty
+// account is not deleted: one that did not exist becomes an existing empty
+// account, and one that existed keeps its pre-state (its touch is dropped).
+fn finalize_state(c: *mut Ctx) -> void {
+  if spec_on(c, SPEC_SPURIOUS_DRAGON) { return; }
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let n: u64 = cx.ac_n;
+  let mut i: u64 = 0u64;
+  while i < n {
+    if acc_has(c, i, ACC_TOUCHED) && acc_is_empty(c, i)
+       && !acc_has(c, i, ACC_SELFDESTRUCTED) && !acc_has(c, i, ACC_CREATED) {
+      if acc_has(c, i, ACC_NOT_EXISTING) { acc_set_flag(c, i, ACC_CREATED); }
+      else { acc_clear_flag(c, i, ACC_TOUCHED); }
+    }
+    i = i + 1u64;
+  }
+}

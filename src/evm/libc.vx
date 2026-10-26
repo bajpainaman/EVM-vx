@@ -1,0 +1,70 @@
+import core::ptr;
+
+// C library functions the engine uses. `*mut i8` is the untyped pointer:
+// every pointer type converts to and from it implicitly.
+extern "C" {
+  fn malloc(n: u64) -> *mut i8;
+  fn calloc(n: u64, size: u64) -> *mut i8;
+  fn realloc(p: *mut i8, n: u64) -> *mut i8;
+  fn free(p: *mut i8) -> void;
+  fn memcpy(d: *mut i8, s: *mut i8, n: u64) -> *mut i8;
+  fn memmove(d: *mut i8, s: *mut i8, n: u64) -> *mut i8;
+  fn memset(d: *mut i8, c: i32, n: u64) -> *mut i8;
+  fn memcmp(a: *mut i8, b: *mut i8, n: u64) -> i32;
+}
+
+// Zeroed allocation. At least one byte, so the result is never a null "empty" buffer.
+fn zalloc(n: u64) -> *mut u8 {
+  let mut m: u64 = n;
+  if m == 0u64 { m = 1u64; }
+  let p: *mut i8 = unsafe { calloc(m, 1u64) };
+  let q: *mut u8 = p;
+  return q;
+}
+
+fn mfree(p: *mut u8) -> void {
+  let q: *mut i8 = p;
+  unsafe { free(q); }
+}
+
+fn copy_bytes(d: *mut u8, s: *mut u8, n: u64) -> void {
+  if n == 0u64 { return; }
+  let dd: *mut i8 = d;
+  let ss: *mut i8 = s;
+  unsafe { memmove(dd, ss, n); }
+}
+
+fn zero_bytes(d: *mut u8, n: u64) -> void {
+  if n == 0u64 { return; }
+  let dd: *mut i8 = d;
+  unsafe { memset(dd, 0, n); }
+}
+
+// A fresh copy of n bytes, owned by the caller.
+fn dup_bytes(s: *mut u8, n: u64) -> *mut u8 {
+  let d: *mut u8 = zalloc(n);
+  copy_bytes(d, s, n);
+  return d;
+}
+
+fn bytes_eq(a: *mut u8, b: *mut u8, n: u64) -> bool {
+  if n == 0u64 { return true; }
+  let aa: *mut i8 = a;
+  let bb: *mut i8 = b;
+  return unsafe { memcmp(aa, bb, n) } == 0;
+}
+
+// Grows a buffer to new_cap bytes; the added bytes are zero.
+fn grow_bytes(p: *mut u8, old_cap: u64, new_cap: u64) -> *mut u8 {
+  let raw: *mut i8 = p;
+  let q: *mut i8 = unsafe { realloc(raw, new_cap) };
+  let r: *mut u8 = q;
+  if new_cap > old_cap {
+    let tail: *mut u8 = offset_mut(r, old_cap as i64);
+    zero_bytes(tail, new_cap - old_cap);
+  }
+  return r;
+}
+
+fn null_u8() -> *mut u8 { return unsafe { 0 as *mut u8 }; }
+fn null_i8() -> *mut i8 { return unsafe { 0 as *mut i8 }; }

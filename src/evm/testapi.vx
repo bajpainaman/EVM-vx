@@ -1,0 +1,27 @@
+// Exported helpers for unit tests; not part of the execution API.
+pub fn evmvx_test_keccak(p: *mut u8, n: u64, out: *mut u8) -> void {
+  u256_store_be(out, keccak256(p, n));
+}
+
+pub fn evmvx_test_sha256(p: *mut u8, n: u64, out: *mut u8) -> void {
+  sha256(p, n, out);
+}
+
+pub fn evmvx_test_ripemd160(p: *mut u8, n: u64, out: *mut u8) -> void {
+  ripemd160(p, n, out);
+}
+
+// Runs precompile `id` without a transaction context. out_len[0] receives the
+// output length and gas[0] the gas used; returns the PC_* status.
+pub fn evmvx_test_precompile(spec: u64, id: u64, input: *mut u8, len: u64, gas_limit: u64, out: *mut u8, out_len: *mut u64, gas: *mut u64) -> u64 {
+  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<PcOut>() as u64) };
+  let po: *mut PcOut = raw;
+  if id == 4u64 { pc_identity(input, len, gas_limit, po); }
+  else { precompile_run_ext(spec, id, input, len, gas_limit, po); }
+  let r: &mut PcOut = unsafe { &mut po[0u64] };
+  copy_bytes(out, r.data, r.len);
+  unsafe { out_len[0u64] = r.len; gas[0u64] = r.gas_used; }
+  let st: u64 = r.status;
+  unsafe { free(raw); }
+  return st;
+}

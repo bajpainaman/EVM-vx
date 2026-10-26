@@ -1,0 +1,88 @@
+// Dynamic gas, following revm GasParams. All arithmetic saturates at u64::MAX.
+
+const U64_MAX: u64 = 18446744073709551615u64;
+
+fn sat_add(a: u64, b: u64) -> u64 {
+  let s: u64 = a + b;
+  if s < a { return U64_MAX; }
+  return s;
+}
+
+fn sat_mul(a: u64, b: u64) -> u64 {
+  let p: u128 = (a as u128) * (b as u128);
+  if p > (U64_MAX as u128) { return U64_MAX; }
+  return p as u64;
+}
+
+// Words needed to hold len bytes.
+fn num_words(len: u64) -> u64 { return len / 32u64 + ((len % 32u64) + 31u64) / 32u64; }
+
+// Total cost of a memory of `words` 32-byte words: 3 * w + w * w / 512.
+fn memory_cost(words: u64) -> u64 {
+  return sat_add(sat_mul(3u64, words), sat_mul(words, words) / 512u64);
+}
+
+fn copy_cost(len: u64) -> u64 { return sat_mul(3u64, num_words(len)); }
+
+fn exp_cost(spec: u64, power: U256) -> u64 {
+  if u256_is_zero(power) { return 0u64; }
+  let mut per: u64 = 10u64;
+  if spec >= SPEC_SPURIOUS_DRAGON { per = 50u64; }
+  return sat_mul(per, u256_byte_len(power) as u64);
+}
+
+// SSTORE parameters for the fork.
+fn sstore_static(spec: u64) -> u64 {
+  if spec >= SPEC_BERLIN { return 100u64; }
+  if spec >= SPEC_ISTANBUL { return 800u64; }
+  return 5000u64;
+}
+
+fn sstore_set_wo_load(spec: u64) -> u64 { return 20000u64 - sstore_static(spec); }
+
+fn sstore_reset_wo_cold(spec: u64) -> u64 {
+  if spec >= SPEC_BERLIN { return 2800u64; }
+  if spec >= SPEC_ISTANBUL { return 4200u64; }
+  return 0u64;
+}
+
+fn sstore_clear_refund(spec: u64) -> i64 {
+  if spec >= SPEC_LONDON { return 4800i64; }
+  return 15000i64;
+}
+
+// Dynamic SSTORE gas for original o, present p, new n.
+fn sstore_dynamic(spec: u64, o: U256, p: U256, n: U256, cold: bool) -> u64 {
+  if spec < SPEC_ISTANBUL {
+    if u256_is_zero(p) && !u256_is_zero(n) { return 15000u64; }
+    return 0u64;
+  }
+  let mut g: u64 = 0u64;
+  if cold { g = 2100u64; }
+  if !u256_eq(n, p) && u256_eq(o, p) {
+    if u256_is_zero(o) { g = g + sstore_set_wo_load(spec); }
+    else { g = g + sstore_reset_wo_cold(spec); }
+  }
+  return g;
+}
+
+// SSTORE refund delta for original o, present p, new n.
+fn sstore_refund(spec: u64, o: U256, p: U256, n: U256) -> i64 {
+  let clear: i64 = sstore_clear_refund(spec);
+  if spec < SPEC_ISTANBUL {
+    if !u256_is_zero(p) && u256_is_zero(n) { return clear; }
+    return 0i64;
+  }
+  if u256_eq(n, p) { return 0i64; }
+  if u256_eq(o, p) && u256_is_zero(n) { return clear; }
+  let mut r: i64 = 0i64;
+  if !u256_is_zero(o) {
+    if u256_is_zero(p) { r = r - clear; }
+    else if u256_is_zero(n) { r = r + clear; }
+  }
+  if u256_eq(o, n) {
+    if u256_is_zero(o) { r = r + (sstore_set_wo_load(spec) as i64); }
+    else { r = r + (sstore_reset_wo_cold(spec) as i64); }
+  }
+  return r;
+}

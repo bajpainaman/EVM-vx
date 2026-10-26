@@ -1,0 +1,63 @@
+// Arithmetic, comparison and bitwise opcodes (0x01-0x1e). Each pops its operands
+// from the frame stack and pushes one result. The stack depth is checked by the
+// interpreter loop before dispatch.
+
+fn op_binary(f: *mut Frame, op: u64) -> u64 {
+  let a: U256 = stack_pop(f);
+  let b: U256 = stack_pop(f);
+  let mut r: U256 = u256_zero();
+  let o: i32 = op as i32;
+  match o {
+    1 => { r = u256_add(a, b); }
+    2 => { r = u256_mul(a, b); }
+    3 => { r = u256_sub(a, b); }
+    4 => { r = u256_div(a, b); }
+    5 => { r = u256_sdiv(a, b); }
+    6 => { r = u256_mod(a, b); }
+    7 => { r = u256_smod(a, b); }
+    11 => { r = u256_signextend(a, b); }
+    16 => { r = u256_from_bool(u256_lt(a, b)); }
+    17 => { r = u256_from_bool(u256_gt(a, b)); }
+    18 => { r = u256_from_bool(u256_slt(a, b)); }
+    19 => { r = u256_from_bool(u256_sgt(a, b)); }
+    20 => { r = u256_from_bool(u256_eq(a, b)); }
+    22 => { r = u256_and(a, b); }
+    23 => { r = u256_or(a, b); }
+    24 => { r = u256_xor(a, b); }
+    26 => { r = u256_byte(a, b); }
+    27 => { r = u256_shl(b, a); }
+    28 => { r = u256_shr(b, a); }
+    29 => { r = u256_sar(b, a); }
+    _ => { r = u256_zero(); }
+  }
+  stack_push(f, r);
+  return R_CONTINUE;
+}
+
+fn op_ternary_mod(f: *mut Frame, op: u64) -> u64 {
+  let a: U256 = stack_pop(f);
+  let b: U256 = stack_pop(f);
+  let m: U256 = stack_pop(f);
+  if op == 8u64 { stack_push(f, u256_addmod(a, b, m)); }
+  else { stack_push(f, u256_mulmod(a, b, m)); }
+  return R_CONTINUE;
+}
+
+fn op_exp(f: *mut Frame, spec: u64) -> u64 {
+  let base: U256 = stack_pop(f);
+  let e: U256 = stack_pop(f);
+  if !charge(f, exp_cost(spec, e)) { return R_OOG; }
+  stack_push(f, u256_exp(base, e));
+  return R_CONTINUE;
+}
+
+// CLZ (EIP-7939): number of leading zero bits; 256 for zero.
+fn u256_clz(a: U256) -> U256 { return u256_from_u64(256u64 - (u256_bit_len(a) as u64)); }
+
+fn op_unary(f: *mut Frame, op: u64) -> u64 {
+  let a: U256 = stack_pop(f);
+  if op == 21u64 { stack_push(f, u256_from_bool(u256_is_zero(a))); }
+  else if op == 25u64 { stack_push(f, u256_not(a)); }
+  else { stack_push(f, u256_clz(a)); }
+  return R_CONTINUE;
+}

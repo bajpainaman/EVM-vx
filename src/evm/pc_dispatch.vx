@@ -1,0 +1,9 @@
+// Dispatch for precompiles other than identity. Each implementation sets out.
+fn precompile_run_ext(spec: u64, id: u64, input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void {
+  if id == 1u64 { pc_ecrecover(input, len, gas_limit, out); return; }
+  if id == 2u64 { pc_sha256(input, len, gas_limit, out); return; }
+  if id == 3u64 { pc_ripemd160(input, len, gas_limit, out); return; }
+  if id == 5u64 { pc_modexp(spec, input, len, gas_limit, out); return; }
+  if id == 9u64 { pc_blake2f(input, len, gas_limit, out); return; }
+  if id == 256u64 { pc_p256verify(input, len, gas_limit, out); return; }
+}

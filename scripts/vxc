@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Runs the fixed Vx compiler with this repository's src/ on the module path.
+# The compiler must be upstream Vx dc6a460 plus the local i128-guard and
+# struct-pointer fixes; a stock vxc 0.0.2 is not equivalent.
+set -eu
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export VX_EXTRA_PATH="$ROOT/src${VX_EXTRA_PATH:+:$VX_EXTRA_PATH}"
+exec "${VXC:-/data/fast/vx-toolchain/vxc}" "$@"

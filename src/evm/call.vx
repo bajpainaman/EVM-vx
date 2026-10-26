@@ -1,0 +1,424 @@
+// CALL, CALLCODE, DELEGATECALL, STATICCALL, CREATE and CREATE2.
+//
+// A child frame runs inline through run_frame (recursive tree-walker), rather
+// than revm's explicit suspend/resume. Depth is bounded by 1024, so the native
+// stack depth is bounded too. Gas, value transfer, the 63/64 rule, the stipend,
+// journaling and the return-data buffer follow revm handler/src/frame.rs.
+
+const CALL_DEPTH_LIMIT: u64 = 1024u64;
+const OP_CALL: u64 = 241u64;
+const OP_CALLCODE: u64 = 242u64;
+const OP_DELEGATECALL: u64 = 244u64;
+const OP_STATICCALL: u64 = 250u64;
+
+struct ChildOut {
+  result: u64,
+  gas_left: u64,
+  refund: i64,
+  out: *mut u8,
+  out_len: u64,
+  addr: U256,
+}
+
+fn all_but_64th(x: u64) -> u64 { return x - x / 64u64; }
+
+fn frame_add_gas(f: *mut Frame, g: u64) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  fr.gas = fr.gas + g;
+}
+
+fn frame_depth(f: *mut Frame) -> u64 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  return fr.depth;
+}
+
+fn frame_tabs(f: *mut Frame) -> *mut OpTabs {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  return fr.tabs;
+}
+
+// A fresh copy of parent memory [off, off + len); off/len already in range.
+fn mem_slice_dup(f: *mut Frame, off: u64, len: u64) -> *mut u8 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  if len == 0u64 { return zalloc(1u64); }
+  let src: *mut u8 = offset_mut(fr.mem, off as i64);
+  return dup_bytes(src, len);
+}
+
+// Replaces the frame's return-data buffer with a copy of len bytes at data.
+fn set_return_data(f: *mut Frame, data: *mut u8, len: u64) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  mfree(fr.ret);
+  fr.ret = dup_bytes(data, len);
+  fr.ret_len = len;
+}
+
+// Writes min(cap, len) bytes of data into parent memory at off (already in range).
+fn mem_write_output(f: *mut Frame, off: u64, cap: u64, data: *mut u8, len: u64) -> void {
+  let mut n: u64 = len;
+  if n > cap { n = cap; }
+  if n == 0u64 { return; }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let dst: *mut u8 = offset_mut(fr.mem, off as i64);
+  copy_bytes(dst, data, n);
+}
+
+// Resolves the code to execute for a call into account i, charging the
+// EIP-7702 delegation access (warm read + cold surcharge). Writes the code
+// account index to *code_idx. Returns false on out of gas.
+fn resolve_delegated(c: *mut Ctx, f: *mut Frame, i: u64, code_idx: *mut u64) -> bool {
+  unsafe { code_idx[0u64] = i; }
+  if !spec_on(c, SPEC_PRAGUE) { return true; }
+  let code: *mut u8 = acc_code(c, i);
+  let len: u64 = acc_code_len(c, i);
+  if !is_delegation(code, len) { return true; }
+  if !charge(f, 100u64) { return false; }
+  let da: U256 = delegation_address(code);
+  let di: u64 = acc_load(c, da);
+  if last_cold(c) { if !charge(f, 2500u64) { return false; } }
+  unsafe { code_idx[0u64] = di; }
+  return true;
+}
+
+// Builds and runs a child message call into account `acct_idx`, whose code is
+// `code_idx`. Fills `o`. caller/target/value set the child's frame words.
+fn run_child_call(c: *mut Ctx, parent: *mut Frame, acct_idx: u64, code_idx: u64,
+                  target: U256, caller: U256, value: U256, input: *mut u8, input_len: u64,
+                  gas: u64, is_static: bool, o: *mut ChildOut) -> void {
+  let code: *mut u8 = acc_code(c, code_idx);
+  let clen: u64 = acc_code_len(c, code_idx);
+  let r: &mut ChildOut = unsafe { &mut o[0u64] };
+  if clen == 0u64 {
+    r.result = R_STOP;
+    r.gas_left = gas;
+    r.refund = 0i64;
+    r.out = zalloc(1u64);
+    r.out_len = 0u64;
+    return;
+  }
+  let jd: *mut u8 = acc_jumpdests(c, code_idx);
+  let child: *mut Frame = frame_new(code, clen, jd, gas, input, input_len, target, caller, value,
+                                    is_static, frame_depth(parent) + 1u64, acct_idx, frame_tabs(parent));
+  let res: u64 = run_frame(c, child);
+  let cf: &mut Frame = unsafe { &mut child[0u64] };
+  r.result = res;
+  r.gas_left = 0u64;
+  if r_is_ok_or_revert(res) { r.gas_left = cf.gas; }
+  r.refund = 0i64;
+  if r_is_ok(res) { r.refund = cf.refund; }
+  r.out = dup_bytes(cf.out, cf.out_len);
+  r.out_len = cf.out_len;
+  frame_free(child);
+}
+
+// Runs a precompile as a child call, filling `o`.
+fn run_child_precompile(c: *mut Ctx, pid: u64, input: *mut u8, input_len: u64, gas: u64, o: *mut ChildOut) -> void {
+  let raw: *mut i8 = unsafe { calloc(1u64, sizeof<PcOut>() as u64) };
+  let po: *mut PcOut = raw;
+  precompile_run(c, pid, input, input_len, gas, po);
+  let p: &mut PcOut = unsafe { &mut po[0u64] };
+  let r: &mut ChildOut = unsafe { &mut o[0u64] };
+  if p.status == PC_OK {
+    r.result = R_RETURN;
+    r.gas_left = gas - p.gas_used;
+    r.out = dup_bytes(p.data, p.len);
+    r.out_len = p.len;
+  } else if p.status == PC_OOG {
+    r.result = R_PRECOMPILE_OOG;
+    r.gas_left = 0u64;
+    r.out = zalloc(1u64);
+    r.out_len = 0u64;
+  } else {
+    // A precompile input error reverts and consumes all its gas (revm).
+    r.result = R_PRECOMPILE_ERROR;
+    r.gas_left = 0u64;
+    r.out = zalloc(1u64);
+    r.out_len = 0u64;
+  }
+  r.refund = 0i64;
+  let d: *mut u8 = p.data;
+  mfree(d);
+  unsafe { free(raw); }
+}
+
+fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
+  let gas_req: U256 = stack_pop(f);
+  let to: U256 = u256_to_address(stack_pop(f));
+  let mut value: U256 = u256_zero();
+  if op == OP_CALL || op == OP_CALLCODE { value = stack_pop(f); }
+  let in_off_w: U256 = stack_pop(f);
+  let in_len_w: U256 = stack_pop(f);
+  let out_off_w: U256 = stack_pop(f);
+  let out_len_w: U256 = stack_pop(f);
+  let has_transfer: bool = (op == OP_CALL || op == OP_CALLCODE) && !u256_is_zero(value);
+  if op == OP_CALL && frame_is_static(f) && has_transfer { return R_CALL_NOT_ALLOWED_STATIC; }
+
+  // Resize memory for the input and output ranges; collect their offsets.
+  if !fits(in_len_w) || !fits(out_len_w) { return R_INVALID_OPERAND_OOG; }
+  let in_len: u64 = in_len_w.l0;
+  let out_len: u64 = out_len_w.l0;
+  let mut in_off: u64 = 0u64;
+  if in_len != 0u64 {
+    if !fits(in_off_w) { return R_INVALID_OPERAND_OOG; }
+    in_off = in_off_w.l0;
+    let r: u64 = mem_expand(f, in_off, in_len);
+    if r != R_CONTINUE { return r; }
+  }
+  let mut out_off: u64 = 0u64;
+  if out_len != 0u64 {
+    if !fits(out_off_w) { return R_INVALID_OPERAND_OOG; }
+    out_off = out_off_w.l0;
+    let r: u64 = mem_expand(f, out_off, out_len);
+    if r != R_CONTINUE { return r; }
+  }
+
+  // Value transfer cost.
+  if has_transfer { if !charge(f, 9000u64) { return R_OOG; } }
+  // Account access (warm base already charged by the loop; add cold surcharge).
+  let i: u64 = acc_load(c, to);
+  if last_cold(c) && spec_on(c, SPEC_BERLIN) { if !charge(f, 2500u64) { return R_OOG; } }
+  // New-account cost (CALL only).
+  if op == OP_CALL && acc_is_empty(c, i) {
+    if !spec_on(c, SPEC_SPURIOUS_DRAGON) || has_transfer {
+      if !charge(f, 25000u64) { return R_OOG; }
+    }
+  }
+  // EIP-7702 delegated code.
+  let ciu: *mut u64 = limbs_alloc(1u64);
+  if !resolve_delegated(c, f, i, ciu) { limbs_free(ciu); return R_OOG; }
+  let code_idx: u64 = unsafe { ciu[0u64] };
+  limbs_free(ciu);
+
+  // 63/64 rule and the requested limit.
+  let remaining: u64 = frame_gas(f);
+  let mut child_gas: u64 = u256_sat_u64(gas_req);
+  if spec_on(c, SPEC_TANGERINE) {
+    let capped: u64 = all_but_64th(remaining);
+    if capped < child_gas { child_gas = capped; }
+  }
+  if !charge(f, child_gas) { return R_OOG; }
+  if has_transfer { child_gas = child_gas + 2300u64; }
+
+  // Frame words: who runs, whose storage, what value is visible.
+  let mut target_addr: U256 = to;
+  let mut caller_addr: U256 = frame_word(f, FW_TARGET);
+  let mut child_value: U256 = value;
+  let mut acct_idx: u64 = i;
+  if op == OP_CALLCODE {
+    target_addr = frame_word(f, FW_TARGET);
+    acct_idx = frame_acct(f);
+  } else if op == OP_DELEGATECALL {
+    target_addr = frame_word(f, FW_TARGET);
+    caller_addr = frame_word(f, FW_CALLER);
+    child_value = frame_word(f, FW_VALUE);
+    acct_idx = frame_acct(f);
+  }
+  let is_static: bool = frame_is_static(f) || op == OP_STATICCALL;
+
+  let input: *mut u8 = mem_slice_dup(f, in_off, in_len);
+  let oraw: *mut i8 = unsafe { calloc(1u64, sizeof<ChildOut>() as u64) };
+  let o: *mut ChildOut = oraw;
+
+  // Depth limit: nothing runs, gas returns, push 0.
+  if frame_depth(f) + 1u64 > CALL_DEPTH_LIMIT {
+    finish_call(c, f, o, false, child_gas, out_off, out_len, R_CALL_TOO_DEEP);
+    mfree(input);
+    unsafe { free(oraw); }
+    return R_CONTINUE;
+  }
+
+  let jn: u64 = journal_len(c);
+  let ln: u64 = log_len(c);
+  if has_transfer {
+    // CALL sends to `to`; CALLCODE's value stays with the executing account.
+    let err: u64 = transfer_loaded(c, frame_acct(f), acct_idx, value);
+    if err != 0u64 {
+      journal_revert(c, jn, ln);
+      finish_call(c, f, o, false, child_gas, out_off, out_len, R_OUT_OF_FUNDS);
+      mfree(input);
+      unsafe { free(oraw); }
+      return R_CONTINUE;
+    }
+  } else if op == OP_CALL {
+    // A zero-value CALL still touches the recipient.
+    let _e: u64 = transfer_loaded(c, frame_acct(f), i, u256_zero());
+  }
+
+  let pid: u64 = precompile_id(to, c);
+  if pid != 0u64 {
+    run_child_precompile(c, pid, input, in_len, child_gas, o);
+  } else {
+    run_child_call(c, f, acct_idx, code_idx, target_addr, caller_addr, child_value, input, in_len, child_gas, is_static, o);
+  }
+  let r: &mut ChildOut = unsafe { &mut o[0u64] };
+  if r_is_ok(r.result) { } else { journal_revert(c, jn, ln); }
+  commit_call(c, f, o, out_off, out_len);
+  mfree(input);
+  unsafe { free(oraw); }
+  return R_CONTINUE;
+}
+
+// Pushes 0 for a call that never ran (depth, funds), returns its gas, clears
+// return data. `_result` records why for readability.
+fn finish_call(c: *mut Ctx, f: *mut Frame, o: *mut ChildOut, ok: bool, child_gas: u64, out_off: u64, out_len: u64, _result: u64) -> void {
+  frame_add_gas(f, child_gas);
+  set_return_data(f, zalloc(1u64), 0u64);
+  stack_push(f, u256_from_bool(ok));
+}
+
+// Applies a completed child call: return gas and refund, set return data,
+// copy output into the out range, push success.
+fn commit_call(c: *mut Ctx, f: *mut Frame, o: *mut ChildOut, out_off: u64, out_len: u64) -> void {
+  let r: &mut ChildOut = unsafe { &mut o[0u64] };
+  frame_add_gas(f, r.gas_left);
+  if r_is_ok(r.result) { add_refund(f, r.refund); }
+  set_return_data(f, r.out, r.out_len);
+  if r_is_ok_or_revert(r.result) { mem_write_output(f, out_off, out_len, r.out, r.out_len); }
+  stack_push(f, u256_from_bool(r_is_ok(r.result)));
+  mfree(r.out);
+}
+
+fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
+  if frame_is_static(f) { return R_STATE_CHANGE_STATIC; }
+  if is2 { if !spec_on(c, SPEC_PETERSBURG) { return R_OPCODE_NOT_FOUND; } }
+  let value: U256 = stack_pop(f);
+  let off_w: U256 = stack_pop(f);
+  let len_w: U256 = stack_pop(f);
+  if !fits(len_w) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = len_w.l0;
+  let mut salt: U256 = u256_zero();
+  if is2 { salt = stack_pop(f); }
+
+  let ep: *mut VxEnv = ctx_env(c);
+  if len != 0u64 {
+    if spec_on(c, SPEC_SHANGHAI) {
+      let e: &mut VxEnv = unsafe { &mut ep[0u64] };
+      if len > e.max_initcode_size { return R_CREATE_SIZE_LIMIT; }
+      if !charge(f, sat_mul(2u64, num_words(len))) { return R_OOG; }
+    }
+  }
+  let mut off: u64 = 0u64;
+  if len != 0u64 {
+    if !fits(off_w) { return R_INVALID_OPERAND_OOG; }
+    off = off_w.l0;
+    let r: u64 = mem_expand(f, off, len);
+    if r != R_CONTINUE { return r; }
+  }
+  if !charge(f, 32000u64) { return R_OOG; }
+  if is2 { if !charge(f, sat_mul(6u64, num_words(len))) { return R_OOG; } }
+
+  let init: *mut u8 = mem_slice_dup(f, off, len);
+  // 63/64 of all remaining gas goes to the child (Tangerine+).
+  let remaining: u64 = frame_gas(f);
+  let mut child_gas: u64 = remaining;
+  if spec_on(c, SPEC_TANGERINE) { child_gas = all_but_64th(remaining); }
+  if !charge(f, child_gas) { return R_OOG; }
+
+  let caller_idx: u64 = frame_acct(f);
+  let caller_addr: U256 = frame_word(f, FW_TARGET);
+
+  // Depth or insufficient balance: push 0, return the child gas, keep nonce.
+  if frame_depth(f) + 1u64 > CALL_DEPTH_LIMIT || u256_lt(acc_bal(c, caller_idx), value) {
+    frame_add_gas(f, child_gas);
+    set_return_data(f, zalloc(1u64), 0u64);
+    stack_push(f, u256_zero());
+    mfree(init);
+    return R_CONTINUE;
+  }
+
+  let old_nonce: u64 = acc_nonce(c, caller_idx);
+  if !acc_bump_nonce(c, caller_idx) {
+    frame_add_gas(f, child_gas);
+    set_return_data(f, zalloc(1u64), 0u64);
+    stack_push(f, u256_zero());
+    mfree(init);
+    return R_CONTINUE;
+  }
+
+  let mut created: U256 = u256_zero();
+  if is2 { created = create2_address(caller_addr, salt, keccak256(init, len)); }
+  else { created = create_address(caller_addr, old_nonce); }
+
+  // EIP-2929 warms the created address.
+  let created_idx: u64 = acc_load(c, created);
+
+  let jn: u64 = journal_len(c);
+  let ln: u64 = log_len(c);
+  let err: u64 = create_account(c, caller_idx, created_idx, value);
+  if err != 0u64 {
+    journal_revert(c, jn, ln);
+    set_return_data(f, zalloc(1u64), 0u64);
+    // Collision consumes the child gas; funds/overflow are caught above.
+    stack_push(f, u256_zero());
+    mfree(init);
+    return R_CONTINUE;
+  }
+
+  // Run the init code: no input, the created account is the context.
+  let jd: *mut u8 = analyze_jumpdests(init, len);
+  let child: *mut Frame = frame_new(init, len, jd, child_gas, zalloc(1u64), 0u64,
+                                    created, caller_addr, value, false,
+                                    frame_depth(f) + 1u64, created_idx, frame_tabs(f));
+  let res: u64 = run_frame(c, child);
+  let cf: &mut Frame = unsafe { &mut child[0u64] };
+  let mut gas_left: u64 = 0u64;
+  if r_is_ok_or_revert(res) { gas_left = cf.gas; }
+  let mut refund: i64 = 0i64;
+  if r_is_ok(res) { refund = cf.refund; }
+  let outp: *mut u8 = dup_bytes(cf.out, cf.out_len);
+  let outl: u64 = cf.out_len;
+  let cinput: *mut u8 = cf.input;
+  frame_free(child);
+  mfree(cinput);
+  mfree(jd);
+  mfree(init);
+
+  let gleft: *mut u64 = limbs_alloc(1u64);
+  unsafe { gleft[0u64] = gas_left; }
+  let mut final_res: u64 = res;
+  if r_is_ok(res) {
+    final_res = finish_create(c, created_idx, outp, outl, gas_left, gleft);
+  }
+  let deposit_left: u64 = unsafe { gleft[0u64] };
+  limbs_free(gleft);
+  if r_is_ok(final_res) {
+    frame_add_gas(f, deposit_left);
+    add_refund(f, refund);
+    // Successful create returns no data; revert data is set below only on revert.
+    set_return_data(f, zalloc(1u64), 0u64);
+    stack_push(f, created);
+  } else {
+    journal_revert(c, jn, ln);
+    if final_res == R_REVERT {
+      frame_add_gas(f, gas_left);
+      set_return_data(f, outp, outl);
+    } else {
+      set_return_data(f, zalloc(1u64), 0u64);
+    }
+    stack_push(f, u256_zero());
+  }
+  mfree(outp);
+  return R_CONTINUE;
+}
+
+// revm return_create: size and 0xEF checks, code-deposit gas, set the code.
+// Writes the remaining gas to gleft and returns R_RETURN on success, or
+// R_OOG / R_CREATE_* on failure.
+fn finish_create(c: *mut Ctx, created_idx: u64, out: *mut u8, out_len: u64, gas_left: u64, gleft: *mut u64) -> u64 {
+  let ep: *mut VxEnv = ctx_env(c);
+  let e: &mut VxEnv = unsafe { &mut ep[0u64] };
+  if spec_on(c, SPEC_SPURIOUS_DRAGON) && out_len > e.max_code_size { return R_CREATE_SIZE_LIMIT; }
+  let mut first: u8 = 0u8;
+  if out_len > 0u64 { first = unsafe { out[0u64] }; }
+  if spec_on(c, SPEC_LONDON) && out_len > 0u64 && first == 239u8 { return R_CREATE_EF; }
+  let deposit: u64 = sat_mul(200u64, out_len);
+  if deposit > gas_left {
+    if spec_on(c, SPEC_HOMESTEAD) { return R_OOG; }
+    // Pre-Homestead: the code is silently dropped, the create still succeeds.
+    return R_RETURN;
+  }
+  let code_copy: *mut u8 = dup_bytes(out, out_len);
+  acc_set_code(c, created_idx, keccak256(out, out_len), code_copy, out_len);
+  unsafe { gleft[0u64] = gas_left - deposit; }
+  return R_RETURN;
+}
