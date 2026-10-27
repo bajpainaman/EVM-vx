@@ -3,6 +3,10 @@ import core::ptr;
 // C library functions the engine uses. `*mut i8` is the untyped pointer:
 // every pointer type converts to and from it implicitly.
 extern "C" {
+  fn evx_malloc(n: u64) -> *mut i8;
+  fn evx_calloc(n: u64, size: u64) -> *mut i8;
+  fn evx_realloc(p: *mut i8, n: u64) -> *mut i8;
+  fn evx_free(p: *mut i8) -> void;
   fn malloc(n: u64) -> *mut i8;
   fn calloc(n: u64, size: u64) -> *mut i8;
   fn realloc(p: *mut i8, n: u64) -> *mut i8;
@@ -14,13 +18,13 @@ extern "C" {
 }
 
 // The engine's only allocator: every allocation goes through these four.
-// On the CPU they call the C library. A device build replaces just these
+// On the CPU they call the thread-local allocator in src/native/alloc_shim.c. A device build replaces just these
 // bodies (for example with a bump arena set aside before launch), so the
 // rest of the engine never calls the C allocator directly.
-fn vx_malloc(n: u64) -> *mut i8 { return unsafe { malloc(n) }; }
-fn vx_calloc(n: u64, size: u64) -> *mut i8 { return unsafe { calloc(n, size) }; }
-fn vx_realloc(p: *mut i8, n: u64) -> *mut i8 { return unsafe { realloc(p, n) }; }
-fn vx_free(p: *mut i8) -> void { unsafe { free(p); } }
+fn vx_malloc(n: u64) -> *mut i8 { return unsafe { evx_malloc(n) }; }
+fn vx_calloc(n: u64, size: u64) -> *mut i8 { return unsafe { evx_calloc(n, size) }; }
+fn vx_realloc(p: *mut i8, n: u64) -> *mut i8 { return unsafe { evx_realloc(p, n) }; }
+fn vx_free(p: *mut i8) -> void { unsafe { evx_free(p); } }
 
 // Zeroed allocation. At least one byte, so the result is never a null "empty" buffer.
 fn zalloc(n: u64) -> *mut u8 {

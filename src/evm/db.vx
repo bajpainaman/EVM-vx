@@ -13,6 +13,9 @@ struct DbAcct {
   code_len: u64,
   gen: u64,
   live: u64,
+  // Jump-destination table for code, computed once when the code is set and
+  // shared read-only by every transaction that runs it.
+  jd: *mut u8,
 }
 
 struct StateDb {
@@ -79,7 +82,7 @@ fn db_acc_slot(db: *mut StateDb, a: U256) -> u64 {
   unsafe { pa[i] = a; pb[i] = u256_zero(); ph[i] = keccak_empty(); }
   let pm: *mut DbAcct = d.ameta;
   let none: *mut u8 = null_u8();
-  unsafe { pm[i] = DbAcct { nonce: 0u64, code: none, code_len: 0u64, gen: 0u64, live: 0u64 }; }
+  unsafe { pm[i] = DbAcct { nonce: 0u64, code: none, code_len: 0u64, gen: 0u64, live: 0u64, jd: null_u8() }; }
   d.an = i + 1u64;
   map_put(d.amap, a, u256_zero(), i);
   return i;
@@ -96,16 +99,38 @@ fn db_set_account(db: *mut StateDb, a: U256, bal: U256, nonce: u64, hash: U256, 
   let d: &mut StateDb = unsafe { &mut db[0u64] };
   let pb: *mut U256 = d.abal;
   let ph: *mut U256 = d.ahash;
+  let old_hash: U256 = unsafe { ph[i] };
   unsafe { pb[i] = bal; ph[i] = hash; }
   let mp: *mut DbAcct = db_meta(db, i);
   let m: &mut DbAcct = unsafe { &mut mp[0u64] };
   m.nonce = nonce;
-  // Copy before freeing: a result's code pointer can be this very buffer.
-  let nc: *mut u8 = dup_bytes(code, code_len);
-  mfree(m.code);
-  m.code = nc;
-  m.code_len = code_len;
+  // Same code as stored: keep the buffer and its jump table (the common case
+  // when committing a block: balances and nonces change, code does not).
+  let same: bool = m.live != 0u64 && u256_eq(old_hash, hash) && m.code_len == code_len;
+  if !same {
+    // Copy before freeing: a result's code pointer can be this very buffer.
+    let nc: *mut u8 = dup_bytes(code, code_len);
+    mfree(m.code);
+    mfree(m.jd);
+    m.code = nc;
+    m.code_len = code_len;
+    m.jd = null_u8();
+    if code_len > 0u64 { m.jd = analyze_jumpdests(m.code, m.code_len); }
+  }
   m.live = 1u64;
+}
+
+// The shared jump table for account a, if its stored code is exactly `code`
+// (same buffer); null otherwise. Read-only during a block.
+fn db_jumpdests(db: *mut StateDb, a: U256, code: *mut u8) -> *mut u8 {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  let i: u64 = map_get(d.amap, a, u256_zero());
+  if i == MAP_NONE { return null_u8(); }
+  let mp: *mut DbAcct = db_meta(db, i);
+  let m: &mut DbAcct = unsafe { &mut mp[0u64] };
+  let mc: *mut u8 = m.code;
+  if !eq(mc as *const u8, code as *const u8) { return null_u8(); }
+  return m.jd;
 }
 
 // Removes an account and all its storage.
@@ -120,6 +145,8 @@ fn db_delete_account(db: *mut StateDb, a: U256) -> void {
   let m: &mut DbAcct = unsafe { &mut mp[0u64] };
   m.nonce = 0u64;
   mfree(m.code);
+  mfree(m.jd);
+  m.jd = null_u8();
   m.code = zalloc(1u64);
   m.code_len = 0u64;
   m.gen = m.gen + 1u64;

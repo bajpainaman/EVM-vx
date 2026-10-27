@@ -34,36 +34,111 @@ fn run_frame(c: *mut Ctx, root: *mut Frame) -> u64 {
   return res;
 }
 
+// The interpreter loop. Hot state (pc, gas, stack pointer, code, stack base
+// and the opcode tables) lives in locals so it stays in registers, the way
+// evm2's packed dispatch keeps it. Stack, push, jump and pure arithmetic
+// opcodes run inline on the stack slots; every other opcode writes the
+// locals back to the frame, runs its handler, and reloads them.
 fn run_loop(c: *mut Ctx, f: *mut Frame, tmp: *mut u64, sd: *mut SdResult) -> u64 {
   let spec: u64 = ctx_spec(c);
+  let fr0: &mut Frame = unsafe { &mut f[0u64] };
+  let code: *mut u8 = fr0.code;
+  let code_len: u64 = fr0.code_len;
+  let st: *mut U256 = fr0.stack;
+  let jd: *mut u8 = fr0.jd;
+  let tp: *mut OpTabs = fr0.tabs;
+  let t: &mut OpTabs = unsafe { &mut tp[0u64] };
+  let actp: *mut u8 = t.act;
+  let gp: *mut u64 = t.gas;
+  let sip: *mut u8 = t.sin;
+  let sop: *mut u8 = t.sout;
+  let mut pc: u64 = fr0.pc;
+  let mut gas: u64 = fr0.gas;
+  let mut sp: u64 = fr0.sp;
+  let mut res: u64 = R_STOP;
   loop {
-    let fr: &mut Frame = unsafe { &mut f[0u64] };
-    if fr.pc >= fr.code_len { return R_STOP; }
-    let code: *mut u8 = fr.code;
-    let opb: u8 = unsafe { code[fr.pc] };
-    let op: u64 = opb as u64;
-    fr.pc = fr.pc + 1u64;
-    let tp: *mut OpTabs = fr.tabs;
-    let t: &mut OpTabs = unsafe { &mut tp[0u64] };
-    let actp: *mut u8 = t.act;
+    if pc >= code_len { res = R_STOP; break; }
+    let op: u64 = (unsafe { code[pc] }) as u64;
+    pc = pc + 1u64;
     let a: u8 = unsafe { actp[op] };
-    if a == 0u8 { return R_OPCODE_NOT_FOUND; }
-    if a == 2u8 { return R_NOT_ACTIVATED; }
-    let gp: *mut u64 = t.gas;
+    if a == 0u8 { res = R_OPCODE_NOT_FOUND; break; }
+    if a == 2u8 { res = R_NOT_ACTIVATED; break; }
     let g: u64 = unsafe { gp[op] };
-    if g > fr.gas { return R_OOG; }
-    fr.gas = fr.gas - g;
-    let sip: *mut u8 = t.sin;
-    let sop: *mut u8 = t.sout;
+    if g > gas { res = R_OOG; break; }
+    gas = gas - g;
     let si: u64 = (unsafe { sip[op] }) as u64;
     let so: u64 = (unsafe { sop[op] }) as u64;
-    if fr.sp < si { return R_STACK_UNDERFLOW; }
-    if fr.sp - si + so > STACK_LIMIT { return R_STACK_OVERFLOW; }
-    let r: u64 = dispatch(c, f, op, spec, tmp, sd);
-    if r != R_CONTINUE { return r; }
-    if is_fatal(c) { return R_FATAL; }
+    if sp < si { res = R_STACK_UNDERFLOW; break; }
+    if sp - si + so > STACK_LIMIT { res = R_STACK_OVERFLOW; break; }
+    let mut hot: bool = true;
+    let mut done: bool = false;
+    if op >= 96u64 && op <= 127u64 {
+      let n: u64 = op - 95u64;
+      unsafe { st[sp] = u256_load_be_n(code, code_len, pc, n); }
+      pc = pc + n;
+      sp = sp + 1u64;
+    } else if op >= 128u64 && op <= 143u64 {
+      let n: u64 = op - 127u64;
+      unsafe { st[sp] = st[sp - n]; }
+      sp = sp + 1u64;
+    } else if op >= 144u64 && op <= 159u64 {
+      let n: u64 = op - 143u64;
+      let top: u64 = sp - 1u64;
+      let x: U256 = unsafe { st[top] };
+      let y: U256 = unsafe { st[top - n] };
+      unsafe { st[top] = y; st[top - n] = x; }
+    } else {
+      let o: i32 = op as i32;
+      match o {
+        0 => { res = R_STOP; done = true; }
+        1 => { unsafe { st[sp - 2u64] = u256_add(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        3 => { unsafe { st[sp - 2u64] = u256_sub(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        16 => { unsafe { st[sp - 2u64] = u256_from_bool(u256_lt(st[sp - 1u64], st[sp - 2u64])); } sp = sp - 1u64; }
+        17 => { unsafe { st[sp - 2u64] = u256_from_bool(u256_gt(st[sp - 1u64], st[sp - 2u64])); } sp = sp - 1u64; }
+        20 => { unsafe { st[sp - 2u64] = u256_from_bool(u256_eq(st[sp - 1u64], st[sp - 2u64])); } sp = sp - 1u64; }
+        21 => { unsafe { st[sp - 1u64] = u256_from_bool(u256_is_zero(st[sp - 1u64])); } }
+        22 => { unsafe { st[sp - 2u64] = u256_and(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        23 => { unsafe { st[sp - 2u64] = u256_or(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        24 => { unsafe { st[sp - 2u64] = u256_xor(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        80 => { sp = sp - 1u64; }
+        86 => {
+          let dest: U256 = unsafe { st[sp - 1u64] };
+          sp = sp - 1u64;
+          if is_jumpdest(jd, code_len, dest) { pc = dest.l0; } else { res = R_INVALID_JUMP; done = true; }
+        }
+        87 => {
+          let dest: U256 = unsafe { st[sp - 1u64] };
+          let cond: U256 = unsafe { st[sp - 2u64] };
+          sp = sp - 2u64;
+          if !u256_is_zero(cond) {
+            if is_jumpdest(jd, code_len, dest) { pc = dest.l0; } else { res = R_INVALID_JUMP; done = true; }
+          }
+        }
+        91 => { }
+        95 => { unsafe { st[sp] = u256_zero(); } sp = sp + 1u64; }
+        _ => { hot = false; }
+      }
+    }
+    if done { break; }
+    if !hot {
+      let fw: &mut Frame = unsafe { &mut f[0u64] };
+      fw.pc = pc;
+      fw.gas = gas;
+      fw.sp = sp;
+      let r: u64 = dispatch(c, f, op, spec, tmp, sd);
+      let fl: &mut Frame = unsafe { &mut f[0u64] };
+      pc = fl.pc;
+      gas = fl.gas;
+      sp = fl.sp;
+      if r != R_CONTINUE { res = r; break; }
+      if is_fatal(c) { res = R_FATAL; break; }
+    }
   }
-  return R_STOP;
+  let fe: &mut Frame = unsafe { &mut f[0u64] };
+  fe.pc = pc;
+  fe.gas = gas;
+  fe.sp = sp;
+  return res;
 }
 
 fn ctx_spec(c: *mut Ctx) -> u64 {

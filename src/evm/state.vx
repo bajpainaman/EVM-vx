@@ -36,6 +36,8 @@ struct AcctMeta {
   code: *mut u8,
   code_len: u64,
   jd: *mut u8,
+  // 1 when jd is the StateDb's shared table (never freed here).
+  jd_shared: u64,
 }
 
 struct SlotMeta {
@@ -75,6 +77,17 @@ struct Ctx {
   rs_cap: u64,
   mv_dep: u64,
   coinbase_fee: *mut U256,
+  // Scratch MvEntry for block-mode reads (one per Ctx, not one per read).
+  mv_scratch: *mut MvEntry,
+  // Opcode tables shared across a block (block mode); null means build own.
+  tabs_shared: *mut OpTabs,
+  // Block mode: set when the transaction loads the coinbase account. The
+  // committer then re-executes it with cb_ov (the exact coinbase account,
+  // fees folded in) when cb_ov_on is 1; cb_ov_exists 0 means missing.
+  cb_read: u64,
+  cb_ov_on: u64,
+  cb_ov_exists: u64,
+  cb_ov: *mut HostAccount,
   env: *mut VxEnv,
   spec: u64,
   fatal: u64,
@@ -116,6 +129,10 @@ struct Ctx {
   // Access list: (address, 0) marks an address, (address, key) a slot.
   almap: *mut Map,
   almap_slots: *mut Map,
+  // Pool of retired frames (struct + stack + words buffers kept).
+  fpool: *mut PtrBox,
+  fpool_n: u64,
+  fpool_cap: u64,
 }
 
 fn spec_on(c: *mut Ctx, s: u64) -> bool {
@@ -187,6 +204,13 @@ fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
   cx.rs_txi = limbs_alloc(64u64);
   cx.rs_inc = limbs_alloc(64u64);
   cx.coinbase_fee = calloc_words(1u64);
+  let msr: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvEntry>() as u64) };
+  cx.mv_scratch = msr;
+  let cbo: *mut i8 = unsafe { vx_calloc(1u64, sizeof<HostAccount>() as u64) };
+  cx.cb_ov = cbo;
+  cx.fpool_cap = 64u64;
+  let fpr: *mut i8 = unsafe { vx_calloc(64u64, sizeof<PtrBox>() as u64) };
+  cx.fpool = fpr;
   let ha: *mut i8 = unsafe { vx_calloc(1u64, sizeof<HostAccount>() as u64) };
   cx.hacc = ha;
   cx.ac_cap = 16u64;
@@ -307,8 +331,16 @@ fn acc_jumpdests(c: *mut Ctx, i: u64) -> *mut u8 {
   let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
   let have: *mut u8 = m.jd;
   if is_null_mut(have) {
-    let jd: *mut u8 = analyze_jumpdests(m.code, m.code_len);
-    m.jd = jd;
+    let cx: &mut Ctx = unsafe { &mut c[0u64] };
+    let mut shared: *mut u8 = null_u8();
+    if !is_null_mut(cx.db) { shared = db_jumpdests(cx.db, acc_addr(c, i), m.code); }
+    if is_null_mut(shared) {
+      m.jd = analyze_jumpdests(m.code, m.code_len);
+      m.jd_shared = 0u64;
+    } else {
+      m.jd = shared;
+      m.jd_shared = 1u64;
+    }
   }
   return m.jd;
 }
@@ -414,6 +446,7 @@ fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
       m.code_len = e.n;
       let none: *mut u8 = null_u8();
       m.jd = none;
+      m.jd_shared = 0u64;
     }
     cx.j_n = k;
   }
@@ -469,7 +502,7 @@ fn acc_push(c: *mut Ctx, a: U256, bal: U256, nonce: u64, hash: U256, code: *mut 
   unsafe { pa[i] = a; pb[i] = bal; ph[i] = hash; }
   let pm: *mut AcctMeta = cx.ac_meta;
   let none: *mut u8 = null_u8();
-  unsafe { pm[i] = AcctMeta { nonce: nonce, flags: flags, code: code, code_len: code_len, jd: none }; }
+  unsafe { pm[i] = AcctMeta { nonce: nonce, flags: flags, code: code, code_len: code_len, jd: none, jd_shared: 0u64 }; }
   cx.ac_n = i + 1u64;
   map_put(cx.amap, a, u256_zero(), i);
   return i;
@@ -498,8 +531,24 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
   let mut st: u64 = HOST_MISSING;
   let mut from_mv: bool = false;
   if !is_null_mut(cx.mv) {
-    let er: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvEntry>() as u64) };
-    let ent: *mut MvEntry = er;
+    // Block mode pays the coinbase as a deferred delta, so a speculative read
+    // of the coinbase is stale. Flag it: the committer re-executes this
+    // transaction with the exact coinbase account once its prefix is final.
+    let ce: &mut VxEnv = unsafe { &mut (cx.env)[0u64] };
+    if u256_eq(a, ce.coinbase) {
+      cx.cb_read = 1u64;
+      if cx.cb_ov_on != 0u64 {
+        // Final re-execution at commit: the exact coinbase, no versioned read.
+        from_mv = true;
+        let ov: *mut HostAccount = cx.cb_ov;
+        unsafe { ha[0u64] = ov[0u64]; }
+        st = HOST_MISSING;
+        if cx.cb_ov_exists != 0u64 { st = HOST_OK; }
+      }
+    }
+  }
+  if !is_null_mut(cx.mv) && !from_mv {
+    let ent: *mut MvEntry = cx.mv_scratch;
     let r: u64 = mv_read(cx.mv, true, a, u256_zero(), cx.txi, ent);
     let e: &mut MvEntry = unsafe { &mut ent[0u64] };
     if r == MVR_ESTIMATE {
@@ -516,7 +565,6 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
       st = HOST_OK;
       if (e.flags & MV_DELETED) != 0u64 { st = HOST_MISSING; }
     }
-    unsafe { vx_free(er); }
   }
   if !from_mv {
     if is_null_mut(cx.db) { st = unsafe { evmvx_host_account(cx.host, sp, ha) }; }
@@ -617,6 +665,7 @@ fn acc_set_code(c: *mut Ctx, i: u64, hash: U256, code: *mut u8, len: u64) -> voi
   m.code_len = len;
   let none: *mut u8 = null_u8();
   m.jd = none;
+  m.jd_shared = 0u64;
   acc_set_hash_raw(c, i, hash);
 }
 
@@ -766,8 +815,7 @@ fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
     } else {
       let mut from_mv: bool = false;
       if !is_null_mut(cx.mv) {
-        let er: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvEntry>() as u64) };
-        let ent: *mut MvEntry = er;
+        let ent: *mut MvEntry = cx.mv_scratch;
         let r: u64 = mv_read(cx.mv, false, a, k, cx.txi, ent);
         let e: &mut MvEntry = unsafe { &mut ent[0u64] };
         if r == MVR_ESTIMATE {
@@ -779,7 +827,6 @@ fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
           rs_record(c, false, a, k, false, e.txi, e.incarnation);
           v = e.val;
         }
-        unsafe { vx_free(er); }
       }
       if !from_mv {
         v = db_storage(cx.db, a, k);
@@ -925,4 +972,101 @@ fn finalize_state(c: *mut Ctx) -> void {
     }
     i = i + 1u64;
   }
+}
+
+// Resets a Ctx for the next transaction in a block: frees per-transaction
+// owned buffers (jumpdest tables, log payloads), clears counters and maps,
+// and keeps every capacity. CREATE-deployed code copies leak here, exactly as
+// they do when a Ctx is dropped today.
+fn ctx_reset(c: *mut Ctx, env: *mut VxEnv) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let mut i: u64 = 0u64;
+  while i < cx.ac_n {
+    let mp: *mut AcctMeta = offset_mut(cx.ac_meta, i as i64);
+    let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+    if m.jd_shared == 0u64 { mfree(m.jd); }
+    i = i + 1u64;
+  }
+  i = 0u64;
+  while i < cx.lg_n {
+    let lp: *mut LogMeta = offset_mut(cx.lg_meta, i as i64);
+    let l: &mut LogMeta = unsafe { &mut lp[0u64] };
+    mfree(l.data);
+    i = i + 1u64;
+  }
+  cx.ac_n = 0u64;
+  cx.sl_n = 0u64;
+  cx.ts_n = 0u64;
+  cx.j_n = 0u64;
+  cx.lg_n = 0u64;
+  cx.rs_n = 0u64;
+  cx.fatal = 0u64;
+  cx.last_cold = 0u64;
+  cx.mv_dep = 0u64;
+  cx.cb_read = 0u64;
+  cx.cb_ov_on = 0u64;
+  let fp: *mut U256 = cx.coinbase_fee;
+  unsafe { fp[0u64] = u256_zero(); }
+  map_reset(cx.amap);
+  map_reset(cx.smap);
+  map_reset(cx.tmap);
+  map_reset(cx.almap);
+  map_reset(cx.almap_slots);
+  cx.env = env;
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  cx.spec = e.spec;
+}
+
+fn free_words(p: *mut U256) -> void { let r: *mut i8 = p; unsafe { vx_free(r); } }
+
+// Frees a Ctx and every buffer it owns, including its pooled frames. The
+// per-transaction buffers (jump tables, log payloads) go through ctx_reset's
+// rules first.
+fn ctx_free(c: *mut Ctx) -> void {
+  let c0: &mut Ctx = unsafe { &mut c[0u64] };
+  let env: *mut VxEnv = c0.env;
+  ctx_reset(c, env);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let mut i: u64 = 0u64;
+  while i < cx.fpool_n {
+    let bp: *mut PtrBox = cx.fpool;
+    let bx: &mut PtrBox = unsafe { &mut bp[i] };
+    let fp: *mut Frame = bx.p;
+    frame_free(fp);
+    i = i + 1u64;
+  }
+  free_words(cx.scratch);
+  free_words(cx.rs_a);
+  free_words(cx.rs_k);
+  limbs_free(cx.rs_isacct);
+  limbs_free(cx.rs_base);
+  limbs_free(cx.rs_txi);
+  limbs_free(cx.rs_inc);
+  free_words(cx.coinbase_fee);
+  free_words(cx.ac_addr);
+  free_words(cx.ac_bal);
+  free_words(cx.ac_hash);
+  free_words(cx.sl_key);
+  free_words(cx.sl_orig);
+  free_words(cx.sl_cur);
+  free_words(cx.ts_val);
+  free_words(cx.j_val);
+  free_words(cx.lg_addr);
+  free_words(cx.lg_topics);
+  map_free(cx.amap);
+  map_free(cx.smap);
+  map_free(cx.tmap);
+  map_free(cx.almap);
+  map_free(cx.almap_slots);
+  let p0: *mut i8 = cx.cb_ov;
+  unsafe { vx_free(p0); }
+  let p1: *mut i8 = cx.mv_scratch;
+  let p2: *mut i8 = cx.fpool;
+  let p3: *mut i8 = cx.hacc;
+  let p4: *mut i8 = cx.ac_meta;
+  let p5: *mut i8 = cx.sl_meta;
+  let p6: *mut i8 = cx.j;
+  let p7: *mut i8 = cx.lg_meta;
+  let p8: *mut i8 = c;
+  unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); vx_free(p5); vx_free(p6); vx_free(p7); vx_free(p8); }
 }

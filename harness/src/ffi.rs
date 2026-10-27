@@ -193,6 +193,11 @@ extern "C" {
     pub fn evmvx_block_result(b: *mut core::ffi::c_void, i: u64) -> *mut VxResult;
     pub fn evmvx_block_reexecs(b: *mut core::ffi::c_void) -> u64;
     pub fn evmvx_block_finish(b: *mut core::ffi::c_void) -> u64;
+    pub fn evmvx_block_fee(b: *mut core::ffi::c_void, i: u64, out: *mut Word);
+    pub fn evmvx_block_aborted(b: *mut core::ffi::c_void) -> u64;
+    pub fn evmvx_block_free(b: *mut core::ffi::c_void);
+    pub fn evmvx_block_tail_fees(b: *mut core::ffi::c_void, out: *mut Word);
+    pub fn evmvx_block_coinbase_txs(b: *mut core::ffi::c_void) -> u64;
     pub fn evmvx_db_get_account(db: *mut core::ffi::c_void, addr: *const Word, out: *mut HostAccount) -> u64;
     pub fn evmvx_db_get_slot(db: *mut core::ffi::c_void, addr: *const Word, key: *const Word, out: *mut Word);
     pub fn evmvx_system_call_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;

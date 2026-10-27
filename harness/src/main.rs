@@ -9,6 +9,7 @@ mod env;
 mod ffi;
 mod host;
 mod pexec;
+mod pfuzz;
 
 use ffi::*;
 use host::Host;
@@ -199,9 +200,10 @@ fn json_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or_default().to_string();
-    if mode != "statetest" && mode != "btest" && mode != "bench" && mode != "pexec" {
+    if mode != "statetest" && mode != "btest" && mode != "bench" && mode != "pexec" && mode != "pfuzz" {
         eprintln!("usage: evmvx-test statetest|btest|bench <path>... [--show N] [--reps N]");
         eprintln!("       evmvx-test pexec [--txs N] [--threads N] [--contracts N]");
+        eprintln!("       evmvx-test pfuzz [--blocks N] [--txs N] [--seed N] [--threads N]");
         std::process::exit(2);
     }
     let mut show = 20usize;
@@ -209,6 +211,8 @@ fn main() {
     let mut ptx = 2000usize;
     let mut pthreads = 8usize;
     let mut pcontracts = 2000u64;
+    let mut pblocks = 200usize;
+    let mut pseed = 1u64;
     let mut paths = Vec::new();
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -219,6 +223,8 @@ fn main() {
             "--txs" => ptx = num(2000) as usize,
             "--threads" => pthreads = num(8) as usize,
             "--contracts" => pcontracts = num(2000),
+            "--blocks" => pblocks = num(200) as usize,
+            "--seed" => pseed = num(1),
             _ => paths.push(PathBuf::from(a)),
         }
     }
@@ -241,8 +247,22 @@ fn main() {
     let handle = std::thread::Builder::new()
         .stack_size(1 << 30)
         .spawn(move || {
+            if mode == "pfuzz" {
+                return match pfuzz::run(pblocks, ptx.max(2), pseed, pthreads) {
+                    Ok((txs, blocks, reexecs, cbtx)) => {
+                        println!(
+                            "pfuzz: {blocks} blocks, {txs} txs, seed {pseed}, {pthreads} threads: revm == vx-seq == vx-par on every tx and final state | {reexecs} re-executions, {cbtx} coinbase re-runs"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        println!("pfuzz FAILED: {e}");
+                        false
+                    }
+                };
+            }
             if mode == "pexec" {
-                pexec::run(ptx, pthreads, pcontracts);
+                pexec::run(ptx, pthreads, pcontracts, reps);
                 return true;
             }
             if mode == "bench" {
@@ -276,6 +296,15 @@ fn main() {
             }
             if skipped > 0 {
                 println!("{skipped} cases skipped (transition forks, as revme does)");
+            }
+            if host::block_threads() > 0 {
+                use std::sync::atomic::Ordering::Relaxed;
+                println!(
+                    "parallel executor: {} blocks run in parallel, {} aborted to sequential, {} coinbase-touching txs re-run exactly at commit",
+                    bctest::PAR_BLOCKS.load(Relaxed),
+                    bctest::PAR_ABORTS.load(Relaxed),
+                    bctest::PAR_CB_TXS.load(Relaxed)
+                );
             }
             for f in fails.iter().take(show) {
                 println!("FAIL {f}");

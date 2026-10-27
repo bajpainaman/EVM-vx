@@ -111,6 +111,72 @@ fn run_tx(host: &mut Host, spec: SpecId, cfg: &CfgEnv, block: &BlockEnv, tx: &Tx
     out
 }
 
+/// Blocks run by the parallel executor, and blocks it aborted (coinbase read
+/// or table overflow) that then ran sequentially.
+pub static PAR_BLOCKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PAR_ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Transactions the committer re-ran with the exact coinbase account.
+pub static PAR_CB_TXS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Runs one block's transactions through the Vx block executor. Returns the
+/// cumulative gas and receipts, or None when the executor aborted (the caller
+/// then runs the block sequentially; an aborted block changed no state).
+fn run_block_parallel(
+    host: &mut Host,
+    spec: SpecId,
+    cfg: &CfgEnv,
+    block: &BlockEnv,
+    txs: &[TxEnv],
+    nthreads: usize,
+    eip161: bool,
+) -> Result<Option<(u64, Vec<ReceiptEnvelope>)>, String> {
+    let ebs: Vec<env::EnvBuf> = txs.iter().map(|t| env::build(spec, cfg, block, t)).collect();
+    let venvs: Vec<VxEnv> = ebs.iter().map(|eb| unsafe { std::ptr::read(&eb.env) }).collect();
+    let db = host.db as *mut std::ffi::c_void;
+    let b = unsafe { evmvx_block_new(db, venvs.as_ptr(), venvs.len() as u64) };
+    let bp = b as usize;
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(move || unsafe { evmvx_block_worker(bp as *mut std::ffi::c_void) });
+        }
+    });
+    let committed = unsafe { evmvx_block_finish(b) };
+    if unsafe { evmvx_block_aborted(b) } != 0 || committed as usize != txs.len() {
+        unsafe { evmvx_block_free(b) };
+        PAR_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    PAR_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut cumulative = 0u64;
+    let mut receipts = Vec::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
+        let r = unsafe { &*evmvx_block_result(b, i as u64) };
+        match r.status {
+            RES_INVALID_TX | RES_HOST_FAILURE => {
+                let why = format!("parallel: tx {i} status {} (reason {})", r.status, r.reason);
+                unsafe { evmvx_block_free(b) };
+                return Err(why);
+            }
+            _ => {}
+        }
+        // The db already holds the block; mirror it into the Rust maps.
+        host.commit_excluding(r, None);
+        cumulative += r.gas_used;
+        let tx_type = TxType::try_from(tx.tx_type).map_err(|e| format!("tx type: {e}"))?;
+        receipts.push(ReceiptEnvelope::from_typed(
+            tx_type,
+            Receipt { status: (r.status == RES_SUCCESS).into(), cumulative_gas_used: cumulative, logs: logs_of(r) },
+        ));
+    }
+    // Fees not folded into a coinbase write by a transaction, as finish paid.
+    let mut tail = Word::default();
+    unsafe { evmvx_block_tail_fees(b, &mut tail) };
+    host.balance_incr_rust(block.beneficiary, tail.u256(), eip161);
+    PAR_CB_TXS.fetch_add(unsafe { evmvx_block_coinbase_txs(b) } as usize, std::sync::atomic::Ordering::Relaxed);
+    unsafe { evmvx_block_free(b) };
+    Ok(Some((cumulative, receipts)))
+}
+
 /// revm system_call_commit: a 30M-gas call from SYSTEM_ADDRESS, committed.
 fn system_call(host: &mut Host, spec: SpecId, cfg: &CfgEnv, block: &BlockEnv, to: Address, data: Bytes) -> Result<(), String> {
     let tx = TxEnv {
@@ -153,7 +219,7 @@ fn run_case(case: &BlockchainTestCase) -> Result<bool, String> {
         host.insert(*addr, acc.balance, acc.nonce.to::<u64>(), acc.code.clone(), storage);
     }
     host.set_block_hash(0, case.genesis_block_header.hash);
-    if crate::host::db_mode() {
+    if crate::host::db_mode() || crate::host::block_threads() > 0 {
         host.attach_db();
     }
     let spec = fork_to_spec_id(case.network);
@@ -197,7 +263,19 @@ fn run_case(case: &BlockchainTestCase) -> Result<bool, String> {
         let mut cumulative: u64 = 0;
         let mut completed = true;
         let mut receipts = Vec::with_capacity(transactions.len());
-        for tx in transactions {
+        let nthreads = crate::host::block_threads();
+        let mut ran_parallel = false;
+        if nthreads > 0 && !should_fail && !transactions.is_empty() && transactions.iter().all(|t| t.sender.is_some()) {
+            let tx_envs: Result<Vec<TxEnv>, _> = transactions.iter().map(|t| t.to_tx_env()).collect();
+            if let Ok(tx_envs) = tx_envs {
+                if let Some(r) = run_block_parallel(&mut host, spec, &cfg, &block_env, &tx_envs, nthreads, eip161)? {
+                    cumulative = r.0;
+                    receipts = r.1;
+                    ran_parallel = true;
+                }
+            }
+        }
+        for tx in transactions.iter().filter(|_| !ran_parallel) {
             if tx.sender.is_none() {
                 completed = false;
                 break;

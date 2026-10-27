@@ -233,7 +233,7 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
     unsafe {
       logs[li] = OutLog { address: ap[li], topic_count: m.topic_count,
                           t0: tp[li * 4u64], t1: tp[li * 4u64 + 1u64], t2: tp[li * 4u64 + 2u64], t3: tp[li * 4u64 + 3u64],
-                          data: m.data, data_len: m.data_len };
+                          data: dup_bytes(m.data, m.data_len), data_len: m.data_len };
     }
     li = li + 1u64;
   }
@@ -243,7 +243,9 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
 
 fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let e: &mut VxEnv = unsafe { &mut env[0u64] };
-  let tabs: *mut OpTabs = tabs_new(e.spec);
+  let cxt: &mut Ctx = unsafe { &mut c[0u64] };
+  let mut tabs: *mut OpTabs = cxt.tabs_shared;
+  if is_null_tabs(tabs) { tabs = tabs_new(e.spec); }
   let res: *mut VxResult = result_alloc();
   let r: &mut VxResult = unsafe { &mut res[0u64] };
 
@@ -394,7 +396,7 @@ fn run_tx_call(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: *m
     } else {
       let ccode: *mut u8 = acc_code(c, code_idx);
       let jd: *mut u8 = acc_jumpdests(c, code_idx);
-      let child: *mut Frame = frame_new(ccode, clen2, jd, gas, input, e.data_len,
+      let child: *mut Frame = frame_get(c, ccode, clen2, jd, gas, input, e.data_len,
                                         to, e.caller, e.value, false, 0u64, target_idx, tabs);
       let rr: u64 = run_frame(c, child);
       let cf: &mut Frame = unsafe { &mut child[0u64] };
@@ -406,7 +408,7 @@ fn run_tx_call(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: *m
       if r_is_ok(rr) { oc.refund = cf.refund; }
       oc.out = dup_bytes(cf.out, cf.out_len);
       oc.out_len = cf.out_len;
-      frame_free(child);
+      frame_put(c, child);
     }
   }
   let oc: &mut ChildOut = unsafe { &mut o[0u64] };
@@ -444,7 +446,7 @@ fn run_tx_create(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: 
   }
   let init: *mut u8 = dup_bytes(e.data, e.data_len);
   let jd: *mut u8 = analyze_jumpdests(init, e.data_len);
-  let child: *mut Frame = frame_new(init, e.data_len, jd, gas, zalloc(1u64), 0u64,
+  let child: *mut Frame = frame_get(c, init, e.data_len, jd, gas, zalloc(1u64), 0u64,
                                     created, e.caller, e.value, false, 0u64, created_idx, tabs);
   let rr: u64 = run_frame(c, child);
   let cf: &mut Frame = unsafe { &mut child[0u64] };
@@ -455,7 +457,7 @@ fn run_tx_create(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: 
   let outp: *mut u8 = dup_bytes(cf.out, cf.out_len);
   let outl: u64 = cf.out_len;
   let cinput: *mut u8 = cf.input;
-  frame_free(child);
+  frame_put(c, child);
   mfree(cinput);
   mfree(jd);
   mfree(init);
@@ -492,6 +494,15 @@ fn run_tx_create(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: 
 pub fn evmvx_result_free(res: *mut VxResult) -> void {
   let r: &mut VxResult = unsafe { &mut res[0u64] };
   mfree(r.output);
+  // The result owns a copy of each log's data (the Ctx's buffers are reused
+  // across transactions by the block executor).
+  let lp: *mut OutLog = r.logs;
+  let mut li: u64 = 0u64;
+  while li < r.log_count {
+    let lg: &mut OutLog = unsafe { &mut lp[li] };
+    mfree(lg.data);
+    li = li + 1u64;
+  }
   let a: *mut i8 = r.accounts;
   let s: *mut i8 = r.slots;
   let l: *mut i8 = r.logs;
@@ -561,4 +572,9 @@ pub fn evmvx_transact_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
 
 pub fn evmvx_system_call_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
   return system_call_with(ctx_new_db(db, env), env);
+}
+
+fn is_null_tabs(t: *mut OpTabs) -> bool {
+  let p: *mut i8 = t;
+  return is_null_mut(p);
 }

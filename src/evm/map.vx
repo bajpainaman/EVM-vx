@@ -20,15 +20,17 @@ fn mix64(x: u64) -> u64 {
   return z ^ (z >> 31u64);
 }
 
+fn rotl64(x: u64, r: u64) -> u64 { return (x << r) | (x >> (64u64 - r)); }
+
+// Folds the eight limbs with rotations, then mixes with three multiplies
+// (was eight full splitmix rounds). The final fold feeds high bits into the
+// low bits the table masks with.
 fn map_hash(a: U256, b: U256) -> u64 {
-  let mut h: u64 = mix64(a.l0 ^ 7u64);
-  h = mix64(h ^ a.l1);
-  h = mix64(h ^ a.l2);
-  h = mix64(h ^ a.l3);
-  h = mix64(h ^ b.l0);
-  h = mix64(h ^ b.l1);
-  h = mix64(h ^ b.l2);
-  return mix64(h ^ b.l3);
+  let p: u64 = a.l0 ^ rotl64(a.l1, 21u64) ^ rotl64(a.l2, 42u64) ^ rotl64(a.l3, 11u64);
+  let q: u64 = b.l0 ^ rotl64(b.l1, 21u64) ^ rotl64(b.l2, 42u64) ^ rotl64(b.l3, 11u64);
+  let mut h: u64 = (p * 11400714819323198485u64) ^ (q * 14029467366897019727u64);
+  h = (h ^ (h >> 32u64)) * 13787848793156543929u64;
+  return h ^ (h >> 29u64);
 }
 
 fn map_alloc_arrays(m: *mut Map, cap: u64) -> void {
@@ -144,4 +146,11 @@ fn map_free(m: *mut Map) -> void {
   let fu: *mut i8 = mr.used;
   let fm: *mut i8 = m;
   unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); vx_free(fm); }
+}
+
+// Clears the map in place; capacity and buffers stay.
+fn map_reset(m: *mut Map) -> void {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  zero_bytes(mr.used, mr.cap);
+  mr.len = 0u64;
 }

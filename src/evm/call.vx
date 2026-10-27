@@ -230,7 +230,7 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
     r0.out_len = 0u64;
   } else {
     // Suspend this frame; run_frame runs the child, then resume_call.
-    let child: *mut Frame = frame_new(acc_code(c, code_idx), acc_code_len(c, code_idx), acc_jumpdests(c, code_idx),
+    let child: *mut Frame = frame_get(c, acc_code(c, code_idx), acc_code_len(c, code_idx), acc_jumpdests(c, code_idx),
                                       child_gas, input, in_len, target_addr, caller_addr, child_value,
                                       is_static, frame_depth(f) + 1u64, acct_idx, frame_tabs(f));
     let fr: &mut Frame = unsafe { &mut f[0u64] };
@@ -259,7 +259,7 @@ fn call_complete(c: *mut Ctx, f: *mut Frame, o: *mut ChildOut, jn: u64, ln: u64,
 
 // Collects a finished child frame's result into a fresh ChildOut and frees
 // the child. The caller frees the ChildOut and its out buffer.
-fn take_child(child: *mut Frame, res: u64) -> *mut ChildOut {
+fn take_child(c: *mut Ctx, child: *mut Frame, res: u64) -> *mut ChildOut {
   let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
   let o: *mut ChildOut = oraw;
   let cf: &mut Frame = unsafe { &mut child[0u64] };
@@ -272,13 +272,13 @@ fn take_child(child: *mut Frame, res: u64) -> *mut ChildOut {
   r.out = dup_bytes(cf.out, cf.out_len);
   r.out_len = cf.out_len;
   mfree(cf.out);
-  frame_free(child);
+  frame_put(c, child);
   return o;
 }
 
 // Resumes a frame suspended by CALL/CALLCODE/DELEGATECALL/STATICCALL.
 fn resume_call(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -> void {
-  let o: *mut ChildOut = take_child(child, res);
+  let o: *mut ChildOut = take_child(c, child, res);
   let p: &mut Frame = unsafe { &mut parent[0u64] };
   let jn: u64 = p.k_jn;
   let ln: u64 = p.k_ln;
@@ -397,7 +397,7 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
 
   // Run the init code: no input, the created account is the context.
   let jd: *mut u8 = analyze_jumpdests(init, len);
-  let child: *mut Frame = frame_new(init, len, jd, child_gas, zalloc(1u64), 0u64,
+  let child: *mut Frame = frame_get(c, init, len, jd, child_gas, zalloc(1u64), 0u64,
                                     created, caller_addr, value, false,
                                     frame_depth(f) + 1u64, created_idx, frame_tabs(f));
   let fr: &mut Frame = unsafe { &mut f[0u64] };
@@ -431,7 +431,7 @@ fn resume_create(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -
   let outl: u64 = cf.out_len;
   let cinput: *mut u8 = cf.input;
   mfree(cf.out);
-  frame_free(child);
+  frame_put(c, child);
   mfree(cinput);
   mfree(jd);
   mfree(init);

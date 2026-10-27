@@ -34,14 +34,18 @@ struct MvLoc {
   entries: *mut MvEntry,
 }
 
+const MV_SHARDS: u64 = 16u64;
+
 struct MvMem {
   db: *mut StateDb,
-  amap: *mut Map,
-  amap_lock: *mut u64,
-  smap: *mut Map,
-  smap_lock: *mut u64,
+  // 16 shards per map, picked by the address's low limb; each shard has its
+  // own reader/writer lock, so independent accounts never contend.
+  amaps: *mut PtrBox,
+  amap_locks: *mut u64,
+  smaps: *mut PtrBox,
+  smap_locks: *mut u64,
   locs: *mut MvLoc,
-  loc_n: u64,
+  loc_n: *mut u64,
   loc_cap: u64,
   locs_lock: *mut u64,
   // Set when the fixed location table fills: the block must abort, because a
@@ -58,6 +62,11 @@ extern "C" {
   fn evx_unlock_sh(p: *mut u64) -> void;
   fn evx_lock_ex(p: *mut u64) -> void;
   fn evx_unlock_ex(p: *mut u64) -> void;
+  fn evx_aload8(p: *mut u8) -> u64;
+  fn evx_astore8(p: *mut u8, v: u64) -> void;
+  fn evx_aload_ptr(p: *mut PtrBox) -> *mut i8;
+  fn evx_astore_ptr(p: *mut PtrBox, v: *mut i8) -> void;
+  fn evx_pause() -> void;
 }
 
 // cap_hint sizes the location array once: it never grows, because workers
@@ -68,11 +77,30 @@ fn mv_new(db: *mut StateDb, cap_hint: u64) -> *mut MvMem {
   let m: *mut MvMem = raw;
   let mm: &mut MvMem = unsafe { &mut m[0u64] };
   mm.db = db;
-  mm.amap = map_new();
-  mm.smap = map_new();
-  mm.amap_lock = limbs_alloc(1u64);
-  mm.smap_lock = limbs_alloc(1u64);
+  let ar: *mut i8 = unsafe { vx_calloc(MV_SHARDS, sizeof<PtrBox>() as u64) };
+  mm.amaps = ar;
+  let sr: *mut i8 = unsafe { vx_calloc(MV_SHARDS, sizeof<PtrBox>() as u64) };
+  mm.smaps = sr;
+  // Shard maps start at twice the expected per-shard load (cap_hint counts
+  // every location), so most blocks never grow them.
+  let mut shard_cap: u64 = 64u64;
+  while shard_cap < (cap_hint / MV_SHARDS) / 4u64 { shard_cap = shard_cap * 2u64; }
+  let mut si: u64 = 0u64;
+  while si < MV_SHARDS {
+    let ab: *mut PtrBox = mm.amaps;
+    let abx: &mut PtrBox = unsafe { &mut ab[si] };
+    let am: *mut i8 = mv_map_new_cap(shard_cap);
+    abx.p = am;
+    let sb: *mut PtrBox = mm.smaps;
+    let sbx: &mut PtrBox = unsafe { &mut sb[si] };
+    let sm: *mut i8 = mv_map_new_cap(shard_cap);
+    sbx.p = sm;
+    si = si + 1u64;
+  }
+  mm.amap_locks = limbs_alloc(MV_SHARDS);
+  mm.smap_locks = limbs_alloc(MV_SHARDS);
   mm.locs_lock = limbs_alloc(1u64);
+  mm.loc_n = limbs_alloc(1u64);
   mm.overflow = limbs_alloc(1u64);
   let mut cap: u64 = cap_hint;
   if cap < 1024u64 { cap = 1024u64; }
@@ -80,6 +108,106 @@ fn mv_new(db: *mut StateDb, cap_hint: u64) -> *mut MvMem {
   let lr: *mut i8 = unsafe { vx_calloc(cap, sizeof<MvLoc>() as u64) };
   mm.locs = lr;
   return m;
+}
+
+fn mv_shard(a: U256) -> u64 { return mix64(a.l0) % MV_SHARDS; }
+
+fn mv_map_box(m: *mut MvMem, is_acct: bool, a: U256) -> *mut PtrBox {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let mut boxes: *mut PtrBox = mm.smaps;
+  if is_acct { boxes = mm.amaps; }
+  return offset_mut(boxes, mv_shard(a) as i64);
+}
+
+// The shard's current table. Tables are replaced, never freed, during a
+// block, so a reader holding an older one reads a consistent (older) view.
+fn mv_map(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
+  let raw: *mut i8 = unsafe { evx_aload_ptr(mv_map_box(m, is_acct, a)) };
+  let mp: *mut Map = raw;
+  return mp;
+}
+
+fn mv_map_new_cap(cap: u64) -> *mut Map {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Map>() as u64) };
+  let mp: *mut Map = raw;
+  map_alloc_arrays(mp, cap);
+  return mp;
+}
+
+// Lock-free lookup: `used` is read with acquire, and inserts set it with
+// release after the keys and value, so a visible slot is fully written.
+// A miss that races an insert is harmless: the read is recorded as a base
+// read and validation sees the newer version.
+fn mv_map_get_acq(mp: *mut Map, a: U256, b: U256) -> u64 {
+  let mr: &mut Map = unsafe { &mut mp[0u64] };
+  let mask: u64 = mr.cap - 1u64;
+  let mut i: u64 = map_hash(a, b) & mask;
+  let ka: *mut U256 = mr.ka;
+  let kb: *mut U256 = mr.kb;
+  let used: *mut u8 = mr.used;
+  let vals: *mut u64 = mr.vals;
+  loop {
+    let u: u64 = unsafe { evx_aload8(offset_mut(used, i as i64)) };
+    if u == 0u64 { return MAP_NONE; }
+    let x: U256 = unsafe { ka[i] };
+    let y: U256 = unsafe { kb[i] };
+    if u256_eq(x, a) && u256_eq(y, b) { return unsafe { vals[i] }; }
+    i = (i + 1u64) & mask;
+  }
+  return MAP_NONE;
+}
+
+// Insert under the shard's exclusive lock: keys and value first, then the
+// release store of `used` publishes the slot.
+fn mv_map_insert(mp: *mut Map, a: U256, b: U256, v: u64) -> void {
+  let i: u64 = map_probe(mp, a, b);
+  let mr: &mut Map = unsafe { &mut mp[0u64] };
+  let ka: *mut U256 = mr.ka;
+  let kb: *mut U256 = mr.kb;
+  let vals: *mut u64 = mr.vals;
+  unsafe { ka[i] = a; kb[i] = b; vals[i] = v; }
+  unsafe { evx_astore8(offset_mut(mr.used, i as i64), 1u64); }
+  mr.len = mr.len + 1u64;
+}
+
+// Grows a shard (under its exclusive lock): builds a doubled table privately,
+// then publishes it with one release store. The old table stays valid.
+fn mv_map_grow(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
+  let bp: *mut PtrBox = mv_map_box(m, is_acct, a);
+  let bx: &mut PtrBox = unsafe { &mut bp[0u64] };
+  let old: *mut Map = bx.p;
+  let om: &mut Map = unsafe { &mut old[0u64] };
+  let nm: *mut Map = mv_map_new_cap(om.cap * 2u64);
+  let mut j: u64 = 0u64;
+  let oka: *mut U256 = om.ka;
+  let okb: *mut U256 = om.kb;
+  let ov: *mut u64 = om.vals;
+  let ou: *mut u8 = om.used;
+  while j < om.cap {
+    if (unsafe { ou[j] }) != 0u8 {
+      map_put(nm, unsafe { oka[j] }, unsafe { okb[j] }, unsafe { ov[j] });
+    }
+    j = j + 1u64;
+  }
+  let raw: *mut i8 = nm;
+  unsafe { evx_astore_ptr(bp, raw); }
+  return nm;
+}
+
+fn mv_map_old(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let mut boxes: *mut PtrBox = mm.smaps;
+  if is_acct { boxes = mm.amaps; }
+  let bx: &mut PtrBox = unsafe { &mut boxes[mv_shard(a)] };
+  let mp: *mut Map = bx.p;
+  return mp;
+}
+
+fn mv_map_lock(m: *mut MvMem, is_acct: bool, a: U256) -> *mut u64 {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let mut locks: *mut u64 = mm.smap_locks;
+  if is_acct { locks = mm.amap_locks; }
+  return offset_mut(locks, mv_shard(a) as i64);
 }
 
 fn mv_loc(m: *mut MvMem, i: u64) -> *mut MvLoc {
@@ -91,24 +219,21 @@ fn mv_loc(m: *mut MvMem, i: u64) -> *mut MvLoc {
 // Creates it when missing. The maps grow under their exclusive lock; lookups
 // take the shared side.
 fn mv_loc_get(m: *mut MvMem, is_acct: bool, a: U256, k: U256) -> u64 {
-  let mm: &mut MvMem = unsafe { &mut m[0u64] };
-  let mut map: *mut Map = mm.smap;
-  if is_acct { map = mm.amap; }
-  let mut lp: *mut u64 = mm.smap_lock;
-  if is_acct { lp = mm.amap_lock; }
-  unsafe { evx_lock_sh(lp); }
-  let found: u64 = map_get(map, a, k);
-  unsafe { evx_unlock_sh(lp); }
+  let found: u64 = mv_map_get_acq(mv_map(m, is_acct, a), a, k);
   if found != MAP_NONE { return found; }
+  let lp: *mut u64 = mv_map_lock(m, is_acct, a);
   unsafe { evx_lock_ex(lp); }
-  // Re-check: another worker may have inserted it.
+  // Re-check under the lock: another worker may have inserted it.
+  let mut map: *mut Map = mv_map_old(m, is_acct, a);
   let again: u64 = map_get(map, a, k);
   if again != MAP_NONE {
     unsafe { evx_unlock_ex(lp); }
     return again;
   }
+  let mr: &mut Map = unsafe { &mut map[0u64] };
+  if (mr.len + 1u64) * 2u64 > mr.cap { map = mv_map_grow(m, is_acct, a); }
   let i: u64 = mv_loc_alloc(m);
-  map_put(map, a, k, i);
+  mv_map_insert(map, a, k, i);
   unsafe { evx_unlock_ex(lp); }
   return i;
 }
@@ -116,15 +241,12 @@ fn mv_loc_get(m: *mut MvMem, is_acct: bool, a: U256, k: U256) -> u64 {
 // Appends a fresh empty location; guarded by locs_lock.
 fn mv_loc_alloc(m: *mut MvMem) -> u64 {
   let mm: &mut MvMem = unsafe { &mut m[0u64] };
-  let llp: *mut u64 = mm.locs_lock;
-  unsafe { evx_lock_ex(llp); }
   // The array never grows (see mv_new). A full table aborts the block.
-  let mut i: u64 = mm.loc_n;
+  let i: u64 = unsafe { evx_afetch_add(mm.loc_n, 1u64) };
   if i + 1u64 >= mm.loc_cap {
     unsafe { evx_astore(mm.overflow, 1u64); }
-    i = 0u64;
-  } else { mm.loc_n = i + 1u64; }
-  unsafe { evx_unlock_ex(llp); }
+    return 0u64;
+  }
   return i;
 }
 
@@ -142,13 +264,7 @@ const MVR_BASE: u64 = 2u64;      // nothing below txi: read the StateDb
 // Reads location (a, k) as transaction txi: the entry with the largest writer
 // index below txi. Copies it to out.
 fn mv_read(m: *mut MvMem, is_acct: bool, a: U256, k: U256, txi: u64, out: *mut MvEntry) -> u64 {
-  let mm: &mut MvMem = unsafe { &mut m[0u64] };
-  let mut map: *mut Map = mm.smap;
-  let mut lp: *mut u64 = mm.smap_lock;
-  if is_acct { map = mm.amap; lp = mm.amap_lock; }
-  unsafe { evx_lock_sh(lp); }
-  let li: u64 = map_get(map, a, k);
-  unsafe { evx_unlock_sh(lp); }
+  let li: u64 = mv_map_get_acq(mv_map(m, is_acct, a), a, k);
   if li == MAP_NONE { return MVR_BASE; }
   let loc: *mut MvLoc = mv_loc(m, li);
   let l: &mut MvLoc = unsafe { &mut loc[0u64] };
@@ -276,19 +392,59 @@ fn mv_remove(m: *mut MvMem, li: u64, txi: u64) -> void {
 // (writer, incarnation) is still what the read saw. base_read means the read
 // fell through to the StateDb and must still do so.
 fn mv_validate_read(m: *mut MvMem, is_acct: bool, a: U256, k: U256, txi: u64,
-                    base_read: bool, want_txi: u64, want_inc: u64) -> bool {
-  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvEntry>() as u64) };
-  let tmp: *mut MvEntry = raw;
+                    base_read: bool, want_txi: u64, want_inc: u64, tmp: *mut MvEntry) -> bool {
   let r: u64 = mv_read(m, is_acct, a, k, txi, tmp);
   let e: &mut MvEntry = unsafe { &mut tmp[0u64] };
   let mut ok: bool = false;
   if r == MVR_BASE { ok = base_read; }
   else if r == MVR_HIT { ok = !base_read && e.txi == want_txi && e.incarnation == want_inc; }
-  unsafe { vx_free(raw); }
   return ok;
 }
 
 fn mv_overflowed(m: *mut MvMem) -> bool {
   let mm: &mut MvMem = unsafe { &mut m[0u64] };
   return (unsafe { evx_aload(mm.overflow) }) != 0u64;
+}
+
+// Aborts the block: workers stop and finish commits nothing.
+fn mv_abort(m: *mut MvMem) -> void {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  unsafe { evx_astore(mm.overflow, 1u64); }
+}
+
+fn mv_free(m: *mut MvMem) -> void {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let n: u64 = unsafe { evx_aload(mm.loc_n) };
+  let mut used: u64 = n;
+  if used > mm.loc_cap { used = mm.loc_cap; }
+  let mut i: u64 = 0u64;
+  while i < used {
+    let loc: *mut MvLoc = mv_loc(m, i);
+    let l: &mut MvLoc = unsafe { &mut loc[0u64] };
+    let ep: *mut i8 = l.entries;
+    unsafe { vx_free(ep); }
+    i = i + 1u64;
+  }
+  let mut si: u64 = 0u64;
+  while si < MV_SHARDS {
+    let ab: *mut PtrBox = mm.amaps;
+    let abx: &mut PtrBox = unsafe { &mut ab[si] };
+    let am: *mut Map = abx.p;
+    map_free(am);
+    let sb: *mut PtrBox = mm.smaps;
+    let sbx: &mut PtrBox = unsafe { &mut sb[si] };
+    let sm: *mut Map = sbx.p;
+    map_free(sm);
+    si = si + 1u64;
+  }
+  limbs_free(mm.amap_locks);
+  limbs_free(mm.smap_locks);
+  limbs_free(mm.locs_lock);
+  limbs_free(mm.loc_n);
+  limbs_free(mm.overflow);
+  let p1: *mut i8 = mm.amaps;
+  let p2: *mut i8 = mm.smaps;
+  let p3: *mut i8 = mm.locs;
+  let p4: *mut i8 = m;
+  unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); }
 }

@@ -30,6 +30,7 @@ const BX_COMMITTED: u64 = 3u64;
 struct BlockExec {
   db: *mut StateDb,
   mv: *mut MvMem,
+  tabs: *mut OpTabs,
   envs: *mut VxEnv,
   n: u64,
   exec_cursor: *mut u64,
@@ -38,7 +39,6 @@ struct BlockExec {
   status: *mut u64,
   incarnation: *mut u64,
   res: *mut PtrBox,
-  ctxs: *mut PtrBox,
   fees: *mut U256,
   // Write-location log: per-tx segments into one shared array.
   wl: *mut u64,
@@ -48,6 +48,21 @@ struct BlockExec {
   wl_start: *mut u64,
   wl_count: *mut u64,
   reexecs: *mut u64,
+  // Read-set arena: validation data survives the (reused) Ctx.
+  ra_a: *mut U256,
+  ra_k: *mut U256,
+  ra_meta: *mut u64,
+  ra_txi: *mut u64,
+  ra_inc: *mut u64,
+  ra_cap: u64,
+  ra_n: *mut u64,
+  ra_start: *mut u64,
+  ra_count: *mut u64,
+  // Lazy fee recipient: cb_flag[i] is 1 when tx i's last execution loaded the
+  // coinbase. Fees of txs >= fold_from are not yet in any coinbase write.
+  cb_flag: *mut u64,
+  fold_from: u64,
+  cb_txs: *mut u64,
 }
 
 pub fn evmvx_block_new(db: *mut StateDb, envs: *mut VxEnv, n: u64) -> *mut BlockExec {
@@ -56,6 +71,8 @@ pub fn evmvx_block_new(db: *mut StateDb, envs: *mut VxEnv, n: u64) -> *mut Block
   let bx: &mut BlockExec = unsafe { &mut b[0u64] };
   bx.db = db;
   bx.mv = mv_new(db, 16u64 + 32u64 * n);
+  let e0t: &mut VxEnv = unsafe { &mut envs[0u64] };
+  bx.tabs = tabs_new(e0t.spec);
   bx.envs = envs;
   bx.n = n;
   bx.exec_cursor = limbs_alloc(1u64);
@@ -66,8 +83,6 @@ pub fn evmvx_block_new(db: *mut StateDb, envs: *mut VxEnv, n: u64) -> *mut Block
   bx.fees = calloc_words(n);
   let rr: *mut i8 = unsafe { vx_calloc(n, sizeof<PtrBox>() as u64) };
   bx.res = rr;
-  let cr: *mut i8 = unsafe { vx_calloc(n, sizeof<PtrBox>() as u64) };
-  bx.ctxs = cr;
   // Fixed size for the same reason as the location array: readers index it
   // without a lock.
   bx.wl_cap = 4096u64 + 64u64 * n;
@@ -77,6 +92,17 @@ pub fn evmvx_block_new(db: *mut StateDb, envs: *mut VxEnv, n: u64) -> *mut Block
   bx.wl_start = limbs_alloc(n);
   bx.wl_count = limbs_alloc(n);
   bx.reexecs = limbs_alloc(1u64);
+  bx.ra_cap = 4096u64 + 64u64 * n;
+  bx.ra_a = calloc_words(bx.ra_cap);
+  bx.ra_k = calloc_words(bx.ra_cap);
+  bx.ra_meta = limbs_alloc(bx.ra_cap);
+  bx.ra_txi = limbs_alloc(bx.ra_cap);
+  bx.ra_inc = limbs_alloc(bx.ra_cap);
+  bx.ra_n = limbs_alloc(1u64);
+  bx.ra_start = limbs_alloc(n);
+  bx.ra_count = limbs_alloc(n);
+  bx.cb_flag = limbs_alloc(n);
+  bx.cb_txs = limbs_alloc(1u64);
   return b;
 }
 
@@ -111,7 +137,7 @@ fn bx_install(b: *mut BlockExec, i: u64, inc: u64, res: *mut VxResult, out2: *mu
       unsafe {
         ent[0u64] = MvEntry { txi: i, incarnation: inc, balance: a.balance, val: u256_zero(),
                               nonce: a.nonce, code_hash: a.code_hash,
-                              code: dup_bytes(a.code, a.code_len), code_len: a.code_len, flags: fl };
+                              code: a.code, code_len: a.code_len, flags: fl };
       }
       let li: u64 = mv_write(bx.mv, true, a.address, u256_zero(), ent);
       if nl == cap { cap = cap * 2u64; locs = realloc_limbs(locs, cap); }
@@ -162,15 +188,58 @@ fn bx_install(b: *mut BlockExec, i: u64, inc: u64, res: *mut VxResult, out2: *mu
   unsafe { out2[0u64] = start; out2[1u64] = nl; }
 }
 
-// Runs transaction i (incarnation inc) against db + mv and installs writes.
-fn bx_execute(b: *mut BlockExec, i: u64, inc: u64) -> void {
+// Runs transaction i (incarnation inc) on the worker's Ctx and installs its
+// writes. The Ctx is reset and reused across transactions; the read set is
+// copied into the arena so validation outlives the reuse.
+fn bx_execute(b: *mut BlockExec, c: *mut Ctx, i: u64, inc: u64) -> void {
+  bx_execute_ov(b, c, i, inc, false);
+}
+
+// cb_exact: run with the committer's exact coinbase account (cb_ov, set by
+// bx_coinbase_exact) instead of a speculative read.
+fn bx_execute_ov(b: *mut BlockExec, c: *mut Ctx, i: u64, inc: u64, cb_exact: bool) -> void {
   let bx: &mut BlockExec = unsafe { &mut b[0u64] };
   let env: *mut VxEnv = offset_mut(bx.envs, i as i64);
-  let c: *mut Ctx = ctx_new_db(bx.db, env);
+  ctx_reset(c, env);
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cb_exact { cx.cb_ov_on = 1u64; }
   cx.mv = bx.mv;
   cx.txi = i;
+  cx.tabs_shared = bx.tabs;
   let res: *mut VxResult = transact_with(c, env);
+  // Copy the read set into the arena (one reservation, no lock).
+  let want: u64 = cx.rs_n;
+  let astart: u64 = unsafe { evx_afetch_add(bx.ra_n, want) };
+  if astart + want > bx.ra_cap {
+    let mm: &mut MvMem = unsafe { &mut (bx.mv)[0u64] };
+    unsafe { evx_astore(mm.overflow, 1u64); }
+  } else {
+    let sa: *mut U256 = cx.rs_a;
+    let sk: *mut U256 = cx.rs_k;
+    let s1: *mut u64 = cx.rs_isacct;
+    let s2: *mut u64 = cx.rs_base;
+    let s3: *mut u64 = cx.rs_txi;
+    let s4: *mut u64 = cx.rs_inc;
+    let da: *mut U256 = bx.ra_a;
+    let dk: *mut U256 = bx.ra_k;
+    let dm: *mut u64 = bx.ra_meta;
+    let dt: *mut u64 = bx.ra_txi;
+    let di: *mut u64 = bx.ra_inc;
+    let mut j: u64 = 0u64;
+    while j < want {
+      unsafe {
+        da[astart + j] = sa[j];
+        dk[astart + j] = sk[j];
+        dm[astart + j] = s1[j] * 2u64 + s2[j];
+        dt[astart + j] = s3[j];
+        di[astart + j] = s4[j];
+      }
+      j = j + 1u64;
+    }
+    let ps: *mut u64 = bx.ra_start;
+    let pc: *mut u64 = bx.ra_count;
+    unsafe { ps[i] = astart; pc[i] = want; }
+  }
   // Drop the previous incarnation's writes that this one did not redo.
   let seg: *mut u64 = limbs_alloc(2u64);
   bx_install(b, i, inc, res, seg);
@@ -205,41 +274,38 @@ fn bx_execute(b: *mut BlockExec, i: u64, inc: u64) -> void {
   }
   let rr: *mut i8 = res;
   rbox.p = rr;
-  let cp2: *mut PtrBox = bx.ctxs;
-  let cbox: &mut PtrBox = unsafe { &mut cp2[i] };
-  cbox.p = c;
   let fp: *mut U256 = bx.fees;
   let cfp: *mut U256 = cx.coinbase_fee;
   unsafe { fp[i] = cfp[0u64]; }
+  let cbp: *mut u64 = bx.cb_flag;
+  unsafe { cbp[i] = cx.cb_read; }
   let ip: *mut u64 = bx.incarnation;
   unsafe { ip[i] = inc; }
   unsafe { evx_astore(bx_status_ptr(b, i), BX_EXECUTED); }
 }
 
-// Validates transaction i's recorded reads against the store as of index i.
-fn bx_validate(b: *mut BlockExec, i: u64) -> bool {
+// Validates transaction i's recorded reads (in the arena) as of index i.
+fn bx_validate(b: *mut BlockExec, i: u64, tmp: *mut MvEntry) -> bool {
   let bx: &mut BlockExec = unsafe { &mut b[0u64] };
-  let cp: *mut PtrBox = bx.ctxs;
-  let cbox: &mut PtrBox = unsafe { &mut cp[i] };
-  let c: *mut Ctx = cbox.p;
-  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let ps: *mut u64 = bx.ra_start;
+  let pc: *mut u64 = bx.ra_count;
+  let start: u64 = unsafe { ps[i] };
+  let count: u64 = unsafe { pc[i] };
+  let pa: *mut U256 = bx.ra_a;
+  let pk: *mut U256 = bx.ra_k;
+  let pm: *mut u64 = bx.ra_meta;
+  let pt: *mut u64 = bx.ra_txi;
+  let pi: *mut u64 = bx.ra_inc;
   let mut j: u64 = 0u64;
   let mut ok: bool = true;
-  while j < cx.rs_n {
-    let pa: *mut U256 = cx.rs_a;
-    let pk: *mut U256 = cx.rs_k;
-    let p1: *mut u64 = cx.rs_isacct;
-    let p2: *mut u64 = cx.rs_base;
-    let p3: *mut u64 = cx.rs_txi;
-    let p4: *mut u64 = cx.rs_inc;
-    let ra: U256 = unsafe { pa[j] };
-    let rk: U256 = unsafe { pk[j] };
-    let ria: bool = (unsafe { p1[j] }) != 0u64;
-    let rb: bool = (unsafe { p2[j] }) != 0u64;
-    let rt: u64 = unsafe { p3[j] };
-    let ri: u64 = unsafe { p4[j] };
-    let good: bool = mv_validate_read(bx.mv, ria, ra, rk, i, rb, rt, ri);
-    if !good { ok = false; j = cx.rs_n; } else { j = j + 1u64; }
+  while j < count {
+    let ra: U256 = unsafe { pa[start + j] };
+    let rk: U256 = unsafe { pk[start + j] };
+    let meta: u64 = unsafe { pm[start + j] };
+    let rt: u64 = unsafe { pt[start + j] };
+    let ri: u64 = unsafe { pi[start + j] };
+    let good: bool = mv_validate_read(bx.mv, meta >= 2u64, ra, rk, i, (meta & 1u64) != 0u64, rt, ri, tmp);
+    if !good { ok = false; j = count; } else { j = j + 1u64; }
   }
   return ok;
 }
@@ -247,37 +313,120 @@ fn bx_validate(b: *mut BlockExec, i: u64) -> bool {
 // Advances the commit index while the next transaction is executed: validate,
 // re-execute on a stale read (final, since the whole prefix is committed),
 // then commit. One worker drains at a time.
-fn bx_try_commit(b: *mut BlockExec) -> void {
+fn bx_try_commit(b: *mut BlockExec, c: *mut Ctx) -> void {
   let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  // Test before the CAS, so workers that lose do not bounce the line.
+  if (unsafe { evx_aload(bx.commit_lock) }) != 0u64 { return; }
   if (unsafe { evx_acas(bx.commit_lock, 0u64, 1u64) }) == 0u64 { return; }
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
   loop {
     let k: u64 = unsafe { evx_aload(bx.k) };
     if k >= bx.n { unsafe { evx_astore(bx.commit_lock, 0u64); } return; }
     let st: u64 = unsafe { evx_aload(bx_status_ptr(b, k)) };
     if st != BX_EXECUTED { unsafe { evx_astore(bx.commit_lock, 0u64); } return; }
-    if !bx_validate(b, k) {
+    let cbp: *mut u64 = bx.cb_flag;
+    if (unsafe { cbp[k] }) == 0u64 && !bx_validate(b, k, cx.mv_scratch) {
       let ip: *mut u64 = bx.incarnation;
       let inc: u64 = unsafe { ip[k] };
-      bx_execute(b, k, inc + 1u64);
+      bx_execute(b, c, k, inc + 1u64);
       unsafe { evx_afetch_add(bx.reexecs, 1u64); }
+    }
+    if (unsafe { cbp[k] }) != 0u64 {
+      // Touches the coinbase: re-run once with the exact account (final).
+      bx_coinbase_exact(b, k, c);
+      let ip2: *mut u64 = bx.incarnation;
+      let inc2: u64 = unsafe { ip2[k] };
+      bx_execute_ov(b, c, k, inc2 + 1u64, true);
+      unsafe { evx_afetch_add(bx.cb_txs, 1u64); }
+      if bx_result_writes(b, k, bx_coinbase(b)) { bx.fold_from = k; }
     }
     unsafe { evx_astore(bx_status_ptr(b, k), BX_COMMITTED); }
     unsafe { evx_astore(bx.k, k + 1u64); }
   }
 }
 
+fn bx_coinbase(b: *mut BlockExec) -> U256 {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  let e0: &mut VxEnv = unsafe { &mut (bx.envs)[0u64] };
+  return e0.coinbase;
+}
+
+// Fills the committer Ctx's coinbase override for tx k: the latest committed
+// explicit coinbase state (a versioned write below k, or the StateDb) plus
+// every fee not yet folded into a coinbase write (txs fold_from .. k-1).
+fn bx_coinbase_exact(b: *mut BlockExec, k: u64, c: *mut Ctx) -> void {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let cb: U256 = bx_coinbase(b);
+  let ov: *mut HostAccount = cx.cb_ov;
+  let r: u64 = mv_read(bx.mv, true, cb, u256_zero(), k, cx.mv_scratch);
+  let mut exists: bool = false;
+  if r == MVR_HIT {
+    let e: &mut MvEntry = unsafe { &mut (cx.mv_scratch)[0u64] };
+    unsafe { ov[0u64] = HostAccount { balance: e.balance, nonce: e.nonce, code_hash: e.code_hash,
+                                      code: e.code, code_len: e.code_len }; }
+    exists = (e.flags & MV_DELETED) == 0u64;
+  } else {
+    exists = db_account(bx.db, cb, ov) == HOST_OK;
+  }
+  let mut fees: U256 = u256_zero();
+  let mut j: u64 = bx.fold_from;
+  let fp: *mut U256 = bx.fees;
+  while j < k {
+    fees = u256_add(fees, unsafe { fp[j] });
+    j = j + 1u64;
+  }
+  let e0: &mut VxEnv = unsafe { &mut (bx.envs)[0u64] };
+  let eip161: bool = e0.spec >= SPEC_SPURIOUS_DRAGON;
+  if !exists {
+    unsafe { ov[0u64] = HostAccount { balance: u256_zero(), nonce: 0u64, code_hash: keccak_empty(),
+                                      code: null_u8(), code_len: 0u64 }; }
+    // Fee payments (or, before Spurious Dragon, their touch) create it.
+    if k > bx.fold_from && (!eip161 || !u256_is_zero(fees)) { exists = true; }
+  }
+  let cur: HostAccount = unsafe { ov[0u64] };
+  unsafe { ov[0u64] = HostAccount { balance: u256_add(cur.balance, fees), nonce: cur.nonce,
+                                    code_hash: cur.code_hash, code: cur.code, code_len: cur.code_len }; }
+  cx.cb_ov_exists = 0u64;
+  if exists { cx.cb_ov_exists = 1u64; }
+}
+
+// Whether tx k's result writes account a (it is in the result, touched).
+fn bx_result_writes(b: *mut BlockExec, k: u64, a: U256) -> bool {
+  let r: *mut VxResult = evmvx_block_result(b, k);
+  let rr: &mut VxResult = unsafe { &mut r[0u64] };
+  let accs: *mut OutAccount = rr.accounts;
+  let mut i: u64 = 0u64;
+  while i < rr.account_count {
+    let oa: &mut OutAccount = unsafe { &mut accs[i] };
+    if u256_eq(oa.address, a) && (oa.flags & ACC_TOUCHED) != 0u64 { return true; }
+    i = i + 1u64;
+  }
+  return false;
+}
+
 // Worker body: host threads call this; it returns when the block is done.
 pub fn evmvx_block_worker(b: *mut BlockExec) -> void {
   let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  // One reusable Ctx per worker: reset per transaction, never reallocated.
+  let env0: *mut VxEnv = bx.envs;
+  let c: *mut Ctx = ctx_new_db(bx.db, env0);
+  let mut claiming: bool = true;
   loop {
-    if mv_overflowed(bx.mv) { return; }
-    if (unsafe { evx_aload(bx.k) }) >= bx.n { return; }
-    let i: u64 = unsafe { evx_afetch_add(bx.exec_cursor, 1u64) };
+    if mv_overflowed(bx.mv) { ctx_free(c); return; }
+    if (unsafe { evx_aload(bx.k) }) >= bx.n { ctx_free(c); return; }
+    let mut i: u64 = bx.n;
+    if claiming {
+      i = unsafe { evx_afetch_add(bx.exec_cursor, 1u64) };
+      // Every transaction is claimed: stop touching the cursor line.
+      if i >= bx.n { claiming = false; }
+    }
     if i < bx.n {
-      bx_execute(b, i, 0u64);
-      bx_try_commit(b);
+      bx_execute(b, c, i, 0u64);
+      bx_try_commit(b, c);
     } else {
-      bx_try_commit(b);
+      bx_try_commit(b, c);
+      unsafe { evx_pause(); }
     }
   }
 }
@@ -309,13 +458,94 @@ pub fn evmvx_block_finish(b: *mut BlockExec) -> u64 {
     let rbox: &mut PtrBox = unsafe { &mut rp[i] };
     let r: *mut VxResult = rbox.p;
     db_apply(bx.db, r);
-    let fp: *mut U256 = bx.fees;
-    fee_sum = u256_add(fee_sum, unsafe { fp[i] });
+    // Fees before fold_from are already inside a coinbase write.
+    if i >= bx.fold_from {
+      let fp: *mut U256 = bx.fees;
+      fee_sum = u256_add(fee_sum, unsafe { fp[i] });
+    }
     i = i + 1u64;
   }
-  if done > 0u64 && !u256_is_zero(fee_sum) {
+  // Credit even a zero total: before Spurious Dragon the sequential path's
+  // load-and-touch creates an empty coinbase, and db_balance_incr matches it.
+  if done > 0u64 {
     let e0: &mut VxEnv = unsafe { &mut (bx.envs)[0u64] };
     db_balance_incr(bx.db, e0.coinbase, fee_sum, e0.spec >= SPEC_SPURIOUS_DRAGON);
   }
   return done;
+}
+
+// The coinbase fee transaction i contributed (valid after finish).
+pub fn evmvx_block_fee(b: *mut BlockExec, i: u64, out: *mut U256) -> void {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  let fp: *mut U256 = bx.fees;
+  unsafe { out[0u64] = fp[i]; }
+}
+
+// The fee total finish credited to the coinbase (fees from fold_from on).
+pub fn evmvx_block_tail_fees(b: *mut BlockExec, out: *mut U256) -> void {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  let mut fee_sum: U256 = u256_zero();
+  let mut i: u64 = bx.fold_from;
+  let fp: *mut U256 = bx.fees;
+  while i < bx.n {
+    fee_sum = u256_add(fee_sum, unsafe { fp[i] });
+    i = i + 1u64;
+  }
+  unsafe { out[0u64] = fee_sum; }
+}
+
+// Transactions the committer re-ran because they touched the coinbase.
+pub fn evmvx_block_coinbase_txs(b: *mut BlockExec) -> u64 {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  return unsafe { evx_aload(bx.cb_txs) };
+}
+
+pub fn evmvx_block_aborted(b: *mut BlockExec) -> u64 {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  if mv_overflowed(bx.mv) { return 1u64; }
+  return 0u64;
+}
+
+// Frees a finished block: results, the multi-version store and its versioned
+// entries, the arenas and the executor itself. The host calls it once it no
+// longer reads any result. Code buffers in entries are borrowed (never owned).
+pub fn evmvx_block_free(b: *mut BlockExec) -> void {
+  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  let mut i: u64 = 0u64;
+  while i < bx.n {
+    let rp: *mut PtrBox = bx.res;
+    let rbox: &mut PtrBox = unsafe { &mut rp[i] };
+    if !is_null_mut(rbox.p) {
+      let r: *mut VxResult = rbox.p;
+      evmvx_result_free(r);
+    }
+    i = i + 1u64;
+  }
+  mv_free(bx.mv);
+  tabs_free(bx.tabs);
+  limbs_free(bx.exec_cursor);
+  limbs_free(bx.k);
+  limbs_free(bx.commit_lock);
+  limbs_free(bx.status);
+  limbs_free(bx.incarnation);
+  free_words(bx.fees);
+  limbs_free(bx.wl);
+  limbs_free(bx.wl_n);
+  limbs_free(bx.wl_lock);
+  limbs_free(bx.wl_start);
+  limbs_free(bx.wl_count);
+  limbs_free(bx.reexecs);
+  free_words(bx.ra_a);
+  free_words(bx.ra_k);
+  limbs_free(bx.ra_meta);
+  limbs_free(bx.ra_txi);
+  limbs_free(bx.ra_inc);
+  limbs_free(bx.ra_n);
+  limbs_free(bx.ra_start);
+  limbs_free(bx.ra_count);
+  limbs_free(bx.cb_flag);
+  limbs_free(bx.cb_txs);
+  let p1: *mut i8 = bx.res;
+  let p2: *mut i8 = b;
+  unsafe { vx_free(p1); vx_free(p2); }
 }

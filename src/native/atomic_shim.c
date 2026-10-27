@@ -34,3 +34,24 @@ void evx_lock_ex(uint64_t *p) {
     }
 }
 void evx_unlock_ex(uint64_t *p) { evx_astore(p, 0); }
+
+/* Byte and pointer atomics for lock-free reads of the versioned maps. */
+uint64_t evx_aload8(const uint8_t *p) {
+    return atomic_load_explicit((const _Atomic uint8_t *)p, memory_order_acquire);
+}
+void evx_astore8(uint8_t *p, uint64_t v) {
+    atomic_store_explicit((_Atomic uint8_t *)p, (uint8_t)v, memory_order_release);
+}
+void *evx_aload_ptr(void *const *p) {
+    return atomic_load_explicit((void *_Atomic const *)p, memory_order_acquire);
+}
+void evx_astore_ptr(void **p, void *v) {
+    atomic_store_explicit((void *_Atomic *)p, v, memory_order_release);
+}
+
+/* Spin-wait hint for idle workers (x86 PAUSE). */
+void evx_pause(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}

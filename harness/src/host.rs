@@ -34,6 +34,12 @@ impl Drop for Host {
     }
 }
 
+/// EVMVX_BLOCK=<threads> runs each valid block's transactions through the Vx
+/// block executor (implies a StateDb).
+pub fn block_threads() -> usize {
+    std::env::var("EVMVX_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 /// EVMVX_DB=1 runs the engine on a Vx-side StateDb instead of host callbacks.
 pub fn db_mode() -> bool {
     std::env::var_os("EVMVX_DB").is_some()
@@ -111,6 +117,11 @@ impl Host {
             let mw: Word = amount.into();
             unsafe { evmvx_db_balance_incr(self.db as *mut c_void, &aw, &mw, eip161 as u64) };
         }
+        self.balance_incr_rust(a, amount, eip161);
+    }
+
+    /// balance_incr on the Rust maps only (the db side was already applied).
+    pub fn balance_incr_rust(&mut self, a: Address, amount: U256, eip161: bool) {
         match self.accounts.get_mut(&a) {
             Some(acc) => {
                 acc.balance += amount;
