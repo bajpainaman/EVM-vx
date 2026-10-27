@@ -354,3 +354,13 @@ pub fn evmvx_db_free(db: *mut StateDb) -> void {
   let p8: *mut i8 = db;
   unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); vx_free(p5); vx_free(p6); vx_free(p7); vx_free(p8); }
 }
+
+// Read-back for the host (verification and inspection).
+pub fn evmvx_db_get_account(db: *mut StateDb, addr: *mut U256, out: *mut HostAccount) -> u64 {
+  return db_account(db, unsafe { addr[0u64] }, out);
+}
+
+pub fn evmvx_db_get_slot(db: *mut StateDb, addr: *mut U256, key: *mut U256, out: *mut U256) -> void {
+  let v: U256 = db_storage(db, unsafe { addr[0u64] }, unsafe { key[0u64] });
+  unsafe { out[0u64] = v; }
+}

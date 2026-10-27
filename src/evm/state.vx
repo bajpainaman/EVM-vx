@@ -62,6 +62,19 @@ struct Ctx {
   host: *mut i8,
   // When set, state reads come from this Vx-side database, never the host.
   db: *mut StateDb,
+  // Block mode (SPEC §6): versioned reads and a recorded read set.
+  mv: *mut MvMem,
+  txi: u64,
+  rs_isacct: *mut u64,
+  rs_a: *mut U256,
+  rs_k: *mut U256,
+  rs_base: *mut u64,
+  rs_txi: *mut u64,
+  rs_inc: *mut u64,
+  rs_n: u64,
+  rs_cap: u64,
+  mv_dep: u64,
+  coinbase_fee: *mut U256,
   env: *mut VxEnv,
   spec: u64,
   fatal: u64,
@@ -166,6 +179,14 @@ fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
   cx.env = env;
   cx.spec = e.spec;
   cx.scratch = calloc_words(8u64);
+  cx.rs_cap = 64u64;
+  cx.rs_a = calloc_words(64u64);
+  cx.rs_k = calloc_words(64u64);
+  cx.rs_isacct = limbs_alloc(64u64);
+  cx.rs_base = limbs_alloc(64u64);
+  cx.rs_txi = limbs_alloc(64u64);
+  cx.rs_inc = limbs_alloc(64u64);
+  cx.coinbase_fee = calloc_words(1u64);
   let ha: *mut i8 = unsafe { vx_calloc(1u64, sizeof<HostAccount>() as u64) };
   cx.hacc = ha;
   cx.ac_cap = 16u64;
@@ -475,8 +496,35 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
   unsafe { sp[0u64] = a; }
   let ha: *mut HostAccount = cx.hacc;
   let mut st: u64 = HOST_MISSING;
-  if is_null_mut(cx.db) { st = unsafe { evmvx_host_account(cx.host, sp, ha) }; }
-  else { st = db_account(cx.db, a, ha); }
+  let mut from_mv: bool = false;
+  if !is_null_mut(cx.mv) {
+    let er: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvEntry>() as u64) };
+    let ent: *mut MvEntry = er;
+    let r: u64 = mv_read(cx.mv, true, a, u256_zero(), cx.txi, ent);
+    let e: &mut MvEntry = unsafe { &mut ent[0u64] };
+    if r == MVR_ESTIMATE {
+      cx.mv_dep = e.txi + 1u64;
+      set_fatal(c);
+    }
+    if r == MVR_HIT {
+      from_mv = true;
+      rs_record(c, true, a, u256_zero(), false, e.txi, e.incarnation);
+      unsafe {
+        ha[0u64] = HostAccount { balance: e.balance, nonce: e.nonce, code_hash: e.code_hash,
+                                 code: e.code, code_len: e.code_len };
+      }
+      st = HOST_OK;
+      if (e.flags & MV_DELETED) != 0u64 { st = HOST_MISSING; }
+    }
+    unsafe { vx_free(er); }
+  }
+  if !from_mv {
+    if is_null_mut(cx.db) { st = unsafe { evmvx_host_account(cx.host, sp, ha) }; }
+    else {
+      st = db_account(cx.db, a, ha);
+      rs_record(c, true, a, u256_zero(), true, 0u64, 0u64);
+    }
+  }
   let mut i: u64 = 0u64;
   if st == HOST_OK {
     let h: &mut HostAccount = unsafe { &mut ha[0u64] };
@@ -489,6 +537,43 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
   if cold { journal_simple(c, J_WARMED, i); }
   set_last_cold(c, cold);
   return i;
+}
+
+// Records one cross-transaction read for commit-time validation.
+fn rs_record(c: *mut Ctx, is_acct: bool, a: U256, k: U256, base: bool, wtxi: u64, winc: u64) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if is_null_mut(cx.mv) { return; }
+  if cx.rs_n == cx.rs_cap {
+    let nc: u64 = cx.rs_cap * 2u64;
+    cx.rs_a = realloc_words(cx.rs_a, cx.rs_cap, nc);
+    cx.rs_k = realloc_words(cx.rs_k, cx.rs_cap, nc);
+    cx.rs_isacct = realloc_limbs(cx.rs_isacct, nc);
+    cx.rs_base = realloc_limbs(cx.rs_base, nc);
+    cx.rs_txi = realloc_limbs(cx.rs_txi, nc);
+    cx.rs_inc = realloc_limbs(cx.rs_inc, nc);
+    cx.rs_cap = nc;
+  }
+  let i: u64 = cx.rs_n;
+  let pa: *mut U256 = cx.rs_a;
+  let pk: *mut U256 = cx.rs_k;
+  unsafe { pa[i] = a; pk[i] = k; }
+  let p1: *mut u64 = cx.rs_isacct;
+  let p2: *mut u64 = cx.rs_base;
+  let p3: *mut u64 = cx.rs_txi;
+  let p4: *mut u64 = cx.rs_inc;
+  let mut ia: u64 = 0u64;
+  if is_acct { ia = 1u64; }
+  let mut bb: u64 = 0u64;
+  if base { bb = 1u64; }
+  unsafe { p1[i] = ia; p2[i] = bb; p3[i] = wtxi; p4[i] = winc; }
+  cx.rs_n = i + 1u64;
+}
+
+fn realloc_limbs(p: *mut u64, new_n: u64) -> *mut u64 {
+  let raw: *mut i8 = p;
+  let q: *mut i8 = unsafe { vx_realloc(raw, new_n * 8u64) };
+  let r: *mut u64 = q;
+  return r;
 }
 
 // ---- Account mutation (journaled) ----
@@ -679,7 +764,27 @@ fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
       if st == HOST_ERROR { set_fatal(c); }
       v = unsafe { sp[2u64] };
     } else {
-      v = db_storage(cx.db, a, k);
+      let mut from_mv: bool = false;
+      if !is_null_mut(cx.mv) {
+        let er: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvEntry>() as u64) };
+        let ent: *mut MvEntry = er;
+        let r: u64 = mv_read(cx.mv, false, a, k, cx.txi, ent);
+        let e: &mut MvEntry = unsafe { &mut ent[0u64] };
+        if r == MVR_ESTIMATE {
+          cx.mv_dep = e.txi + 1u64;
+          set_fatal(c);
+        }
+        if r == MVR_HIT {
+          from_mv = true;
+          rs_record(c, false, a, k, false, e.txi, e.incarnation);
+          v = e.val;
+        }
+        unsafe { vx_free(er); }
+      }
+      if !from_mv {
+        v = db_storage(cx.db, a, k);
+        rs_record(c, false, a, k, true, 0u64, 0u64);
+      }
     }
   }
   let s: u64 = slot_push(c, i, a, k, v);

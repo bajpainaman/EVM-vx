@@ -5,6 +5,8 @@ keccak.vx
 map.vx
 abi.vx
 db.vx
+mvmem.vx
+block.vx
 bytecode.vx
 optables.vx
 gasfn.vx

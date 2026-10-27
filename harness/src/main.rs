@@ -3,10 +3,12 @@
 //! Usage: evmvx-test statetest <path>... [--keep-going]
 
 mod bctest;
+mod bench;
 mod diff;
 mod env;
 mod ffi;
 mod host;
+mod pexec;
 
 use ffi::*;
 use host::Host;
@@ -197,18 +199,27 @@ fn json_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or_default().to_string();
-    if mode != "statetest" && mode != "btest" {
-        eprintln!("usage: evmvx-test statetest|btest <path>... [--show N]");
+    if mode != "statetest" && mode != "btest" && mode != "bench" && mode != "pexec" {
+        eprintln!("usage: evmvx-test statetest|btest|bench <path>... [--show N] [--reps N]");
+        eprintln!("       evmvx-test pexec [--txs N] [--threads N] [--contracts N]");
         std::process::exit(2);
     }
     let mut show = 20usize;
+    let mut reps = 1u32;
+    let mut ptx = 2000usize;
+    let mut pthreads = 8usize;
+    let mut pcontracts = 2000u64;
     let mut paths = Vec::new();
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
-        if a == "--show" {
-            show = it.next().and_then(|s| s.parse().ok()).unwrap_or(20);
-        } else {
-            paths.push(PathBuf::from(a));
+        let mut num = |d: u64| it.next().and_then(|s| s.parse().ok()).unwrap_or(d);
+        match a.as_str() {
+            "--show" => show = num(20) as usize,
+            "--reps" => reps = num(1) as u32,
+            "--txs" => ptx = num(2000) as usize,
+            "--threads" => pthreads = num(8) as usize,
+            "--contracts" => pcontracts = num(2000),
+            _ => paths.push(PathBuf::from(a)),
         }
     }
     // ABI layout check: Vx struct sizes must match the Rust #[repr(C)] mirrors.
@@ -230,6 +241,24 @@ fn main() {
     let handle = std::thread::Builder::new()
         .stack_size(1 << 30)
         .spawn(move || {
+            if mode == "pexec" {
+                pexec::run(ptx, pthreads, pcontracts);
+                return true;
+            }
+            if mode == "bench" {
+                let mut t = bench::Totals::default();
+                for f in &files {
+                    bench::run_file(f, reps, &mut t);
+                }
+                let ratio = t.vx_ns as f64 / t.revm_ns.max(1) as f64;
+                println!(
+                    "bench: {} cases x{reps} | vx {:.1} ms, revm {:.1} ms | vx/revm = {ratio:.2}",
+                    t.cases,
+                    t.vx_ns as f64 / 1e6,
+                    t.revm_ns as f64 / 1e6
+                );
+                return true;
+            }
             let mut passed = 0;
             let mut fails = Vec::new();
             let mut skipped = 0;

@@ -19,6 +19,12 @@ pub struct EnvBuf {
     _auths: Vec<VxAuth>,
 }
 
+// The raw pointers in VxEnv refer to this EnvBuf's own buffers and the
+// TxEnv's data bytes, which outlive it and are never written while the engine
+// runs, so sharing an EnvBuf across threads read-only is sound (pexec does).
+unsafe impl Send for EnvBuf {}
+unsafe impl Sync for EnvBuf {}
+
 fn ptr<T>(v: &[T]) -> *const T {
     if v.is_empty() { std::ptr::null() } else { v.as_ptr() }
 }

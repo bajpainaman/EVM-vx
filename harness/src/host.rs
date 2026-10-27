@@ -130,14 +130,15 @@ impl Host {
     /// Applies one transaction's account changes, following revm
     /// CacheState::apply_account_state.
     pub fn commit(&mut self, r: &VxResult) {
-        self.commit_rust(r);
+        self.commit_excluding(r, None);
         // Last: db_apply replaces code buffers that r's pointers can alias.
         if self.db != 0 {
             unsafe { evmvx_db_apply(self.db as *mut c_void, r) };
         }
     }
 
-    fn commit_rust(&mut self, r: &VxResult) {
+    /// Commit, skipping one account (pexec applies the coinbase as a delta).
+    pub fn commit_excluding(&mut self, r: &VxResult, skip: Option<Address>) {
         let accounts = unsafe { slice(r.accounts, r.account_count) };
         let slots = unsafe { slice(r.slots, r.slot_count) };
         for a in accounts {
@@ -145,6 +146,9 @@ impl Host {
                 continue;
             }
             let addr = a.address.address();
+            if Some(addr) == skip {
+                continue;
+            }
             if a.flags & ACC_SELFDESTRUCTED != 0 {
                 self.accounts.remove(&addr);
                 continue;

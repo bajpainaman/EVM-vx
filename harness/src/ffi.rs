@@ -186,6 +186,15 @@ extern "C" {
     pub fn evmvx_db_balance_incr(db: *mut core::ffi::c_void, addr: *const Word, amount: *const Word, eip161: u64);
     pub fn evmvx_db_free(db: *mut core::ffi::c_void);
     pub fn evmvx_transact_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
+    /// Block executor (src/evm/block.vx): host threads call evmvx_block_worker
+    /// until the block commits; finish applies it to the db.
+    pub fn evmvx_block_new(db: *mut core::ffi::c_void, envs: *const VxEnv, n: u64) -> *mut core::ffi::c_void;
+    pub fn evmvx_block_worker(b: *mut core::ffi::c_void);
+    pub fn evmvx_block_result(b: *mut core::ffi::c_void, i: u64) -> *mut VxResult;
+    pub fn evmvx_block_reexecs(b: *mut core::ffi::c_void) -> u64;
+    pub fn evmvx_block_finish(b: *mut core::ffi::c_void) -> u64;
+    pub fn evmvx_db_get_account(db: *mut core::ffi::c_void, addr: *const Word, out: *mut HostAccount) -> u64;
+    pub fn evmvx_db_get_slot(db: *mut core::ffi::c_void, addr: *const Word, key: *const Word, out: *mut Word);
     pub fn evmvx_system_call_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
     /// Struct sizes the Vx side sees, for a layout check at startup.
     pub fn evmvx_abi_sizes(out: *mut u64);

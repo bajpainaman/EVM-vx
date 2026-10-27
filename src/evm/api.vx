@@ -322,8 +322,17 @@ fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
     let used: u64 = e.gas_limit - final_left;
     let mut coinbase_price: U256 = effective_gas_price(c);
     if e.spec >= SPEC_LONDON { coinbase_price = u256_sub(coinbase_price, u256_from_u64(e.basefee)); }
-    let cb_idx: u64 = acc_load(c, e.coinbase);
-    acc_incr_balance(c, cb_idx, u256_mul(u256_from_u64(used), coinbase_price));
+    let fee: U256 = u256_mul(u256_from_u64(used), coinbase_price);
+    let cxf: &mut Ctx = unsafe { &mut c[0u64] };
+    if is_null_mut(cxf.mv) {
+      let cb_idx: u64 = acc_load(c, e.coinbase);
+      acc_incr_balance(c, cb_idx, fee);
+    } else {
+      // Block mode: the fee is a delta the block executor sums at the end
+      // (SPEC §6 fee-recipient deltas), so paying it does not serialize txs.
+      let fp: *mut U256 = cxf.coinbase_fee;
+      unsafe { fp[0u64] = fee; }
+    }
   }
 
   let gas_used: u64 = e.gas_limit - final_left;
