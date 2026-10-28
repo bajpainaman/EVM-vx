@@ -1,238 +1,385 @@
-//! Drives the Vx block executor (src/evm/block.vx, SPEC §6) on a synthetic
-//! block and checks it against sequential execution. The executor and its
-//! multi-version store live in the Vx library; this module only builds the
-//! state, contributes worker threads, and verifies the outcome.
+//! Repeated end-to-end CPU measurements with three-way result/state checks.
 
 use crate::env;
 use crate::ffi::*;
 use crate::host::Host;
+use crate::observe::Observation;
+use crate::pfuzz::{diff, snap_host, snap_revm};
+use crate::workload::{self, addr, Workload};
 use revm::context::{cfg::CfgEnv, BlockEnv, TxEnv};
-use revm::primitives::{hardfork::SpecId, Address, Bytes, TxKind, U256};
+use revm::database::{CacheDB, EmptyDB};
+use revm::primitives::{hardfork::SpecId, Bytes, TxKind, U256};
+use revm::state::{AccountInfo, Bytecode};
+use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 const SPEC: SpecId = SpecId::CANCUN;
+const SENDER_BALANCE: u64 = 1_000_000_000_000_000_000;
 
-/// 64 x (counter = sload(0) + 1; sstore(0, counter)), then STOP.
-fn contract_code() -> Bytes {
-    let seg = [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55];
-    let mut v = Vec::with_capacity(seg.len() * 64 + 1);
-    for _ in 0..64 {
-        v.extend_from_slice(&seg);
+fn build_state(ntx: usize, contracts: u64, workload: Workload) -> Host {
+    let mut host = Host::default();
+    let code = workload.code();
+    for index in 0..contracts {
+        host.insert(
+            addr(0xc0, index),
+            U256::ZERO,
+            1,
+            code.clone(),
+            HashMap::new(),
+        );
     }
-    v.push(0x00);
-    v.into()
-}
-
-fn addr(tag: u8, i: u64) -> Address {
-    let mut b = [0u8; 20];
-    b[0] = tag;
-    b[12..].copy_from_slice(&i.to_be_bytes());
-    Address::from(b)
-}
-
-fn build_state(nsenders: u64, ncontracts: u64) -> Host {
-    let mut h = Host::default();
-    let code = contract_code();
-    for i in 0..ncontracts {
-        h.insert(addr(0xc0, i), U256::ZERO, 1, code.clone(), HashMap::new());
+    if workload == Workload::Calls {
+        host.insert(
+            workload::helper_address(),
+            U256::ZERO,
+            1,
+            workload::helper_code(),
+            HashMap::new(),
+        );
     }
-    for i in 0..nsenders {
-        h.insert(addr(0xaa, i), U256::from(1_000_000_000_000_000_000u64), 0, Bytes::new(), HashMap::new());
+    for index in 0..ntx as u64 {
+        host.insert(
+            addr(0xaa, index),
+            U256::from(SENDER_BALANCE),
+            0,
+            Bytes::new(),
+            HashMap::new(),
+        );
     }
-    h
+    host
 }
 
-fn make_tx(i: u64, ncontracts: u64) -> TxEnv {
-    let mut t = TxEnv::default();
-    t.caller = addr(0xaa, i);
-    t.kind = TxKind::Call(addr(0xc0, i % ncontracts));
-    t.gas_limit = 1_000_000;
-    t.gas_price = 1;
-    t.nonce = 0;
-    t.chain_id = Some(1);
-    t
-}
-
-struct BPtr(usize);
-impl BPtr {
-    fn get(&self) -> *mut c_void {
-        self.0 as *mut c_void
+fn make_tx(index: u64, contracts: u64, workload: Workload) -> TxEnv {
+    TxEnv {
+        caller: addr(0xaa, index),
+        kind: TxKind::Call(addr(0xc0, index % contracts)),
+        gas_limit: 1_000_000,
+        gas_price: 1,
+        nonce: 0,
+        chain_id: Some(1),
+        value: U256::from(u64::from(workload == Workload::Transfer)),
+        ..Default::default()
     }
 }
 
-fn median(mut v: Vec<Duration>) -> Duration {
-    v.sort();
-    v[v.len() / 2]
+struct NativeBlock(*mut c_void);
+
+impl Drop for NativeBlock {
+    fn drop(&mut self) {
+        unsafe { evmvx_block_free(self.0) };
+    }
 }
 
-/// revm sequential baseline on the same block: CacheDB + transact_commit.
-fn revm_seq(txs: &[TxEnv], block: &BlockEnv, cfg: &CfgEnv, ncontracts: u64, ntx: u64) -> Duration {
-    use revm::database::{CacheDB, EmptyDB};
-    use revm::state::AccountInfo;
-    use revm::primitives::keccak256;
-    use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+fn median(samples: &[Duration]) -> Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+fn sequential(base: &Host, envs: &[env::EnvBuf]) -> (Duration, Vec<Observation>, Host) {
+    let mut host = base.clone();
+    let mut observations = Vec::with_capacity(envs.len());
+    let start = Instant::now();
+    for environment in envs {
+        let result = host.transact(&environment.env);
+        let view = unsafe { &*result };
+        observations.push(Observation::vx(view));
+        host.commit(view);
+        unsafe { evmvx_result_free(result) };
+    }
+    (start.elapsed(), observations, host)
+}
+
+fn reference(
+    base: &Host,
+    txs: &[TxEnv],
+    block: &BlockEnv,
+    cfg: &CfgEnv,
+) -> (Duration, Vec<Observation>, CacheDB<EmptyDB>) {
     let mut db = CacheDB::new(EmptyDB::default());
-    let code = contract_code();
-    let hash = keccak256(&code);
-    let bytecode = revm::state::Bytecode::new_raw(code);
-    for i in 0..ncontracts {
-        db.insert_account_info(addr(0xc0, i), AccountInfo { balance: U256::ZERO, nonce: 1, code_hash: hash, code: Some(bytecode.clone()), ..Default::default() });
+    for (address, account) in &base.accounts {
+        db.insert_account_info(
+            *address,
+            AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce,
+                code_hash: account.code_hash,
+                code: Some(Bytecode::new_raw(account.code.clone())),
+                ..Default::default()
+            },
+        );
+        for (key, value) in &account.storage {
+            db.insert_account_storage(*address, *key, *value)
+                .expect("valid benchmark prestate");
+        }
     }
-    for i in 0..ntx {
-        db.insert_account_info(addr(0xaa, i), AccountInfo { balance: U256::from(1_000_000_000_000_000_000u64), nonce: 0, ..Default::default() });
+    let mut observations = Vec::with_capacity(txs.len());
+    let start = Instant::now();
+    {
+        let mut evm = Context::mainnet()
+            .with_block(block.clone())
+            .with_cfg(cfg.clone())
+            .with_db(&mut db)
+            .build_mainnet();
+        for transaction in txs {
+            let result = evm
+                .transact_commit(transaction.clone())
+                .expect("revm rejected benchmark transaction");
+            observations.push(Observation::revm(&result));
+        }
     }
-    let t0 = Instant::now();
-    let mut evm = Context::mainnet()
-        .with_block(block.clone())
-        .with_cfg(cfg.clone())
-        .with_db(&mut db)
-        .build_mainnet();
-    for tx in txs {
-        let r = evm.transact_commit(tx.clone()).expect("revm baseline tx failed");
-        assert!(r.is_success(), "revm baseline tx not successful");
-    }
-    t0.elapsed()
+    (start.elapsed(), observations, db)
 }
 
-pub fn run(ntx: usize, nthreads: usize, ncontracts: u64, reps: u32) {
-    let mut cfg = CfgEnv::default();
-    cfg.set_spec_and_mainnet_gas_params(SPEC);
-    let mut block = BlockEnv::default();
-    block.number = U256::from(1);
-    block.timestamp = U256::from(1000);
-    block.gas_limit = 10_000_000_000;
-    block.basefee = 0;
-    block.beneficiary = addr(0xcc, 0);
-    block.prevrandao = Some(Default::default());
+struct ParallelRun {
+    execution: Duration,
+    setup: Duration,
+    cleanup: Duration,
+    observations: Vec<Observation>,
+    host: Host,
+    reexecs: u64,
+    conflicts: Vec<serde_json::Value>,
+}
 
-    let txs: Vec<TxEnv> = (0..ntx as u64).map(|i| make_tx(i, ncontracts)).collect();
-    let envs: Vec<env::EnvBuf> = txs.iter().map(|t| env::build(SPEC, &cfg, &block, t)).collect();
-    let h0 = build_state(ntx as u64, ncontracts);
-
-    // Sequential vx baseline, committed into plain Host maps; median of reps.
-    let mut seq_gas = Vec::with_capacity(ntx);
-    let mut hseq = h0.clone();
-    let mut seq_times = Vec::new();
-    for rep in 0..reps.max(1) {
-        let mut h = h0.clone();
-        let mut gas = Vec::with_capacity(ntx);
-        let t0 = Instant::now();
-        for eb in &envs {
-            let res = h.transact(&eb.env);
-            let r = unsafe { &*res };
-            assert_eq!(r.status, RES_SUCCESS, "sequential tx failed, reason {}", r.reason);
-            gas.push(r.gas_used);
-            h.commit(r);
-            unsafe { evmvx_result_free(res) };
-        }
-        seq_times.push(t0.elapsed());
-        if rep == 0 {
-            seq_gas = gas;
-            hseq = h;
-        }
-    }
-    let seq = median(seq_times);
-    let revm = median((0..reps.max(1)).map(|_| revm_seq(&txs, &block, &cfg, ncontracts, ntx as u64)).collect());
-
-    // Parallel: the Vx block executor over a StateDb; median of reps.
-    let venvs: Vec<VxEnv> = envs.iter().map(|eb| unsafe { std::ptr::read(&eb.env) }).collect();
-    let mut par_times = Vec::new();
-    let mut last: Option<(Host, usize, u64)> = None;
-    for _ in 0..reps.max(1) {
-        let mut hpar = h0.clone();
-        hpar.attach_db();
-        let db = hpar.db as *mut c_void;
-        let t0 = Instant::now();
-        let b = unsafe { evmvx_block_new(db, venvs.as_ptr(), ntx as u64) };
-        if std::env::var_os("EVMVX_PEXEC_SETUP").is_some() {
-            eprintln!("block_new: {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
-        }
-        let bp = BPtr(b as usize);
-        std::thread::scope(|s| {
-            for _ in 0..nthreads {
-                let bp = BPtr(bp.0);
+fn parallel(base: &Host, environments: &[VxEnv], threads: usize) -> ParallelRun {
+    let setup = Instant::now();
+    let mut host = base.clone();
+    host.attach_db();
+    let setup = setup.elapsed();
+    let start = Instant::now();
+    let native = NativeBlock(unsafe {
+        evmvx_block_new(
+            host.db as *mut c_void,
+            environments.as_ptr(),
+            environments.len() as u64,
+        )
+    });
+    let address = native.0 as usize;
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            workers.push(
                 std::thread::Builder::new()
                     .name("vxworker".into())
-                    .spawn_scoped(s, move || unsafe { evmvx_block_worker(bp.get()) })
-                    .unwrap();
-            }
-        });
-        let t_exec = t0.elapsed();
-        let committed = unsafe { evmvx_block_finish(b) };
-        par_times.push(t0.elapsed());
-        if std::env::var_os("EVMVX_PEXEC_SETUP").is_some() {
-            eprintln!(
-                "exec+commit: {:.2} ms, finish: {:.2} ms",
-                t_exec.as_secs_f64() * 1e3,
-                (t0.elapsed() - t_exec).as_secs_f64() * 1e3
+                    .spawn_scoped(scope, move || unsafe {
+                        evmvx_block_worker(address as *mut c_void)
+                    })
+                    .expect("could not create benchmark worker"),
             );
         }
-        assert_eq!(committed as usize, ntx, "block did not commit every transaction");
-        last = Some((hpar, b as usize, unsafe { evmvx_block_reexecs(b) }));
+        for worker in workers {
+            worker.join().expect("Vx worker panicked");
+        }
+    });
+    let committed = unsafe { evmvx_block_finish(native.0) } as usize;
+    assert_eq!(committed, environments.len(), "parallel benchmark aborted");
+    let mut observations = Vec::with_capacity(committed);
+    for index in 0..committed {
+        let result = unsafe { &*evmvx_block_result(native.0, index as u64) };
+        observations.push(Observation::vx(result));
     }
-    let par = median(par_times);
-    let (hpar, b, reexecs) = last.unwrap();
-    let b = b as *mut c_void;
-    let db = hpar.db as *mut c_void;
-
-    // Per-transaction results must match the sequential run.
-    for (i, want) in seq_gas.iter().enumerate() {
-        let r = unsafe { &*evmvx_block_result(b, i as u64) };
-        assert_eq!(r.status, RES_SUCCESS, "parallel tx {i} failed, reason {}", r.reason);
-        assert_eq!(r.gas_used, *want, "parallel tx {i} gas differs");
+    let execution = start.elapsed();
+    let reexecs = unsafe { evmvx_block_reexecs(native.0) };
+    let mut conflicts = Vec::new();
+    for index in 0..committed {
+        let mut conflict = BlockConflict::default();
+        assert_eq!(
+            unsafe { evmvx_block_conflict(native.0, index as u64, &mut conflict) },
+            1
+        );
+        if conflict.kind != 0 {
+            conflicts.push(serde_json::json!({
+                "tx": index, "account": conflict.address.address().to_string(),
+                "key": conflict.key.u256().to_string(), "kind": conflict.kind,
+                "expected_writer": conflict.expected, "observed_writer": conflict.observed,
+                "reason": conflict.reason,
+            }));
+        }
     }
+    // Rust mirrors and native read-back are verification work, outside timers.
+    for index in 0..committed {
+        host.commit_excluding(
+            unsafe { &*evmvx_block_result(native.0, index as u64) },
+            None,
+        );
+    }
+    let mut tail = Word::default();
+    unsafe { evmvx_block_tail_fees(native.0, &mut tail) };
+    host.balance_incr_rust(addr(0xcc, 0), tail.u256(), true);
+    for (address, account) in &host.accounts {
+        let word: Word = (*address).into();
+        let mut actual = HostAccount {
+            balance: Word::default(),
+            nonce: 0,
+            code_hash: Word::default(),
+            code: std::ptr::null(),
+            code_len: 0,
+        };
+        let status = unsafe { evmvx_db_get_account(host.db as *mut c_void, &word, &mut actual) };
+        assert_eq!(status, HOST_OK, "{address}: missing native account");
+        assert_eq!(
+            (actual.balance.u256(), actual.nonce, actual.code_hash.b256()),
+            (account.balance, account.nonce, account.code_hash),
+            "{address}: native metadata differs"
+        );
+        for (key, value) in &account.storage {
+            let mut actual = Word::default();
+            unsafe {
+                evmvx_db_get_slot(host.db as *mut c_void, &word, &(*key).into(), &mut actual)
+            };
+            assert_eq!(
+                actual.u256(),
+                *value,
+                "{address}: native storage differs at {key}"
+            );
+        }
+    }
+    let cleanup = Instant::now();
+    drop(native);
+    let cleanup = cleanup.elapsed();
+    ParallelRun {
+        execution,
+        setup,
+        cleanup,
+        observations,
+        host,
+        reexecs,
+        conflicts,
+    }
+}
 
-    // Final state in the StateDb must match the sequential Host state.
-    let mut ok = true;
-    let mut ha = HostAccount {
-        balance: Word::default(),
-        nonce: 0,
-        code_hash: Word::default(),
-        code: std::ptr::null(),
-        code_len: 0,
+fn nanos(samples: &[Duration]) -> Vec<u128> {
+    samples.iter().map(Duration::as_nanos).collect()
+}
+
+pub fn run(ntx: usize, threads: usize, contracts: u64, reps: u32, workload: Workload, json: bool) {
+    let mut cfg = CfgEnv::default();
+    cfg.set_spec_and_mainnet_gas_params(SPEC);
+    let block = BlockEnv {
+        number: U256::from(1),
+        timestamp: U256::from(1000),
+        gas_limit: 10_000_000_000,
+        basefee: 0,
+        beneficiary: addr(0xcc, 0),
+        prevrandao: Some(Default::default()),
+        ..Default::default()
     };
-    for (a, acc) in &hseq.accounts {
-        let aw: Word = (*a).into();
-        let st = unsafe { evmvx_db_get_account(db, &aw, &mut ha) };
-        if st != 0 {
-            println!("MISMATCH {a}: missing in parallel state");
-            ok = false;
-            continue;
+    let transactions: Vec<TxEnv> = (0..ntx as u64)
+        .map(|index| make_tx(index, contracts, workload))
+        .collect();
+    let environments: Vec<env::EnvBuf> = transactions
+        .iter()
+        .map(|tx| env::build(SPEC, &cfg, &block, tx))
+        .collect();
+    let native_envs: Vec<VxEnv> = environments
+        .iter()
+        .map(|env| unsafe { std::ptr::read(&env.env) })
+        .collect();
+    let initial = build_state(ntx, contracts, workload);
+    let mut seq_times = Vec::new();
+    let mut revm_times = Vec::new();
+    let mut par_times = Vec::new();
+    let mut setup_times = Vec::new();
+    let mut cleanup_times = Vec::new();
+    let mut reexecs = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut state_roots = Vec::new();
+    let mut receipt_roots = Vec::new();
+    for repetition in 0..reps {
+        // Rotate order to avoid assigning every warm/cold advantage to one engine.
+        let (sequential, reference, parallel) = match repetition % 3 {
+            0 => {
+                let s = sequential(&initial, &environments);
+                let r = reference(&initial, &transactions, &block, &cfg);
+                let p = parallel(&initial, &native_envs, threads);
+                (s, r, p)
+            }
+            1 => {
+                let r = reference(&initial, &transactions, &block, &cfg);
+                let p = parallel(&initial, &native_envs, threads);
+                let s = sequential(&initial, &environments);
+                (s, r, p)
+            }
+            _ => {
+                let p = parallel(&initial, &native_envs, threads);
+                let s = sequential(&initial, &environments);
+                let r = reference(&initial, &transactions, &block, &cfg);
+                (s, r, p)
+            }
+        };
+        assert_eq!(
+            sequential.1, reference.1,
+            "revm and Vx sequential observations differ"
+        );
+        assert_eq!(
+            sequential.1, parallel.observations,
+            "Vx parallel observations differ"
+        );
+        let expected = snap_host(&sequential.2);
+        if let Some(error) = diff(&snap_revm(&reference.2), &expected, "revm", "vx-seq") {
+            panic!("{error}");
         }
-        if ha.balance.u256() != acc.balance || ha.nonce != acc.nonce {
-            println!(
-                "MISMATCH {a}: balance/nonce {} / {} vs {} / {}",
-                ha.balance.u256(),
-                ha.nonce,
-                acc.balance,
-                acc.nonce
+        if let Some(error) = diff(&expected, &snap_host(&parallel.host), "vx-seq", "vx-par") {
+            panic!("{error}");
+        }
+        let root = crate::state_root(&sequential.2);
+        assert_eq!(root, crate::state_root(&parallel.host));
+        let mut reference_host = Host::default();
+        for (address, (balance, nonce, code_hash, storage)) in snap_revm(&reference.2) {
+            reference_host.accounts.insert(
+                address,
+                crate::host::Acct {
+                    balance,
+                    nonce,
+                    code_hash,
+                    code: Bytes::new(),
+                    storage: storage.into_iter().collect(),
+                },
             );
-            ok = false;
         }
-        for (k, v) in &acc.storage {
-            if v.is_zero() {
-                continue;
-            }
-            let kw: Word = (*k).into();
-            let mut out = Word::default();
-            unsafe { evmvx_db_get_slot(db, &aw, &kw, &mut out) };
-            if out.u256() != *v {
-                println!("MISMATCH {a} slot {k:#x}: {} vs {v}", out.u256());
-                ok = false;
-            }
-        }
+        assert_eq!(root, crate::state_root(&reference_host));
+        let receipts = |observations: &[Observation]| {
+            let mut cumulative = 0;
+            let receipts = observations
+                .iter()
+                .zip(&transactions)
+                .map(|(o, tx)| o.receipt(tx.tx_type, &mut cumulative))
+                .collect::<Vec<_>>();
+            alloy_consensus::proofs::calculate_receipt_root(&receipts)
+        };
+        let receipt_root = receipts(&sequential.1);
+        assert_eq!(receipt_root, receipts(&reference.1));
+        assert_eq!(receipt_root, receipts(&parallel.observations));
+        state_roots.push(root.to_string());
+        receipt_roots.push(receipt_root.to_string());
+        seq_times.push(sequential.0);
+        revm_times.push(reference.0);
+        par_times.push(parallel.execution);
+        setup_times.push(parallel.setup);
+        cleanup_times.push(parallel.cleanup);
+        reexecs.push(parallel.reexecs);
+        conflicts.push(parallel.conflicts);
     }
-
-    let speedup = seq.as_secs_f64() / par.as_secs_f64();
-    let vs_revm = revm.as_secs_f64() / par.as_secs_f64();
-    println!(
-        "pexec: {ntx} txs, {ncontracts} contracts, {nthreads} threads, median of {reps} | vx-seq {:.1} ms, revm-seq {:.1} ms, par {:.1} ms | par vs vx-seq {speedup:.2}x, par vs revm {vs_revm:.2}x | {reexecs} re-executions | state match: {}",
-        seq.as_secs_f64() * 1e3,
-        revm.as_secs_f64() * 1e3,
-        par.as_secs_f64() * 1e3,
-        if ok { "OK" } else { "MISMATCH" }
-    );
-    assert!(ok, "parallel state differs from sequential");
+    let speedup = median(&revm_times).as_secs_f64() / median(&par_times).as_secs_f64();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "workload": workload.name(), "fork": "Cancun", "txs": ntx,
+                "contracts": contracts, "threads": threads, "reps": reps, "valid": true,
+                "scope": "execution, scheduling, validation, commit, observation copying; setup and block cleanup separate",
+                "vx_seq_ns": nanos(&seq_times), "revm_seq_ns": nanos(&revm_times),
+                "vx_par_ns": nanos(&par_times), "vx_par_state_setup_ns": nanos(&setup_times),
+                "vx_par_block_cleanup_ns": nanos(&cleanup_times), "reexecs": reexecs,
+                "speedup_vs_revm": speedup,
+                "conflicts": conflicts, "state_roots": state_roots, "receipt_roots": receipt_roots,
+            })
+        );
+    } else {
+        println!("pexec: {} | {ntx} txs, {contracts} contracts, {threads} threads, median of {reps} | vx-seq {:.2} ms, revm-seq {:.2} ms, par {:.2} ms | par vs revm {speedup:.2}x | revm == vx-seq == vx-par (outcomes, gas, refunds, output, created address, logs, state)",
+                 workload.name(), median(&seq_times).as_secs_f64() * 1e3,
+                 median(&revm_times).as_secs_f64() * 1e3, median(&par_times).as_secs_f64() * 1e3);
+    }
 }

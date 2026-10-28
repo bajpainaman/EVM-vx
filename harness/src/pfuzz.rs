@@ -158,9 +158,9 @@ fn prestate() -> Vec<(Address, U256, u64, Bytes)> {
     v
 }
 
-type Snap = BTreeMap<Address, (U256, u64, B256, BTreeMap<U256, U256>)>;
+pub(crate) type Snap = BTreeMap<Address, (U256, u64, B256, BTreeMap<U256, U256>)>;
 
-fn snap_host(h: &Host) -> Snap {
+pub(crate) fn snap_host(h: &Host) -> Snap {
     h.accounts
         .iter()
         .map(|(a, x)| {
@@ -171,7 +171,7 @@ fn snap_host(h: &Host) -> Snap {
         .collect()
 }
 
-fn snap_revm(db: &CacheDB<EmptyDB>) -> Snap {
+pub(crate) fn snap_revm(db: &CacheDB<EmptyDB>) -> Snap {
     db.cache
         .accounts
         .iter()
@@ -185,7 +185,7 @@ fn snap_revm(db: &CacheDB<EmptyDB>) -> Snap {
         .collect()
 }
 
-fn diff(a: &Snap, b: &Snap, an: &str, bn: &str) -> Option<String> {
+pub(crate) fn diff(a: &Snap, b: &Snap, an: &str, bn: &str) -> Option<String> {
     let keys: BTreeSet<&Address> = a.keys().chain(b.keys()).collect();
     for k in keys {
         if a.get(k) != b.get(k) {
@@ -257,9 +257,11 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
         let b = unsafe { evmvx_block_new(hp.db as *mut c_void, venvs.as_ptr(), n as u64) };
         let bp = b as usize;
         std::thread::scope(|s| {
+            let mut workers = Vec::with_capacity(threads);
             for _ in 0..threads {
-                s.spawn(move || unsafe { evmvx_block_worker(bp as *mut c_void) });
+                workers.push(s.spawn(move || unsafe { evmvx_block_worker(bp as *mut c_void) }));
             }
+            for worker in workers { worker.join().expect("Vx worker panicked"); }
         });
         let committed = unsafe { evmvx_block_finish(b) };
         if committed as usize != n {
