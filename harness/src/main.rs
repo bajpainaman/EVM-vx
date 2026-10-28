@@ -1,15 +1,20 @@
 //! evmvx-test: runs Ethereum state tests against the Vx EVM, like `revme statetest`.
 //!
-//! Usage: evmvx-test statetest <path>... [--keep-going]
+//! Use --help for fixture, differential, and benchmark modes.
 
 mod bctest;
 mod bench;
+mod cli;
 mod diff;
 mod env;
 mod ffi;
 mod host;
+mod observe;
 mod pexec;
 mod pfuzz;
+mod workload;
+#[cfg(test)]
+mod native_tests;
 
 use ffi::*;
 use host::Host;
@@ -184,48 +189,46 @@ fn run_file(path: &Path) -> (usize, Vec<String>) {
     (passed, fails)
 }
 
-fn json_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+fn json_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for p in paths {
-        for e in WalkDir::new(p).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(p) {
+            let e = entry.map_err(|error| format!("fixture path {}: {error}", p.display()))?;
             if e.path().extension().is_some_and(|x| x == "json") {
                 out.push(e.path().to_path_buf());
             }
         }
     }
     out.sort();
-    out
+    out.dedup();
+    if !paths.is_empty() && out.is_empty() {
+        return Err("fixture paths contain no JSON files".into());
+    }
+    Ok(out)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mode = args.first().map(String::as_str).unwrap_or_default().to_string();
-    if mode != "statetest" && mode != "btest" && mode != "bench" && mode != "pexec" && mode != "pfuzz" {
-        eprintln!("usage: evmvx-test statetest|btest|bench <path>... [--show N] [--reps N]");
-        eprintln!("       evmvx-test pexec [--txs N] [--threads N] [--contracts N]");
-        eprintln!("       evmvx-test pfuzz [--blocks N] [--txs N] [--seed N] [--threads N]");
-        std::process::exit(2);
+    if args.first().is_some_and(|value| value == "--help") {
+        println!("{}", cli::USAGE);
+        return;
     }
-    let mut show = 20usize;
-    let mut reps = 1u32;
-    let mut ptx = 2000usize;
-    let mut pthreads = 8usize;
-    let mut pcontracts = 2000u64;
-    let mut pblocks = 200usize;
-    let mut pseed = 1u64;
-    let mut paths = Vec::new();
-    let mut it = args[1..].iter();
-    while let Some(a) = it.next() {
-        let mut num = |d: u64| it.next().and_then(|s| s.parse().ok()).unwrap_or(d);
-        match a.as_str() {
-            "--show" => show = num(20) as usize,
-            "--reps" => reps = num(1) as u32,
-            "--txs" => ptx = num(2000) as usize,
-            "--threads" => pthreads = num(8) as usize,
-            "--contracts" => pcontracts = num(2000),
-            "--blocks" => pblocks = num(200) as usize,
-            "--seed" => pseed = num(1),
-            _ => paths.push(PathBuf::from(a)),
+    let options = cli::parse(&args).unwrap_or_else(|error| {
+        eprintln!("{error}\n{}", cli::USAGE);
+        std::process::exit(2);
+    });
+    let files = json_files(&options.paths).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let cli::Options {
+        mode, show, reps, txs: ptx, threads: pthreads, contracts: pcontracts,
+        blocks: pblocks, seed: pseed, workload, json, ..
+    } = options;
+    if let Ok(value) = std::env::var("EVMVX_BLOCK") {
+        if value.parse::<usize>().map_or(true, |workers| workers == 0) {
+            eprintln!("EVMVX_BLOCK must be a positive worker count");
+            std::process::exit(2);
         }
     }
     // ABI layout check: Vx struct sizes must match the Rust #[repr(C)] mirrors.
@@ -242,10 +245,10 @@ fn main() {
             assert_eq!(sz[i] as usize, *w, "ABI size mismatch at struct {i}: vx={} rust={w}", sz[i]);
         }
     }
-    let files = json_files(&paths);
-    // Deep call stacks recurse in the engine; run on a large stack.
+    // EVM frames use an explicit heap stack; the harness needs no giant
+    // virtual reservation for nested contracts.
     let handle = std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             if mode == "pfuzz" {
                 return match pfuzz::run(pblocks, ptx.max(2), pseed, pthreads) {
@@ -262,13 +265,17 @@ fn main() {
                 };
             }
             if mode == "pexec" {
-                pexec::run(ptx, pthreads, pcontracts, reps);
+                pexec::run(ptx, pthreads, pcontracts, reps, workload, json);
                 return true;
             }
             if mode == "bench" {
                 let mut t = bench::Totals::default();
                 for f in &files {
                     bench::run_file(f, reps, &mut t);
+                }
+                if t.cases == 0 {
+                    eprintln!("no executable benchmark cases in the supplied fixtures");
+                    return false;
                 }
                 let ratio = t.vx_ns as f64 / t.revm_ns.max(1) as f64;
                 println!(
@@ -310,6 +317,10 @@ fn main() {
                 println!("FAIL {f}");
             }
             println!("{} files, {passed} passed, {} failed", files.len(), fails.len());
+            if passed == 0 && fails.is_empty() {
+                eprintln!("no executable fixture cases; check fork selection and skip policies");
+                return false;
+            }
             fails.is_empty()
         })
         .unwrap();

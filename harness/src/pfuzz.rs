@@ -9,6 +9,7 @@
 use crate::env;
 use crate::ffi::*;
 use crate::host::Host;
+use crate::observe::Observation;
 use revm::context::{cfg::CfgEnv, BlockEnv, TxEnv};
 use revm::database::{AccountState, CacheDB, EmptyDB};
 use revm::primitives::{hardfork::SpecId, keccak256, Address, Bytes, TxKind, B256, U256};
@@ -156,9 +157,9 @@ fn prestate() -> Vec<(Address, U256, u64, Bytes)> {
     v
 }
 
-type Snap = BTreeMap<Address, (U256, u64, B256, BTreeMap<U256, U256>)>;
+pub(crate) type Snap = BTreeMap<Address, (U256, u64, B256, BTreeMap<U256, U256>)>;
 
-fn snap_host(h: &Host) -> Snap {
+pub(crate) fn snap_host(h: &Host) -> Snap {
     h.accounts
         .iter()
         .map(|(a, x)| {
@@ -169,7 +170,7 @@ fn snap_host(h: &Host) -> Snap {
         .collect()
 }
 
-fn snap_revm(db: &CacheDB<EmptyDB>) -> Snap {
+pub(crate) fn snap_revm(db: &CacheDB<EmptyDB>) -> Snap {
     db.cache
         .accounts
         .iter()
@@ -183,7 +184,7 @@ fn snap_revm(db: &CacheDB<EmptyDB>) -> Snap {
         .collect()
 }
 
-fn diff(a: &Snap, b: &Snap, an: &str, bn: &str) -> Option<String> {
+pub(crate) fn diff(a: &Snap, b: &Snap, an: &str, bn: &str) -> Option<String> {
     let keys: BTreeSet<&Address> = a.keys().chain(b.keys()).collect();
     for k in keys {
         if a.get(k) != b.get(k) {
@@ -224,7 +225,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
             let mut evm = Context::mainnet().with_block(block.clone()).with_cfg(cfg.clone()).with_db(&mut rdb).build_mainnet();
             for t in &txs {
                 match evm.transact_commit(t.clone()) {
-                    Ok(r) => rgas.push((r.is_success(), r.tx_gas_used())),
+                    Ok(r) => rgas.push(Observation::revm(&r)),
                     Err(e) => return Err(format!("block {bi}: revm rejected a tx: {e}")),
                 }
             }
@@ -244,7 +245,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
             if r.status == RES_INVALID_TX || r.status == RES_HOST_FAILURE {
                 return Err(format!("block {bi}: vx-seq status {} reason {}", r.status, r.reason));
             }
-            sgas.push((r.status == RES_SUCCESS, r.gas_used));
+            sgas.push(Observation::vx(r));
             hs.commit(r);
             unsafe { evmvx_result_free(res) };
         }
@@ -255,9 +256,11 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
         let b = unsafe { evmvx_block_new(hp.db as *mut c_void, venvs.as_ptr(), n as u64) };
         let bp = b as usize;
         std::thread::scope(|s| {
+            let mut workers = Vec::with_capacity(threads);
             for _ in 0..threads {
-                s.spawn(move || unsafe { evmvx_block_worker(bp as *mut c_void) });
+                workers.push(s.spawn(move || unsafe { evmvx_block_worker(bp as *mut c_void) }));
             }
+            for worker in workers { worker.join().expect("Vx worker panicked"); }
         });
         let committed = unsafe { evmvx_block_finish(b) };
         if committed as usize != n {
@@ -266,7 +269,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
         let mut pgas = Vec::new();
         for i in 0..n {
             let r = unsafe { &*evmvx_block_result(b, i as u64) };
-            pgas.push((r.status == RES_SUCCESS, r.gas_used));
+            pgas.push(Observation::vx(r));
             hp.commit_excluding(r, None);
         }
         let mut tail = Word::default();

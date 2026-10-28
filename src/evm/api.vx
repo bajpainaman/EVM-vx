@@ -308,12 +308,14 @@ fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let mut final_left: u64 = gas_left;
   if rf >= 0i64 { final_left = final_left + (rf as u64); }
   else { final_left = final_left - ((0i64 - rf) as u64); }
+  let mut reported_refund: u64 = 0u64;
+  if rf > 0i64 { reported_refund = rf as u64; }
 
   // EIP-7623 floor: used gas cannot drop below the floor.
   if e.spec >= SPEC_PRAGUE {
     let fl: u64 = floor_gas(c, env);
     let used: u64 = e.gas_limit - final_left;
-    if used < fl { final_left = e.gas_limit - fl; }
+    if used < fl { final_left = e.gas_limit - fl; reported_refund = 0u64; }
   }
 
   // Reimburse the caller for the unused gas.
@@ -339,7 +341,7 @@ fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
 
   let gas_used: u64 = e.gas_limit - final_left;
   r.gas_used = gas_used;
-  r.gas_refunded = 0u64;
+  r.gas_refunded = reported_refund;
   r.output = out;
   r.output_len = out_len;
   r.created_address = U256 { l0: created_addr.l0, l1: created_addr.l1, l2: created_addr.l2, l3: created_addr.l3 };
@@ -473,8 +475,10 @@ fn run_tx_create(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: 
     r.gas_used = dep_left;
     r.gas_refunded = i64_to_slot(rfd);
     r.reason = R_RETURN;
-    r.output = zalloc(1u64);
-    r.output_len = 0u64;
+    // The transaction result owns the deployed bytecode, as revm's Create
+    // output does; it must survive the context and frame being reused.
+    r.output = dup_bytes(outp, outl);
+    r.output_len = outl;
   } else {
     journal_revert(c, jn, ln);
     r.reason = fr;

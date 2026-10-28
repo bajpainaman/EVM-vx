@@ -12,8 +12,9 @@
  *   the owner drains that list when a free list runs dry. So memory returns
  *   to the thread that allocates it (workers allocate results that the main
  *   thread frees), and long multi-block runs stay bounded.
- * - Heaps are never freed. When a thread exits, its heap goes onto an orphan
- *   list and the next new thread adopts it, remote list included.
+ * - Heaps are never freed. A permanent registry has immutable links; exiting
+ *   threads release ownership and new threads claim an idle heap. Registry
+ *   nodes are never removed, so adoption has no ABA/reclamation problem.
  *
  * Blocks above the biggest class go to libc, marked LARGE in the header.
  * CPU builds only; a device build replaces this file. */
@@ -37,38 +38,45 @@ typedef struct Heap {
     FreeBlock *lists[NCLASS];
     uint8_t *cur, *end;
     _Atomic(FreeBlock *) remote;     /* blocks freed by other threads */
-    struct Heap *next_orphan;
+    struct Heap *next;
+    _Atomic unsigned claimed;
 } Heap;
 
-static pthread_mutex_t orphan_mu = PTHREAD_MUTEX_INITIALIZER;
-static Heap *orphans;
+static _Atomic(Heap *) heaps;
 static pthread_key_t exit_key;
-static pthread_once_t key_once = PTHREAD_ONCE_INIT;
 static __thread Heap *my_heap;
 
 static void on_thread_exit(void *h) {
     Heap *heap = (Heap *)h;
-    pthread_mutex_lock(&orphan_mu);
-    heap->next_orphan = orphans;
-    orphans = heap;
-    pthread_mutex_unlock(&orphan_mu);
+    atomic_store_explicit(&heap->claimed, 0, memory_order_release);
 }
 
-static void make_key(void) { pthread_key_create(&exit_key, on_thread_exit); }
+/* Library initialization precedes exported calls; no lazy-init spinlock. */
+__attribute__((constructor)) static void make_key(void) {
+    if (pthread_key_create(&exit_key, on_thread_exit) != 0) abort();
+}
 
 /* First use on a thread: adopt an orphaned heap, or make a new one. */
 static Heap *heap_init(void) {
-    pthread_once(&key_once, make_key);
-    pthread_mutex_lock(&orphan_mu);
-    Heap *h = orphans;
-    if (h) orphans = h->next_orphan;
-    pthread_mutex_unlock(&orphan_mu);
+    Heap *h = atomic_load_explicit(&heaps, memory_order_acquire);
+    while (h) {
+        unsigned available = 0;
+        if (atomic_compare_exchange_strong_explicit(&h->claimed, &available, 1,
+                                                    memory_order_acquire, memory_order_relaxed)) break;
+        h = h->next;
+    }
     if (!h) {
         h = (Heap *)calloc(1, sizeof(Heap));
         if (!h) abort();
+        atomic_init(&h->claimed, 1);
+        atomic_init(&h->remote, NULL);
+        Heap *head = atomic_load_explicit(&heaps, memory_order_acquire);
+        do { h->next = head; }
+        while (!atomic_compare_exchange_weak_explicit(&heaps, &head, h,
+                                                      memory_order_acq_rel, memory_order_acquire));
     }
     my_heap = h;
-    pthread_setspecific(exit_key, h);
+    if (pthread_setspecific(exit_key, h) != 0) abort();
     return h;
 }
 

@@ -101,6 +101,15 @@ Host pointer/length calculations must be checked before truncating U256 offsets 
 
 ## 6. Candidate parallel machine
 
+Implementation note (2026-10-28): the CPU executor uses immutable pre-block
+speculation and a single finalizer after all workers join. Its prefix store
+retains only the latest final value per location. It repairs stale transactions
+in input order and publishes the complete block only after every result is
+valid. No engine mutex or spinlock is used. The host exclusively owns StateDb
+through this operation. See [YOLO ownership and validation](YOLO.md); the
+abstract actions below describe semantic transitions, not an implemented
+multi-version scheduler or a proof of refinement.
+
 Abstract scheduler state consists of:
 
 - C: immutable, published world-state snapshot for the committed transaction prefix.

@@ -1,0 +1,27 @@
+// The raw-pointer ABI uses aligned u64 cells. These are the same native LLVM
+// operations used by core::sync::atomic, without a C call on each task claim.
+fn evx_aload(p: *mut u64) -> u64 {
+  return mlir!(inputs: (%p = p : !llvm.ptr), returns: u64, dialects: ["llvm"]) {
+    %r = llvm.load %p atomic acquire {
+      alignment = 8 : i64
+    } : !llvm.ptr -> i64
+    macro.yield %r : i64
+  };
+}
+
+fn evx_astore(p: *mut u64, v: u64) -> void {
+  mlir!(inputs: (%p = p : !llvm.ptr, %v = v : i64), dialects: ["llvm"]) {
+    llvm.store %v, %p atomic release {
+      alignment = 8 : i64
+    } : i64, !llvm.ptr
+    macro.yield
+  };
+}
+
+// Claims unique indices only; completion publication is a separate release.
+fn evx_afetch_add(p: *mut u64, v: u64) -> u64 {
+  return mlir!(inputs: (%p = p : !llvm.ptr, %v = v : i64), returns: u64, dialects: ["llvm"]) {
+    %r = llvm.atomicrmw add %p, %v monotonic : !llvm.ptr, i64
+    macro.yield %r : i64
+  };
+}

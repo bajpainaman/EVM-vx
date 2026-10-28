@@ -1,5 +1,6 @@
 u256.vx
 libc.vx
+atomic.vx
 bytes.vx
 keccak.vx
 map.vx

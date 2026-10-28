@@ -136,9 +136,11 @@ fn run_block_parallel(
     let b = unsafe { evmvx_block_new(db, venvs.as_ptr(), venvs.len() as u64) };
     let bp = b as usize;
     std::thread::scope(|s| {
+        let mut workers = Vec::with_capacity(nthreads);
         for _ in 0..nthreads {
-            s.spawn(move || unsafe { evmvx_block_worker(bp as *mut std::ffi::c_void) });
+            workers.push(s.spawn(move || unsafe { evmvx_block_worker(bp as *mut std::ffi::c_void) }));
         }
+        for worker in workers { worker.join().expect("Vx worker panicked"); }
     });
     let committed = unsafe { evmvx_block_finish(b) };
     if unsafe { evmvx_block_aborted(b) } != 0 || committed as usize != txs.len() {
