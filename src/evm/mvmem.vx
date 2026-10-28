@@ -1,0 +1,450 @@
+// Multi-version memory for the block executor (SPEC §6, Block-STM style).
+//
+// Locations are accounts (address) and storage slots (address, key). Each
+// location holds a small array of versioned entries ordered by writer
+// transaction index. A read by transaction i returns the entry with the
+// largest writer index below i, or falls through to the StateDb. Each map is
+// guarded by a reader/writer lock; each location's entry array by its own
+// exclusive lock (evx_* from the C shim).
+
+// A versioned write to one location.
+struct MvEntry {
+  txi: u64,
+  incarnation: u64,
+  // Account payload (slot entries use val only).
+  balance: U256,
+  val: U256,
+  nonce: u64,
+  code_hash: U256,
+  code: *mut u8,
+  code_len: u64,
+  flags: u64,
+}
+
+// Entry flags.
+const MV_ESTIMATE: u64 = 1u64;   // Aborted incarnation's write: readers must wait.
+const MV_DELETED: u64 = 2u64;    // Account removed (selfdestruct / state clear).
+const MV_ACCOUNT: u64 = 4u64;    // Account payload, not a slot value.
+
+// One location: a growable entry array plus its lock.
+struct MvLoc {
+  lock: u64,
+  n: u64,
+  cap: u64,
+  entries: *mut MvEntry,
+}
+
+const MV_SHARDS: u64 = 16u64;
+
+struct MvMem {
+  db: *mut StateDb,
+  // 16 shards per map, picked by the address's low limb; each shard has its
+  // own reader/writer lock, so independent accounts never contend.
+  amaps: *mut PtrBox,
+  amap_locks: *mut u64,
+  smaps: *mut PtrBox,
+  smap_locks: *mut u64,
+  locs: *mut MvLoc,
+  loc_n: *mut u64,
+  loc_cap: u64,
+  locs_lock: *mut u64,
+  // Set when the fixed location table fills: the block must abort, because a
+  // shared slot would let one location's reads see another's values.
+  overflow: *mut u64,
+}
+
+extern "C" {
+  fn evx_aload(p: *mut u64) -> u64;
+  fn evx_astore(p: *mut u64, v: u64) -> void;
+  fn evx_afetch_add(p: *mut u64, v: u64) -> u64;
+  fn evx_acas(p: *mut u64, want: u64, new: u64) -> u64;
+  fn evx_lock_sh(p: *mut u64) -> void;
+  fn evx_unlock_sh(p: *mut u64) -> void;
+  fn evx_lock_ex(p: *mut u64) -> void;
+  fn evx_unlock_ex(p: *mut u64) -> void;
+  fn evx_aload8(p: *mut u8) -> u64;
+  fn evx_astore8(p: *mut u8, v: u64) -> void;
+  fn evx_aload_ptr(p: *mut PtrBox) -> *mut i8;
+  fn evx_astore_ptr(p: *mut PtrBox, v: *mut i8) -> void;
+  fn evx_pause() -> void;
+}
+
+// cap_hint sizes the location array once: it never grows, because workers
+// index it without a lock while mv_loc_alloc appends (a realloc would move it
+// under their feet).
+fn mv_new(db: *mut StateDb, cap_hint: u64) -> *mut MvMem {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<MvMem>() as u64) };
+  let m: *mut MvMem = raw;
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  mm.db = db;
+  let ar: *mut i8 = unsafe { vx_calloc(MV_SHARDS, sizeof<PtrBox>() as u64) };
+  mm.amaps = ar;
+  let sr: *mut i8 = unsafe { vx_calloc(MV_SHARDS, sizeof<PtrBox>() as u64) };
+  mm.smaps = sr;
+  // Shard maps start at twice the expected per-shard load (cap_hint counts
+  // every location), so most blocks never grow them.
+  let mut shard_cap: u64 = 64u64;
+  while shard_cap < (cap_hint / MV_SHARDS) / 4u64 { shard_cap = shard_cap * 2u64; }
+  let mut si: u64 = 0u64;
+  while si < MV_SHARDS {
+    let ab: *mut PtrBox = mm.amaps;
+    let abx: &mut PtrBox = unsafe { &mut ab[si] };
+    let am: *mut i8 = mv_map_new_cap(shard_cap);
+    abx.p = am;
+    let sb: *mut PtrBox = mm.smaps;
+    let sbx: &mut PtrBox = unsafe { &mut sb[si] };
+    let sm: *mut i8 = mv_map_new_cap(shard_cap);
+    sbx.p = sm;
+    si = si + 1u64;
+  }
+  mm.amap_locks = limbs_alloc(MV_SHARDS);
+  mm.smap_locks = limbs_alloc(MV_SHARDS);
+  mm.locs_lock = limbs_alloc(1u64);
+  mm.loc_n = limbs_alloc(1u64);
+  mm.overflow = limbs_alloc(1u64);
+  let mut cap: u64 = cap_hint;
+  if cap < 1024u64 { cap = 1024u64; }
+  mm.loc_cap = cap;
+  let lr: *mut i8 = unsafe { vx_calloc(cap, sizeof<MvLoc>() as u64) };
+  mm.locs = lr;
+  return m;
+}
+
+fn mv_shard(a: U256) -> u64 { return mix64(a.l0) % MV_SHARDS; }
+
+fn mv_map_box(m: *mut MvMem, is_acct: bool, a: U256) -> *mut PtrBox {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let mut boxes: *mut PtrBox = mm.smaps;
+  if is_acct { boxes = mm.amaps; }
+  return offset_mut(boxes, mv_shard(a) as i64);
+}
+
+// The shard's current table. Tables are replaced, never freed, during a
+// block, so a reader holding an older one reads a consistent (older) view.
+fn mv_map(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
+  let raw: *mut i8 = unsafe { evx_aload_ptr(mv_map_box(m, is_acct, a)) };
+  let mp: *mut Map = raw;
+  return mp;
+}
+
+fn mv_map_new_cap(cap: u64) -> *mut Map {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Map>() as u64) };
+  let mp: *mut Map = raw;
+  map_alloc_arrays(mp, cap);
+  return mp;
+}
+
+// Lock-free lookup: `used` is read with acquire, and inserts set it with
+// release after the keys and value, so a visible slot is fully written.
+// A miss that races an insert is harmless: the read is recorded as a base
+// read and validation sees the newer version.
+fn mv_map_get_acq(mp: *mut Map, a: U256, b: U256) -> u64 {
+  let mr: &mut Map = unsafe { &mut mp[0u64] };
+  let mask: u64 = mr.cap - 1u64;
+  let mut i: u64 = map_hash(a, b) & mask;
+  let ka: *mut U256 = mr.ka;
+  let kb: *mut U256 = mr.kb;
+  let used: *mut u8 = mr.used;
+  let vals: *mut u64 = mr.vals;
+  loop {
+    let u: u64 = unsafe { evx_aload8(offset_mut(used, i as i64)) };
+    if u == 0u64 { return MAP_NONE; }
+    let x: U256 = unsafe { ka[i] };
+    let y: U256 = unsafe { kb[i] };
+    if u256_eq(x, a) && u256_eq(y, b) { return unsafe { vals[i] }; }
+    i = (i + 1u64) & mask;
+  }
+  return MAP_NONE;
+}
+
+// Insert under the shard's exclusive lock: keys and value first, then the
+// release store of `used` publishes the slot.
+fn mv_map_insert(mp: *mut Map, a: U256, b: U256, v: u64) -> void {
+  let i: u64 = map_probe(mp, a, b);
+  let mr: &mut Map = unsafe { &mut mp[0u64] };
+  let ka: *mut U256 = mr.ka;
+  let kb: *mut U256 = mr.kb;
+  let vals: *mut u64 = mr.vals;
+  unsafe { ka[i] = a; kb[i] = b; vals[i] = v; }
+  unsafe { evx_astore8(offset_mut(mr.used, i as i64), 1u64); }
+  mr.len = mr.len + 1u64;
+}
+
+// Grows a shard (under its exclusive lock): builds a doubled table privately,
+// then publishes it with one release store. The old table stays valid.
+fn mv_map_grow(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
+  let bp: *mut PtrBox = mv_map_box(m, is_acct, a);
+  let bx: &mut PtrBox = unsafe { &mut bp[0u64] };
+  let old: *mut Map = bx.p;
+  let om: &mut Map = unsafe { &mut old[0u64] };
+  let nm: *mut Map = mv_map_new_cap(om.cap * 2u64);
+  let mut j: u64 = 0u64;
+  let oka: *mut U256 = om.ka;
+  let okb: *mut U256 = om.kb;
+  let ov: *mut u64 = om.vals;
+  let ou: *mut u8 = om.used;
+  while j < om.cap {
+    if (unsafe { ou[j] }) != 0u8 {
+      map_put(nm, unsafe { oka[j] }, unsafe { okb[j] }, unsafe { ov[j] });
+    }
+    j = j + 1u64;
+  }
+  let raw: *mut i8 = nm;
+  unsafe { evx_astore_ptr(bp, raw); }
+  return nm;
+}
+
+fn mv_map_old(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let mut boxes: *mut PtrBox = mm.smaps;
+  if is_acct { boxes = mm.amaps; }
+  let bx: &mut PtrBox = unsafe { &mut boxes[mv_shard(a)] };
+  let mp: *mut Map = bx.p;
+  return mp;
+}
+
+fn mv_map_lock(m: *mut MvMem, is_acct: bool, a: U256) -> *mut u64 {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let mut locks: *mut u64 = mm.smap_locks;
+  if is_acct { locks = mm.amap_locks; }
+  return offset_mut(locks, mv_shard(a) as i64);
+}
+
+fn mv_loc(m: *mut MvMem, i: u64) -> *mut MvLoc {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  return offset_mut(mm.locs, i as i64);
+}
+
+// Finds the location index for (a, k); account locations use k = 0 in amap.
+// Creates it when missing. The maps grow under their exclusive lock; lookups
+// take the shared side.
+fn mv_loc_get(m: *mut MvMem, is_acct: bool, a: U256, k: U256) -> u64 {
+  let found: u64 = mv_map_get_acq(mv_map(m, is_acct, a), a, k);
+  if found != MAP_NONE { return found; }
+  let lp: *mut u64 = mv_map_lock(m, is_acct, a);
+  unsafe { evx_lock_ex(lp); }
+  // Re-check under the lock: another worker may have inserted it.
+  let mut map: *mut Map = mv_map_old(m, is_acct, a);
+  let again: u64 = map_get(map, a, k);
+  if again != MAP_NONE {
+    unsafe { evx_unlock_ex(lp); }
+    return again;
+  }
+  let mr: &mut Map = unsafe { &mut map[0u64] };
+  if (mr.len + 1u64) * 2u64 > mr.cap { map = mv_map_grow(m, is_acct, a); }
+  let i: u64 = mv_loc_alloc(m);
+  mv_map_insert(map, a, k, i);
+  unsafe { evx_unlock_ex(lp); }
+  return i;
+}
+
+// Appends a fresh empty location; guarded by locs_lock.
+fn mv_loc_alloc(m: *mut MvMem) -> u64 {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  // The array never grows (see mv_new). A full table aborts the block.
+  let i: u64 = unsafe { evx_afetch_add(mm.loc_n, 1u64) };
+  if i + 1u64 >= mm.loc_cap {
+    unsafe { evx_astore(mm.overflow, 1u64); }
+    return 0u64;
+  }
+  return i;
+}
+
+fn null_entries() -> *mut MvEntry {
+  let p: *mut i8 = null_i8();
+  let q: *mut MvEntry = p;
+  return q;
+}
+
+// Read outcomes.
+const MVR_HIT: u64 = 0u64;       // out holds the entry; version = (out.txi, out.incarnation)
+const MVR_ESTIMATE: u64 = 1u64;  // dependency: wait for out.txi to re-execute
+const MVR_BASE: u64 = 2u64;      // nothing below txi: read the StateDb
+
+// Reads location (a, k) as transaction txi: the entry with the largest writer
+// index below txi. Copies it to out.
+fn mv_read(m: *mut MvMem, is_acct: bool, a: U256, k: U256, txi: u64, out: *mut MvEntry) -> u64 {
+  let li: u64 = mv_map_get_acq(mv_map(m, is_acct, a), a, k);
+  if li == MAP_NONE { return MVR_BASE; }
+  let loc: *mut MvLoc = mv_loc(m, li);
+  let l: &mut MvLoc = unsafe { &mut loc[0u64] };
+  let lkp: *mut u64 = loc_lock_ptr(loc);
+  unsafe { evx_lock_ex(lkp); }
+  // Entries are kept sorted by writer index; scan from the top.
+  let mut best: u64 = MAP_NONE;
+  let mut i: u64 = l.n;
+  while i > 0u64 {
+    i = i - 1u64;
+    let ep: *mut MvEntry = l.entries;
+    let e: &mut MvEntry = unsafe { &mut ep[i] };
+    if e.txi < txi { best = i; i = 0u64; }
+  }
+  let mut res: u64 = MVR_BASE;
+  if best != MAP_NONE {
+    let ep: *mut MvEntry = l.entries;
+    unsafe { out[0u64] = ep[best]; }
+    let o: &mut MvEntry = unsafe { &mut out[0u64] };
+    if (o.flags & MV_ESTIMATE) != 0u64 { res = MVR_ESTIMATE; } else { res = MVR_HIT; }
+  }
+  unsafe { evx_unlock_ex(lkp); }
+  return res;
+}
+
+// The lock field is first in MvLoc, so its address is the location's address.
+fn loc_lock_ptr(loc: *mut MvLoc) -> *mut u64 {
+  let p: *mut i8 = loc;
+  let q: *mut u64 = p;
+  return q;
+}
+
+// Installs entry e (writer e.txi) at location (a, k): replaces that writer's
+// entry or inserts in sorted position. Returns the location index.
+fn mv_write(m: *mut MvMem, is_acct: bool, a: U256, k: U256, e: *mut MvEntry) -> u64 {
+  let e0: &mut MvEntry = unsafe { &mut e[0u64] };
+  let etxi: u64 = e0.txi;
+  let li: u64 = mv_loc_get(m, is_acct, a, k);
+  let loc: *mut MvLoc = mv_loc(m, li);
+  let lkp: *mut u64 = loc_lock_ptr(loc);
+  unsafe { evx_lock_ex(lkp); }
+  let l: &mut MvLoc = unsafe { &mut loc[0u64] };
+  // Replace an entry by the same writer.
+  let mut i: u64 = 0u64;
+  let mut done: bool = false;
+  while i < l.n {
+    let ep: *mut MvEntry = l.entries;
+    let cur: &mut MvEntry = unsafe { &mut ep[i] };
+    if cur.txi == etxi {
+      unsafe { ep[i] = e[0u64]; }
+      done = true;
+      i = l.n;
+    } else { i = i + 1u64; }
+  }
+  if !done {
+    if l.n == l.cap {
+      let mut nc: u64 = l.cap * 2u64;
+      if nc == 0u64 { nc = 4u64; }
+      let old: *mut i8 = l.entries;
+      let nr: *mut i8 = unsafe { vx_realloc(old, nc * (sizeof<MvEntry>() as u64)) };
+      l.entries = nr;
+      l.cap = nc;
+    }
+    // Insert keeping entries sorted by writer index.
+    let ep: *mut MvEntry = l.entries;
+    let mut j: u64 = l.n;
+    while j > 0u64 {
+      let prev: &mut MvEntry = unsafe { &mut ep[j - 1u64] };
+      if prev.txi > etxi {
+        unsafe { ep[j] = ep[j - 1u64]; }
+        j = j - 1u64;
+      } else {
+        let stop: u64 = j; j = 0u64;
+        unsafe { ep[stop] = e[0u64]; }
+        done = true;
+      }
+    }
+    if !done { unsafe { ep[0u64] = e[0u64]; } }
+    l.n = l.n + 1u64;
+  }
+  unsafe { evx_unlock_ex(lkp); }
+  return li;
+}
+
+// Flags writer txi's entry at location li (abort path: readers of it wait).
+fn mv_mark_estimate(m: *mut MvMem, li: u64, txi: u64) -> void {
+  let loc: *mut MvLoc = mv_loc(m, li);
+  let lkp: *mut u64 = loc_lock_ptr(loc);
+  unsafe { evx_lock_ex(lkp); }
+  let l: &mut MvLoc = unsafe { &mut loc[0u64] };
+  let mut i: u64 = 0u64;
+  while i < l.n {
+    let ep: *mut MvEntry = l.entries;
+    let e: &mut MvEntry = unsafe { &mut ep[i] };
+    if e.txi == txi { e.flags = e.flags | MV_ESTIMATE; i = l.n; } else { i = i + 1u64; }
+  }
+  unsafe { evx_unlock_ex(lkp); }
+}
+
+// Removes writer txi's entry at location li (a new incarnation that no longer
+// writes there).
+fn mv_remove(m: *mut MvMem, li: u64, txi: u64) -> void {
+  let loc: *mut MvLoc = mv_loc(m, li);
+  let lkp: *mut u64 = loc_lock_ptr(loc);
+  unsafe { evx_lock_ex(lkp); }
+  let l: &mut MvLoc = unsafe { &mut loc[0u64] };
+  let mut i: u64 = 0u64;
+  while i < l.n {
+    let ep: *mut MvEntry = l.entries;
+    let e: &mut MvEntry = unsafe { &mut ep[i] };
+    if e.txi == txi {
+      let mut j: u64 = i;
+      while j + 1u64 < l.n {
+        unsafe { ep[j] = ep[j + 1u64]; }
+        j = j + 1u64;
+      }
+      l.n = l.n - 1u64;
+      i = l.n;
+    } else { i = i + 1u64; }
+  }
+  unsafe { evx_unlock_ex(lkp); }
+}
+
+// Re-reads location (a, k) as txi and reports whether the observed version
+// (writer, incarnation) is still what the read saw. base_read means the read
+// fell through to the StateDb and must still do so.
+fn mv_validate_read(m: *mut MvMem, is_acct: bool, a: U256, k: U256, txi: u64,
+                    base_read: bool, want_txi: u64, want_inc: u64, tmp: *mut MvEntry) -> bool {
+  let r: u64 = mv_read(m, is_acct, a, k, txi, tmp);
+  let e: &mut MvEntry = unsafe { &mut tmp[0u64] };
+  let mut ok: bool = false;
+  if r == MVR_BASE { ok = base_read; }
+  else if r == MVR_HIT { ok = !base_read && e.txi == want_txi && e.incarnation == want_inc; }
+  return ok;
+}
+
+fn mv_overflowed(m: *mut MvMem) -> bool {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  return (unsafe { evx_aload(mm.overflow) }) != 0u64;
+}
+
+// Aborts the block: workers stop and finish commits nothing.
+fn mv_abort(m: *mut MvMem) -> void {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  unsafe { evx_astore(mm.overflow, 1u64); }
+}
+
+fn mv_free(m: *mut MvMem) -> void {
+  let mm: &mut MvMem = unsafe { &mut m[0u64] };
+  let n: u64 = unsafe { evx_aload(mm.loc_n) };
+  let mut used: u64 = n;
+  if used > mm.loc_cap { used = mm.loc_cap; }
+  let mut i: u64 = 0u64;
+  while i < used {
+    let loc: *mut MvLoc = mv_loc(m, i);
+    let l: &mut MvLoc = unsafe { &mut loc[0u64] };
+    let ep: *mut i8 = l.entries;
+    unsafe { vx_free(ep); }
+    i = i + 1u64;
+  }
+  let mut si: u64 = 0u64;
+  while si < MV_SHARDS {
+    let ab: *mut PtrBox = mm.amaps;
+    let abx: &mut PtrBox = unsafe { &mut ab[si] };
+    let am: *mut Map = abx.p;
+    map_free(am);
+    let sb: *mut PtrBox = mm.smaps;
+    let sbx: &mut PtrBox = unsafe { &mut sb[si] };
+    let sm: *mut Map = sbx.p;
+    map_free(sm);
+    si = si + 1u64;
+  }
+  limbs_free(mm.amap_locks);
+  limbs_free(mm.smap_locks);
+  limbs_free(mm.locs_lock);
+  limbs_free(mm.loc_n);
+  limbs_free(mm.overflow);
+  let p1: *mut i8 = mm.amaps;
+  let p2: *mut i8 = mm.smaps;
+  let p3: *mut i8 = mm.locs;
+  let p4: *mut i8 = m;
+  unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); }
+}

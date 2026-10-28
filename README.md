@@ -2,7 +2,61 @@
 
 A research-stage project to execute Ethereum transactions in parallel in [Vx](https://github.com/vx-lang/Vx), while preserving the results of sequential execution.
 
-**Current status: specification and feasibility research only.** This repository does not yet contain an EVM implementation, a runnable node, or a production library. The goal of at least 20× improvement is an ambition, not a measured result.
+**Current status: a working sequential EVM, checked against the official Ethereum state tests.** `src/evm/` holds an EVM written in Vx: every opcode for Frontier through Osaka, per-fork gas, a journaled state with revert, CALL/CREATE, the transaction handler, EIP-7702 authorizations and most precompiles. `harness/` runs the EEST state tests and blockchain tests through it and checks state and logs roots the way revm's `revme statetest` and `revme btest` do.
+
+Three choices let the core move to a GPU or other device without a rewrite:
+
+- **No native recursion.** CALL and CREATE suspend the calling frame, and `run_frame` runs every frame on an explicit stack. The native stack depth stays the same at any call depth.
+- **No host calls during execution.** With a `StateDb` attached (`evmvx_transact_db`), the engine reads accounts, storage and block hashes from Vx memory and never calls back into the host.
+- **One allocator.** Every allocation goes through `vx_malloc`, `vx_calloc`, `vx_realloc` and `vx_free` in `src/evm/libc.vx`, so a device build can swap in an arena by changing one file.
+
+The pairing-based precompiles (bn254 at 0x06–0x08, KZG at 0x0a, BLS12-381 at 0x0b–0x11) come from a stateless crypto provider, `evmvx_crypto_precompile`. That matches revm, which takes them from its `crypto()` backends. The harness backs the provider with revm's own precompiles. Every other precompile is written in Vx.
+
+Not yet done: the parallel executor, and native Vx versions of the pairing precompiles. See [What's next](#whats-next). No performance claim is made; the 20× goal is still an ambition.
+
+## Test results (2026-10-26)
+
+Every case passes against the official Ethereum fixtures, with the roots checked the way `revme` checks them:
+
+| Suite | Passed | Failed |
+|---|---|---|
+| EEST develop state tests, Frontier to Osaka | 63,314 | 0 |
+| EEST develop blockchain tests | 61,391 | 0 |
+| Legacy Cancun state tests | 108,134 | 0 |
+| Legacy Constantinople state tests | 20,690 | 0 |
+
+The skip list is revm's own (`skip_test` in `harness/src/main.rs`). Amsterdam (devnet) fixtures are not run yet.
+
+## What's next
+
+In order:
+
+1. **Three open decisions.** Each takes a few minutes.
+   - Merge `vx-evm` into `main` through a pull request.
+   - Report the Vx byte-index miscompile upstream. A read such as `buf[135]` through a `*mut u8` reads `buf[-121]`. The workaround is in [docs/VX_NOTES.md](docs/VX_NOTES.md).
+   - Run the Amsterdam devnet fixtures. Amsterdam is not on mainnet yet.
+2. **M4: the parallel executor.** The parallel executor is the project's primary goal: Block-STM-style execution with multi-version reads, parallel validation and fee-recipient deltas, plus a benchmark against revm. It builds on the explicit frame stack and the `StateDb`. Expect several days of work.
+3. **Native Vx pairing precompiles.** bn254, KZG and BLS12-381 still run revm's code through `evmvx_crypto_precompile`, which is a host call. They must move into Vx before any GPU work.
+4. **M5: the GPU step.** It depends on items 2 and 3. It also needs a test kernel to show whether the Vx GPU backend can compile the interpreter loop. Its GPU model today is `across` loops in `spawn on` regions.
+
+## Run the tests
+
+The tests need the fixed Vx compiler (upstream dc6a460 plus the local fixes in [section 8 of the feasibility report](docs/research/feasibility.md#8-compiler-defects-fixes-and-upstream-issues)), LLVM/Clang 22, Rust and Python 3. Set `VXC` to the compiler wrapper if it is not at the default path in `scripts/vxc`. Compiler quirks the code works around are in [docs/VX_NOTES.md](docs/VX_NOTES.md).
+
+```sh
+scripts/build-lib.sh 2                           # builds build/libevmvx.a
+python3 scripts/fetch-fixtures.py                # EEST v5.4.0, devnet and legacy fixtures
+cd harness && cargo build --release
+target/release/evmvx-test statetest <fixtures>/main/develop/fixtures/state_tests/cancun
+EVMVX_DIFF=1 target/release/evmvx-test statetest <dir>   # on failure, diff against revm
+target/release/evmvx-test btest <fixtures>/main/develop/fixtures/blockchain_tests/cancun
+EVMVX_DB=1 target/release/evmvx-test btest <dir>         # run on a Vx StateDb, no host callbacks
+
+scripts/build-testlib.sh 2                       # unit-test library with stub host callbacks
+python3 tests/u256/run.py                        # 25 word opcodes vs. a Python-int oracle
+python3 tests/keccak/run.py                      # Keccak-256 vs. pycryptodome
+python3 tests/precompiles/test_modexp.py         # also test_blake2f.py
+```
 
 ## Start here
 
@@ -12,7 +66,7 @@ A research-stage project to execute Ethereum transactions in parallel in [Vx](ht
 | [Vx feasibility findings](docs/research/feasibility.md) | Cited compiler/runtime research, five native experiments, arithmetic, workers, ABI, memory, and two local compiler fixes. |
 | [Matched performance findings](docs/research/performance.md) | Vx/C arithmetic and toy dispatch measurements, correctness checks, methodology, and limitations. |
 
-There is nothing to build or run from this checkout yet. The reports describe experiments executed outside this repository; raw harnesses, logs, and compiler builds remain in the author's local research archive. This initial publication contains the spec and findings, not a self-contained benchmark package.
+The reports describe experiments executed outside this repository; raw harnesses, logs, and compiler builds remain in the author's local research archive. This initial publication contains the spec and findings, not a self-contained benchmark package.
 
 ## Project direction
 

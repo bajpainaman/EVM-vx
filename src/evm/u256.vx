@@ -1,0 +1,383 @@
+// EVM 256-bit words: four u64 limbs, little endian (l0 is least significant).
+// Limb order is a host detail; EVM byte order lives in the memory/bytecode code.
+// Every function is total: zero divisors, oversized shift counts and signed
+// edges follow EVM rules, and no host trap or undefined shift is reachable.
+import core::marker;
+
+struct U256 { l0: u64, l1: u64, l2: u64, l3: u64 }
+impl Copy for U256 {}
+
+struct U512 { lo: U256, hi: U256 }
+impl Copy for U512 {}
+
+pub fn u256_zero() -> U256 { return U256 { l0: 0u64, l1: 0u64, l2: 0u64, l3: 0u64 }; }
+pub fn u256_one() -> U256 { return U256 { l0: 1u64, l1: 0u64, l2: 0u64, l3: 0u64 }; }
+pub fn u256_max() -> U256 {
+  let m: u64 = 18446744073709551615u64;
+  return U256 { l0: m, l1: m, l2: m, l3: m };
+}
+pub fn u256_from_u64(v: u64) -> U256 { return U256 { l0: v, l1: 0u64, l2: 0u64, l3: 0u64 }; }
+pub fn u256_from_bool(b: bool) -> U256 {
+  if b { return u256_one(); }
+  return u256_zero();
+}
+
+// Limb i, or zero outside 0..4, so shift lanes never index out of range.
+pub fn u256_limb(a: U256, i: i32) -> u64 {
+  if i == 0 { return a.l0; }
+  if i == 1 { return a.l1; }
+  if i == 2 { return a.l2; }
+  if i == 3 { return a.l3; }
+  return 0u64;
+}
+
+pub fn u256_is_zero(a: U256) -> bool { return (a.l0 | a.l1 | a.l2 | a.l3) == 0u64; }
+// True when a fits in a u64; callers use it before narrowing an offset or count.
+pub fn u256_fits_u64(a: U256) -> bool { return (a.l1 | a.l2 | a.l3) == 0u64; }
+pub fn u256_is_negative(a: U256) -> bool { return (a.l3 >> 63u64) != 0u64; }
+pub fn u256_bit(a: U256, i: i32) -> u64 { return (u256_limb(a, i / 64) >> ((i % 64) as u64)) & 1u64; }
+
+pub fn u256_eq(a: U256, b: U256) -> bool {
+  return a.l0 == b.l0 && a.l1 == b.l1 && a.l2 == b.l2 && a.l3 == b.l3;
+}
+pub fn u256_lt(a: U256, b: U256) -> bool {
+  if a.l3 != b.l3 { return a.l3 < b.l3; }
+  if a.l2 != b.l2 { return a.l2 < b.l2; }
+  if a.l1 != b.l1 { return a.l1 < b.l1; }
+  return a.l0 < b.l0;
+}
+pub fn u256_gt(a: U256, b: U256) -> bool { return u256_lt(b, a); }
+// Two's-complement order: flip the sign bits, then compare unsigned.
+pub fn u256_slt(a: U256, b: U256) -> bool {
+  let s: u64 = 9223372036854775808u64;
+  let x = U256 { l0: a.l0, l1: a.l1, l2: a.l2, l3: a.l3 ^ s };
+  let y = U256 { l0: b.l0, l1: b.l1, l2: b.l2, l3: b.l3 ^ s };
+  return u256_lt(x, y);
+}
+pub fn u256_sgt(a: U256, b: U256) -> bool { return u256_slt(b, a); }
+
+pub fn u256_and(a: U256, b: U256) -> U256 {
+  return U256 { l0: a.l0 & b.l0, l1: a.l1 & b.l1, l2: a.l2 & b.l2, l3: a.l3 & b.l3 };
+}
+pub fn u256_or(a: U256, b: U256) -> U256 {
+  return U256 { l0: a.l0 | b.l0, l1: a.l1 | b.l1, l2: a.l2 | b.l2, l3: a.l3 | b.l3 };
+}
+pub fn u256_xor(a: U256, b: U256) -> U256 {
+  return U256 { l0: a.l0 ^ b.l0, l1: a.l1 ^ b.l1, l2: a.l2 ^ b.l2, l3: a.l3 ^ b.l3 };
+}
+pub fn u256_not(a: U256) -> U256 { return u256_xor(a, u256_max()); }
+
+pub fn u256_add(a: U256, b: U256) -> U256 {
+  let t0: u128 = (a.l0 as u128) + (b.l0 as u128);
+  let t1: u128 = (a.l1 as u128) + (b.l1 as u128) + (t0 >> 64u128);
+  let t2: u128 = (a.l2 as u128) + (b.l2 as u128) + (t1 >> 64u128);
+  let t3: u128 = (a.l3 as u128) + (b.l3 as u128) + (t2 >> 64u128);
+  return U256 { l0: t0 as u64, l1: t1 as u64, l2: t2 as u64, l3: t3 as u64 };
+}
+
+// Each limb computes base + a - b - borrow, which is never negative.
+pub fn u256_sub(a: U256, b: U256) -> U256 {
+  let base: u128 = 1u128 << 64u128;
+  let t0: u128 = base + (a.l0 as u128) - (b.l0 as u128);
+  let c0: u128 = 1u128 - (t0 >> 64u128);
+  let t1: u128 = base + (a.l1 as u128) - (b.l1 as u128) - c0;
+  let c1: u128 = 1u128 - (t1 >> 64u128);
+  let t2: u128 = base + (a.l2 as u128) - (b.l2 as u128) - c1;
+  let c2: u128 = 1u128 - (t2 >> 64u128);
+  let t3: u128 = base + (a.l3 as u128) - (b.l3 as u128) - c2;
+  return U256 { l0: t0 as u64, l1: t1 as u64, l2: t2 as u64, l3: t3 as u64 };
+}
+pub fn u256_neg(a: U256) -> U256 { return u256_sub(u256_zero(), a); }
+
+// x*y + acc + carry is at most 2^128 - 1, so it never wraps.
+fn mac(acc: u64, x: u64, y: u64, carry: u64) -> u128 {
+  return (x as u128) * (y as u128) + (acc as u128) + (carry as u128);
+}
+
+// Low 256 bits of the product: only the ten partial products that reach them.
+pub fn u256_mul(a: U256, b: U256) -> U256 {
+  let mut t: u128 = mac(0u64, a.l0, b.l0, 0u64);
+  let r0: u64 = t as u64;
+  t = mac(0u64, a.l0, b.l1, (t >> 64u128) as u64);
+  let mut r1: u64 = t as u64;
+  t = mac(0u64, a.l0, b.l2, (t >> 64u128) as u64);
+  let mut r2: u64 = t as u64;
+  t = mac(0u64, a.l0, b.l3, (t >> 64u128) as u64);
+  let mut r3: u64 = t as u64;
+
+  t = mac(r1, a.l1, b.l0, 0u64);
+  r1 = t as u64;
+  t = mac(r2, a.l1, b.l1, (t >> 64u128) as u64);
+  r2 = t as u64;
+  t = mac(r3, a.l1, b.l2, (t >> 64u128) as u64);
+  r3 = t as u64;
+
+  t = mac(r2, a.l2, b.l0, 0u64);
+  r2 = t as u64;
+  t = mac(r3, a.l2, b.l1, (t >> 64u128) as u64);
+  r3 = t as u64;
+
+  t = mac(r3, a.l3, b.l0, 0u64);
+  r3 = t as u64;
+  return U256 { l0: r0, l1: r1, l2: r2, l3: r3 };
+}
+
+fn wide_limb(w: U512, i: i32) -> u64 {
+  if i < 4 { return u256_limb(w.lo, i); }
+  return u256_limb(w.hi, i - 4);
+}
+
+// One row of the schoolbook product: adds x * b into limbs i..i+4 of acc.
+fn wide_row(acc: U512, x: u64, b: U256, i: i32) -> U512 {
+  let mut r = acc;
+  let mut carry: u64 = 0u64;
+  let mut j: i32 = 0;
+  while j < 5 {
+    let k = i + j;
+    let mut t: u128 = (wide_limb(r, k) as u128) + (carry as u128);
+    if j < 4 { t = mac(wide_limb(r, k), x, u256_limb(b, j), carry); }
+    carry = (t >> 64u128) as u64;
+    r = wide_set(r, k, t as u64);
+    j = j + 1;
+  }
+  return r;
+}
+
+fn set_limb(a: U256, i: i32, v: u64) -> U256 {
+  if i == 0 { return U256 { l0: v, l1: a.l1, l2: a.l2, l3: a.l3 }; }
+  if i == 1 { return U256 { l0: a.l0, l1: v, l2: a.l2, l3: a.l3 }; }
+  if i == 2 { return U256 { l0: a.l0, l1: a.l1, l2: v, l3: a.l3 }; }
+  return U256 { l0: a.l0, l1: a.l1, l2: a.l2, l3: v };
+}
+
+fn wide_set(w: U512, i: i32, v: u64) -> U512 {
+  if i < 4 { return U512 { lo: set_limb(w.lo, i, v), hi: w.hi }; }
+  return U512 { lo: w.lo, hi: set_limb(w.hi, i - 4, v) };
+}
+
+// Full 512-bit product, used by MULMOD.
+pub fn u256_mul_wide(a: U256, b: U256) -> U512 {
+  let mut r = U512 { lo: u256_zero(), hi: u256_zero() };
+  r = wide_row(r, a.l0, b, 0);
+  r = wide_row(r, a.l1, b, 1);
+  r = wide_row(r, a.l2, b, 2);
+  r = wide_row(r, a.l3, b, 3);
+  return r;
+}
+
+// r * 2 + bit, plus the bit shifted out of the top.
+fn shl1(r: U256, bit: u64) -> U256 {
+  return U256 { l0: (r.l0 << 1u64) | bit, l1: (r.l1 << 1u64) | (r.l0 >> 63u64),
+                l2: (r.l2 << 1u64) | (r.l1 >> 63u64), l3: (r.l3 << 1u64) | (r.l2 >> 63u64) };
+}
+
+// Restoring remainder step. Invariant before each step: r < m. The shifted
+// value can need 257 bits, so the bit shifted out is checked explicitly and
+// the subtraction is modulo 2^256.
+fn reduce_step(r: U256, m: U256, bit: u64) -> U256 {
+  let overflow: u64 = r.l3 >> 63u64;
+  let s = shl1(r, bit);
+  if overflow != 0u64 || !u256_lt(s, m) { return u256_sub(s, m); }
+  return s;
+}
+
+// Bit-serial 512-by-256 remainder. Correctness baseline; replace with a
+// limb-wise (Knuth D) division once measured workloads justify it.
+pub fn u512_rem(w: U512, m: U256) -> U256 {
+  if u256_is_zero(m) { return u256_zero(); }
+  let mut r = u256_zero();
+  let mut i: i32 = 511;
+  while i >= 0 {
+    let bit: u64 = (wide_limb(w, i / 64) >> ((i % 64) as u64)) & 1u64;
+    r = reduce_step(r, m, bit);
+    i = i - 1;
+  }
+  return r;
+}
+
+// Unsigned division. DIV and MOD by zero return zero.
+pub fn u256_divrem(a: U256, b: U256, want_rem: bool) -> U256 {
+  if u256_is_zero(b) { return u256_zero(); }
+  if u256_lt(a, b) {
+    if want_rem { return a; }
+    return u256_zero();
+  }
+  // Both operands fit in u128: the guarded native division is exact.
+  if (a.l2 | a.l3 | b.l2 | b.l3) == 0u64 {
+    let x: u128 = (a.l0 as u128) | ((a.l1 as u128) << 64u128);
+    let y: u128 = (b.l0 as u128) | ((b.l1 as u128) << 64u128);
+    let mut v: u128 = x / y;
+    if want_rem { v = x % y; }
+    return U256 { l0: v as u64, l1: (v >> 64u128) as u64, l2: 0u64, l3: 0u64 };
+  }
+  let mut q = u256_zero();
+  let mut r = u256_zero();
+  let mut i: i32 = 255;
+  while i >= 0 {
+    let overflow: u64 = r.l3 >> 63u64;
+    let s = shl1(r, u256_bit(a, i));
+    let mut qb: u64 = 0u64;
+    if overflow != 0u64 || !u256_lt(s, b) {
+      r = u256_sub(s, b);
+      qb = 1u64;
+    } else {
+      r = s;
+    }
+    q = shl1(q, qb);
+    i = i - 1;
+  }
+  if want_rem { return r; }
+  return q;
+}
+pub fn u256_div(a: U256, b: U256) -> U256 { return u256_divrem(a, b, false); }
+pub fn u256_mod(a: U256, b: U256) -> U256 { return u256_divrem(a, b, true); }
+
+// SDIV truncates toward zero; MIN / -1 wraps to MIN through unsigned magnitudes.
+pub fn u256_sdiv(a: U256, b: U256) -> U256 {
+  if u256_is_zero(b) { return u256_zero(); }
+  let an = u256_is_negative(a);
+  let bn = u256_is_negative(b);
+  let mut x = a;
+  let mut y = b;
+  if an { x = u256_neg(a); }
+  if bn { y = u256_neg(b); }
+  let q = u256_div(x, y);
+  if an != bn { return u256_neg(q); }
+  return q;
+}
+
+// SMOD takes the sign of the dividend.
+pub fn u256_smod(a: U256, b: U256) -> U256 {
+  if u256_is_zero(b) { return u256_zero(); }
+  let an = u256_is_negative(a);
+  let mut x = a;
+  let mut y = b;
+  if an { x = u256_neg(a); }
+  if u256_is_negative(b) { y = u256_neg(b); }
+  let r = u256_mod(x, y);
+  if an { return u256_neg(r); }
+  return r;
+}
+
+// ADDMOD reduces the full 257-bit sum, not its wrapped low word.
+pub fn u256_addmod(a: U256, b: U256, m: U256) -> U256 {
+  if u256_is_zero(m) { return u256_zero(); }
+  let s = u256_add(a, b);
+  let mut hi = u256_zero();
+  if u256_lt(s, a) { hi = u256_one(); }
+  return u512_rem(U512 { lo: s, hi: hi }, m);
+}
+
+// MULMOD reduces the full 512-bit product.
+pub fn u256_mulmod(a: U256, b: U256, m: U256) -> U256 {
+  if u256_is_zero(m) { return u256_zero(); }
+  return u512_rem(u256_mul_wide(a, b), m);
+}
+
+// Square-and-multiply, low 256 bits.
+pub fn u256_exp(base: U256, e: U256) -> U256 {
+  let mut r = u256_one();
+  let mut b = base;
+  let mut i: i32 = 0;
+  let top = u256_bit_len(e);
+  while i < top {
+    if u256_bit(e, i) != 0u64 { r = u256_mul(r, b); }
+    b = u256_mul(b, b);
+    i = i + 1;
+  }
+  return r;
+}
+
+fn u64_bit_len(v: u64) -> i32 {
+  let mut n: i32 = 0;
+  let mut x = v;
+  while x != 0u64 {
+    x = x >> 1u64;
+    n = n + 1;
+  }
+  return n;
+}
+
+// Number of significant bits; zero for zero.
+pub fn u256_bit_len(a: U256) -> i32 {
+  if a.l3 != 0u64 { return 192 + u64_bit_len(a.l3); }
+  if a.l2 != 0u64 { return 128 + u64_bit_len(a.l2); }
+  if a.l1 != 0u64 { return 64 + u64_bit_len(a.l1); }
+  return u64_bit_len(a.l0);
+}
+
+// Number of significant bytes; EXP gas charges per exponent byte.
+pub fn u256_byte_len(a: U256) -> i32 { return (u256_bit_len(a) + 7) / 8; }
+
+// One output limb of a shift by k bits, 0 < k < 256. A u64 is never
+// shifted by 64: r == 0 takes the whole-limb path.
+fn lane(a: U256, i: i32, k: i32, left: bool) -> u64 {
+  let w = k / 64;
+  let r = k % 64;
+  let mut n = i + w;
+  if left { n = i - w; }
+  if n < 0 || n > 3 { return 0u64; }
+  let v = u256_limb(a, n);
+  if r == 0 { return v; }
+  if left {
+    let mut lower: u64 = 0u64;
+    if n >= 1 { lower = u256_limb(a, n - 1) >> ((64 - r) as u64); }
+    return (v << (r as u64)) | lower;
+  }
+  let mut upper: u64 = 0u64;
+  if n <= 2 { upper = u256_limb(a, n + 1) << ((64 - r) as u64); }
+  return (v >> (r as u64)) | upper;
+}
+
+fn shift_by(a: U256, k: i32, left: bool) -> U256 {
+  if k == 0 { return a; }
+  return U256 { l0: lane(a, 0, k, left), l1: lane(a, 1, k, left),
+                l2: lane(a, 2, k, left), l3: lane(a, 3, k, left) };
+}
+
+// The whole 256-bit count is checked before it is narrowed to an index.
+fn small_count(count: U256) -> i32 {
+  if !u256_fits_u64(count) || count.l0 >= 256u64 { return 256; }
+  return count.l0 as i32;
+}
+
+pub fn u256_shl(value: U256, count: U256) -> U256 {
+  let k = small_count(count);
+  if k >= 256 { return u256_zero(); }
+  return shift_by(value, k, true);
+}
+pub fn u256_shr(value: U256, count: U256) -> U256 {
+  let k = small_count(count);
+  if k >= 256 { return u256_zero(); }
+  return shift_by(value, k, false);
+}
+// SAR fills with the sign bit; counts of 256 or more give all sign bits.
+pub fn u256_sar(value: U256, count: U256) -> U256 {
+  let neg = u256_is_negative(value);
+  let k = small_count(count);
+  if k >= 256 {
+    if neg { return u256_max(); }
+    return u256_zero();
+  }
+  let r = shift_by(value, k, false);
+  if neg && k > 0 { return u256_or(r, shift_by(u256_max(), 256 - k, true)); }
+  return r;
+}
+
+// BYTE: byte i of x, where byte 0 is the most significant.
+pub fn u256_byte(i: U256, x: U256) -> U256 {
+  if !u256_fits_u64(i) || i.l0 >= 32u64 { return u256_zero(); }
+  let k = 31 - (i.l0 as i32);
+  let limb = u256_limb(x, k / 8);
+  let v = (limb >> (((k % 8) * 8) as u64)) & 255u64;
+  return u256_from_u64(v);
+}
+
+// SIGNEXTEND: extend the sign of byte b (counted from the least significant).
+pub fn u256_signextend(b: U256, x: U256) -> U256 {
+  if !u256_fits_u64(b) || b.l0 >= 31u64 { return x; }
+  let bit = (b.l0 as i32) * 8 + 7;
+  let mask = u256_sub(shift_by(u256_one(), bit + 1, true), u256_one());
+  if u256_bit(x, bit) != 0u64 { return u256_or(x, u256_not(mask)); }
+  return u256_and(x, mask);
+}

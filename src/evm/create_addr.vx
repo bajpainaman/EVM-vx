@@ -1,0 +1,50 @@
+// Contract addresses for CREATE and CREATE2.
+
+// keccak256(rlp([sender, nonce]))[12..]
+fn create_address(sender: U256, nonce: u64) -> U256 {
+  let buf: *mut u8 = zalloc(64u64);
+  // Nonce as RLP: 0x80 for zero, the byte itself below 0x80, else 0x80+len then big-endian bytes.
+  let mut nlen: u64 = 0u64;
+  let mut x: u64 = nonce;
+  while x != 0u64 {
+    nlen = nlen + 1u64;
+    x = x >> 8u64;
+  }
+  let mut nonce_rlp: u64 = 1u64;
+  if nonce >= 128u64 { nonce_rlp = 1u64 + nlen; }
+  let payload: u64 = 21u64 + nonce_rlp;
+  unsafe { buf[0u64] = (192u64 + payload) as u8; buf[1u64] = 148u8; }
+  let a: *mut u8 = offset_mut(buf, 2i64);
+  address_store(a, sender);
+  if nonce == 0u64 {
+    unsafe { buf[22u64] = 128u8; }
+  } else if nonce < 128u64 {
+    unsafe { buf[22u64] = nonce as u8; }
+  } else {
+    unsafe { buf[22u64] = (128u64 + nlen) as u8; }
+    let mut i: u64 = 0u64;
+    while i < nlen {
+      let shift: u64 = (nlen - 1u64 - i) * 8u64;
+      unsafe { buf[23u64 + i] = ((nonce >> shift) & 255u64) as u8; }
+      i = i + 1u64;
+    }
+  }
+  let h: U256 = keccak256(buf, 1u64 + payload);
+  mfree(buf);
+  return u256_to_address(h);
+}
+
+// keccak256(0xff ++ sender ++ salt ++ keccak256(initcode))[12..]
+fn create2_address(sender: U256, salt: U256, code_hash: U256) -> U256 {
+  let buf: *mut u8 = zalloc(85u64);
+  unsafe { buf[0u64] = 255u8; }
+  let a: *mut u8 = offset_mut(buf, 1i64);
+  address_store(a, sender);
+  let s: *mut u8 = offset_mut(buf, 21i64);
+  u256_store_be(s, salt);
+  let hh: *mut u8 = offset_mut(buf, 53i64);
+  u256_store_be(hh, code_hash);
+  let h: U256 = keccak256(buf, 85u64);
+  mfree(buf);
+  return u256_to_address(h);
+}

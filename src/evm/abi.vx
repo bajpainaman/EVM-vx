@@ -1,0 +1,175 @@
+// The C interface between the host and the engine. Every field is a u64, a
+// pointer or a U256 (four little-endian u64 limbs), so the layout matches a
+// #[repr(C)] Rust struct field for field. harness/src/ffi.rs mirrors these.
+
+// Fork ids, in revm SpecId order.
+const SPEC_FRONTIER: u64 = 0u64;
+const SPEC_HOMESTEAD: u64 = 1u64;
+const SPEC_TANGERINE: u64 = 2u64;
+const SPEC_SPURIOUS_DRAGON: u64 = 3u64;
+const SPEC_BYZANTIUM: u64 = 4u64;
+const SPEC_PETERSBURG: u64 = 5u64;
+const SPEC_ISTANBUL: u64 = 6u64;
+const SPEC_BERLIN: u64 = 7u64;
+const SPEC_LONDON: u64 = 8u64;
+const SPEC_MERGE: u64 = 9u64;
+const SPEC_SHANGHAI: u64 = 10u64;
+const SPEC_CANCUN: u64 = 11u64;
+const SPEC_PRAGUE: u64 = 12u64;
+const SPEC_OSAKA: u64 = 13u64;
+const SPEC_AMSTERDAM: u64 = 14u64;
+
+// cfg_flags bits.
+const CFG_DISABLE_NONCE_CHECK: u64 = 1u64;
+const CFG_DISABLE_BALANCE_CHECK: u64 = 2u64;
+const CFG_DISABLE_BASE_FEE: u64 = 4u64;
+const CFG_DISABLE_EIP3607: u64 = 8u64;
+const CFG_DISABLE_BLOCK_GAS_LIMIT: u64 = 16u64;
+const CFG_DISABLE_FEE_CHARGE: u64 = 32u64;
+const CFG_DISABLE_EIP7623: u64 = 64u64;
+const CFG_TX_CHAIN_ID_CHECK: u64 = 128u64;
+const CFG_DISABLE_PRIORITY_FEE_CHECK: u64 = 256u64;
+
+// Transaction types.
+const TX_LEGACY: u64 = 0u64;
+const TX_EIP2930: u64 = 1u64;
+const TX_EIP1559: u64 = 2u64;
+const TX_EIP4844: u64 = 3u64;
+const TX_EIP7702: u64 = 4u64;
+
+struct VxAuth {
+  chain_id: U256,
+  address: U256,
+  nonce: u64,
+  y_parity: u64,
+  r: U256,
+  s: U256,
+}
+
+struct VxEnv {
+  spec: u64,
+  chain_id: u64,
+  cfg_flags: u64,
+  tx_gas_limit_cap: u64,
+  max_blobs_per_tx: u64,
+  max_code_size: u64,
+  max_initcode_size: u64,
+  // Block.
+  number: U256,
+  coinbase: U256,
+  timestamp: U256,
+  block_gas_limit: u64,
+  basefee: u64,
+  difficulty: U256,
+  prevrandao: U256,
+  has_prevrandao: u64,
+  excess_blob_gas: u64,
+  blob_gasprice: U256,
+  has_blob: u64,
+  // Transaction.
+  tx_type: u64,
+  caller: U256,
+  gas_limit: u64,
+  gas_price: U256,
+  priority_fee: U256,
+  has_priority_fee: u64,
+  is_create: u64,
+  to: U256,
+  value: U256,
+  data: *mut u8,
+  data_len: u64,
+  nonce: u64,
+  has_tx_chain_id: u64,
+  tx_chain_id: u64,
+  al_count: u64,
+  al_addrs: *mut U256,
+  al_nslots: *mut u64,
+  al_slots: *mut U256,
+  blob_count: u64,
+  blob_hashes: *mut U256,
+  max_fee_per_blob_gas: U256,
+  auth_count: u64,
+  auths: *mut VxAuth,
+}
+
+// What the host returns for an account. code points at host memory that
+// stays valid until the engine returns.
+struct HostAccount {
+  balance: U256,
+  nonce: u64,
+  code_hash: U256,
+  code: *mut u8,
+  code_len: u64,
+}
+
+// Host callbacks. Each returns HOST_OK, HOST_MISSING (account does not exist)
+// or HOST_ERROR. An error stops execution with a host failure; it is never
+// read as an empty account or a zero slot.
+const HOST_OK: u64 = 0u64;
+const HOST_MISSING: u64 = 1u64;
+const HOST_ERROR: u64 = 2u64;
+
+extern "C" {
+  fn evmvx_host_account(host: *mut i8, addr: *mut U256, out: *mut HostAccount) -> u64;
+  fn evmvx_host_storage(host: *mut i8, addr: *mut U256, key: *mut U256, out: *mut U256) -> u64;
+  fn evmvx_host_block_hash(host: *mut i8, number: u64, out: *mut U256) -> u64;
+  // Stateless crypto provider for the pairing-based precompiles (see
+  // pc_crypto). Writes up to out_cap bytes to out, res[0] = gas used,
+  // res[1] = output length. Returns PC_OK, PC_OOG or PC_ERROR.
+  fn evmvx_crypto_precompile(id: u64, spec: u64, input: *mut u8, len: u64, gas_limit: u64,
+                             out: *mut u8, out_cap: u64, res: *mut u64) -> u64;
+}
+
+// Per-account output. flags uses the ACC_* bits from state.vx.
+struct OutAccount {
+  address: U256,
+  balance: U256,
+  nonce: u64,
+  code_hash: U256,
+  code: *mut u8,
+  code_len: u64,
+  flags: u64,
+  slot_start: u64,
+  slot_count: u64,
+}
+
+struct OutSlot {
+  key: U256,
+  original: U256,
+  present: U256,
+}
+
+struct OutLog {
+  address: U256,
+  topic_count: u64,
+  t0: U256,
+  t1: U256,
+  t2: U256,
+  t3: U256,
+  data: *mut u8,
+  data_len: u64,
+}
+
+// Result status.
+const RES_SUCCESS: u64 = 0u64;
+const RES_REVERT: u64 = 1u64;
+const RES_HALT: u64 = 2u64;
+const RES_INVALID_TX: u64 = 3u64;
+const RES_HOST_FAILURE: u64 = 4u64;
+
+struct VxResult {
+  status: u64,
+  reason: u64,
+  gas_used: u64,
+  gas_refunded: u64,
+  output: *mut u8,
+  output_len: u64,
+  created: u64,
+  created_address: U256,
+  logs: *mut OutLog,
+  log_count: u64,
+  accounts: *mut OutAccount,
+  account_count: u64,
+  slots: *mut OutSlot,
+  slot_count: u64,
+}

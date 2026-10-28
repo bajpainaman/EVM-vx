@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Compiles one Vx entry file to a native object through explicit LLVM tools:
+#   vxc --emit-llvm -> mlir-translate -> opt -> llc
+# This path, unlike `vxc -c`, does not resolve extern symbols at compile time,
+# so Vx code can call host functions that are linked in later.
+#
+# Usage: scripts/vxbuild <entry.vx> <out.o> [opt-level 0|1|2|3]
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC="$1"; OUT="$2"; OPT="${3:-2}"
+LLVM="${LLVM_BIN:-/usr/lib/llvm-22/bin}"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+if ! "$ROOT/scripts/vxc" --emit-llvm "$SRC" "-O$OPT" > "$TMP/m.mlir" 2> "$TMP/err"; then
+  grep -vE '^\[JIT\]|W1007|i32::from' "$TMP/err" >&2 || true
+  exit 1
+fi
+"$LLVM/mlir-translate" --mlir-to-llvmir "$TMP/m.mlir" -o "$TMP/m.ll"
+if [ "$OPT" = 0 ]; then
+  cp "$TMP/m.ll" "$TMP/o.ll"
+else
+  "$LLVM/opt" -mcpu=native "-passes=default<O$OPT>" "$TMP/m.ll" -S -o "$TMP/o.ll"
+fi
+"$LLVM/llc" -mcpu=native "-O=$OPT" -relocation-model=pic -filetype=obj "$TMP/o.ll" -o "$OUT"

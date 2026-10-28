@@ -1,0 +1,48 @@
+// Legacy bytecode analysis.
+
+// One byte per code position: 1 where a JUMPDEST (0x5b) is an instruction,
+// not PUSH immediate data. The buffer is len + 1 bytes and owned by the caller.
+fn analyze_jumpdests(code: *mut u8, len: u64) -> *mut u8 {
+  let jd: *mut u8 = zalloc(len + 1u64);
+  let mut pc: u64 = 0u64;
+  while pc < len {
+    let op: u8 = unsafe { code[pc] };
+    if op == 91u8 {
+      unsafe { jd[pc] = 1u8; }
+      pc = pc + 1u64;
+    } else if op >= 96u8 && op <= 127u8 {
+      pc = pc + (op as u64) - 94u64;
+    } else {
+      pc = pc + 1u64;
+    }
+  }
+  return jd;
+}
+
+fn is_jumpdest(jd: *mut u8, len: u64, dest: U256) -> bool {
+  if !u256_fits_u64(dest) || dest.l0 >= len { return false; }
+  let b: u8 = unsafe { jd[dest.l0] };
+  return b != 0u8;
+}
+
+// EIP-7702 delegation designator: 0xef 0x01 0x00 followed by a 20-byte address.
+fn is_delegation(code: *mut u8, len: u64) -> bool {
+  if len != 23u64 { return false; }
+  let b0: u8 = unsafe { code[0u64] };
+  let b1: u8 = unsafe { code[1u64] };
+  let b2: u8 = unsafe { code[2u64] };
+  return b0 == 239u8 && b1 == 1u8 && b2 == 0u8;
+}
+
+fn delegation_address(code: *mut u8) -> U256 {
+  return u256_load_be_n(code, 23u64, 3u64, 20u64);
+}
+
+// Builds the 23-byte designator for address a. Owned by the caller.
+fn make_delegation(a: U256) -> *mut u8 {
+  let p: *mut u8 = zalloc(23u64);
+  unsafe { p[0u64] = 239u8; p[1u64] = 1u8; p[2u64] = 0u8; }
+  let dst: *mut u8 = offset_mut(p, 3i64);
+  address_store(dst, a);
+  return p;
+}

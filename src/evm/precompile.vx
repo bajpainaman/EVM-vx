@@ -1,0 +1,63 @@
+// Precompiled contracts: which addresses exist in each fork, and dispatch.
+
+// Precompile result status.
+const PC_OK: u64 = 0u64;
+const PC_OOG: u64 = 1u64;
+const PC_ERROR: u64 = 2u64;
+const PC_UNIMPLEMENTED: u64 = 3u64;
+
+struct PcOut {
+  status: u64,
+  gas_used: u64,
+  data: *mut u8,
+  len: u64,
+}
+
+// The precompile number of address a (1 through 17, or 256), or 0 if a is not
+// a precompile in the active fork.
+fn precompile_id(a: U256, c: *mut Ctx) -> u64 {
+  if a.l1 != 0u64 || a.l2 != 0u64 || a.l3 != 0u64 { return 0u64; }
+  let n: u64 = a.l0;
+  if n >= 1u64 && n <= 4u64 { return n; }
+  if n >= 5u64 && n <= 8u64 && spec_on(c, SPEC_BYZANTIUM) { return n; }
+  if n == 9u64 && spec_on(c, SPEC_ISTANBUL) { return n; }
+  if n == 10u64 && spec_on(c, SPEC_CANCUN) { return n; }
+  if n >= 11u64 && n <= 17u64 && spec_on(c, SPEC_PRAGUE) { return n; }
+  if n == 256u64 && spec_on(c, SPEC_OSAKA) { return n; }
+  return 0u64;
+}
+
+fn is_precompile(a: U256, c: *mut Ctx) -> bool { return precompile_id(a, c) != 0u64; }
+
+fn words_of(len: u64) -> u64 { return (len + 31u64) / 32u64; }
+
+fn pc_set(out: *mut PcOut, status: u64, gas: u64, data: *mut u8, len: u64) -> void {
+  let o: &mut PcOut = unsafe { &mut out[0u64] };
+  o.status = status;
+  o.gas_used = gas;
+  o.data = data;
+  o.len = len;
+}
+
+// Charges cost against gas_limit; on success copies nothing and returns true.
+fn pc_charge(out: *mut PcOut, cost: u64, gas_limit: u64) -> bool {
+  if cost > gas_limit {
+    let none: *mut u8 = null_u8();
+    pc_set(out, PC_OOG, gas_limit, none, 0u64);
+    return false;
+  }
+  return true;
+}
+
+fn pc_identity(input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void {
+  let cost: u64 = 15u64 + 3u64 * words_of(len);
+  if !pc_charge(out, cost, gas_limit) { return; }
+  pc_set(out, PC_OK, cost, dup_bytes(input, len), len);
+}
+
+fn precompile_run(c: *mut Ctx, id: u64, input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void {
+  let none: *mut u8 = null_u8();
+  pc_set(out, PC_UNIMPLEMENTED, 0u64, none, 0u64);
+  if id == 4u64 { pc_identity(input, len, gas_limit, out); return; }
+  precompile_run_ext(ctx_spec(c), id, input, len, gas_limit, out);
+}

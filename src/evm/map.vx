@@ -1,0 +1,156 @@
+// Open-addressing hash map from a pair of words (a, b) to a u64 value.
+// Accounts use (address, 0); storage and transient slots use (address, key).
+// Capacity is a power of two; the table grows at 1/2 load.
+
+struct Map {
+  ka: *mut U256,
+  kb: *mut U256,
+  vals: *mut u64,
+  used: *mut u8,
+  cap: u64,
+  len: u64,
+}
+
+const MAP_NONE: u64 = 18446744073709551615u64;
+
+fn mix64(x: u64) -> u64 {
+  let mut z: u64 = x + 11400714819323198485u64;
+  z = (z ^ (z >> 30u64)) * 13787848793156543929u64;
+  z = (z ^ (z >> 27u64)) * 10723151780598845931u64;
+  return z ^ (z >> 31u64);
+}
+
+fn rotl64(x: u64, r: u64) -> u64 { return (x << r) | (x >> (64u64 - r)); }
+
+// Folds the eight limbs with rotations, then mixes with three multiplies
+// (was eight full splitmix rounds). The final fold feeds high bits into the
+// low bits the table masks with.
+fn map_hash(a: U256, b: U256) -> u64 {
+  let p: u64 = a.l0 ^ rotl64(a.l1, 21u64) ^ rotl64(a.l2, 42u64) ^ rotl64(a.l3, 11u64);
+  let q: u64 = b.l0 ^ rotl64(b.l1, 21u64) ^ rotl64(b.l2, 42u64) ^ rotl64(b.l3, 11u64);
+  let mut h: u64 = (p * 11400714819323198485u64) ^ (q * 14029467366897019727u64);
+  h = (h ^ (h >> 32u64)) * 13787848793156543929u64;
+  return h ^ (h >> 29u64);
+}
+
+fn map_alloc_arrays(m: *mut Map, cap: u64) -> void {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  let pa: *mut i8 = unsafe { vx_calloc(cap, 32u64) };
+  let pb: *mut i8 = unsafe { vx_calloc(cap, 32u64) };
+  let pv: *mut i8 = unsafe { vx_calloc(cap, 8u64) };
+  let pu: *mut i8 = unsafe { vx_calloc(cap, 1u64) };
+  mr.ka = pa;
+  mr.kb = pb;
+  mr.vals = pv;
+  mr.used = pu;
+  mr.cap = cap;
+  mr.len = 0u64;
+}
+
+fn map_new() -> *mut Map {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Map>() as u64) };
+  let m: *mut Map = raw;
+  map_alloc_arrays(m, 64u64);
+  return m;
+}
+
+// Slot index of (a, b), or the empty slot where it would go.
+fn map_probe(m: *mut Map, a: U256, b: U256) -> u64 {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  let mask: u64 = mr.cap - 1u64;
+  let mut i: u64 = map_hash(a, b) & mask;
+  let ka: *mut U256 = mr.ka;
+  let kb: *mut U256 = mr.kb;
+  let used: *mut u8 = mr.used;
+  loop {
+    let u: u8 = unsafe { used[i] };
+    if u == 0u8 { return i; }
+    let x: U256 = unsafe { ka[i] };
+    let y: U256 = unsafe { kb[i] };
+    if u256_eq(x, a) && u256_eq(y, b) { return i; }
+    i = (i + 1u64) & mask;
+  }
+  return i;
+}
+
+fn map_get(m: *mut Map, a: U256, b: U256) -> u64 {
+  let i: u64 = map_probe(m, a, b);
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  let used: *mut u8 = mr.used;
+  let u: u8 = unsafe { used[i] };
+  if u == 0u8 { return MAP_NONE; }
+  let vals: *mut u64 = mr.vals;
+  return unsafe { vals[i] };
+}
+
+fn map_grow(m: *mut Map) -> void {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  let old_cap: u64 = mr.cap;
+  let oka: *mut U256 = mr.ka;
+  let okb: *mut U256 = mr.kb;
+  let ov: *mut u64 = mr.vals;
+  let ou: *mut u8 = mr.used;
+  map_alloc_arrays(m, old_cap * 2u64);
+  let mut i: u64 = 0u64;
+  while i < old_cap {
+    let u: u8 = unsafe { ou[i] };
+    if u != 0u8 {
+      let a: U256 = unsafe { oka[i] };
+      let b: U256 = unsafe { okb[i] };
+      let v: u64 = unsafe { ov[i] };
+      map_put(m, a, b, v);
+    }
+    i = i + 1u64;
+  }
+  let fa: *mut i8 = oka;
+  let fb: *mut i8 = okb;
+  let fv: *mut i8 = ov;
+  let fu: *mut i8 = ou;
+  unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); }
+}
+
+// Inserts or overwrites (a, b) -> v.
+fn map_put(m: *mut Map, a: U256, b: U256, v: u64) -> void {
+  let cap: u64 = map_cap(m);
+  let len: u64 = map_len(m);
+  if (len + 1u64) * 2u64 > cap { map_grow(m); }
+  let i: u64 = map_probe(m, a, b);
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  let used: *mut u8 = mr.used;
+  let u: u8 = unsafe { used[i] };
+  if u == 0u8 {
+    let ka: *mut U256 = mr.ka;
+    let kb: *mut U256 = mr.kb;
+    unsafe { ka[i] = a; kb[i] = b; used[i] = 1u8; }
+    mr.len = mr.len + 1u64;
+  }
+  let vals: *mut u64 = mr.vals;
+  unsafe { vals[i] = v; }
+}
+
+fn map_cap(m: *mut Map) -> u64 {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  return mr.cap;
+}
+
+fn map_len(m: *mut Map) -> u64 {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  return mr.len;
+}
+
+fn map_free(m: *mut Map) -> void {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  let fa: *mut i8 = mr.ka;
+  let fb: *mut i8 = mr.kb;
+  let fv: *mut i8 = mr.vals;
+  let fu: *mut i8 = mr.used;
+  let fm: *mut i8 = m;
+  unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); vx_free(fm); }
+}
+
+// Clears the map in place; capacity and buffers stay.
+fn map_reset(m: *mut Map) -> void {
+  let mr: &mut Map = unsafe { &mut m[0u64] };
+  zero_bytes(mr.used, mr.cap);
+  mr.len = 0u64;
+}

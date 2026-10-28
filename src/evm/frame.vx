@@ -1,0 +1,323 @@
+// A call frame: code, stack, memory and gas, plus result codes (revm InstructionResult).
+
+const R_CONTINUE: u64 = 0u64;
+// Success.
+const R_STOP: u64 = 1u64;
+const R_RETURN: u64 = 2u64;
+const R_SELFDESTRUCT: u64 = 3u64;
+// Not a frame result: the frame started a child and waits for it to finish.
+const R_SUSPEND: u64 = 5u64;
+// Revert-like: remaining gas goes back to the caller.
+const R_REVERT: u64 = 10u64;
+const R_CALL_TOO_DEEP: u64 = 11u64;
+const R_OUT_OF_FUNDS: u64 = 12u64;
+// Errors (halts): all gas is consumed.
+const R_OOG: u64 = 20u64;
+const R_MEMORY_OOG: u64 = 21u64;
+const R_PRECOMPILE_OOG: u64 = 22u64;
+const R_INVALID_OPERAND_OOG: u64 = 23u64;
+const R_REENTRANCY_OOG: u64 = 24u64;
+const R_OPCODE_NOT_FOUND: u64 = 25u64;
+const R_CALL_NOT_ALLOWED_STATIC: u64 = 26u64;
+const R_STATE_CHANGE_STATIC: u64 = 27u64;
+const R_INVALID_FE: u64 = 28u64;
+const R_INVALID_JUMP: u64 = 29u64;
+const R_NOT_ACTIVATED: u64 = 30u64;
+const R_STACK_UNDERFLOW: u64 = 31u64;
+const R_STACK_OVERFLOW: u64 = 32u64;
+const R_OUT_OF_OFFSET: u64 = 33u64;
+const R_CREATE_COLLISION: u64 = 34u64;
+const R_OVERFLOW_PAYMENT: u64 = 35u64;
+const R_PRECOMPILE_ERROR: u64 = 36u64;
+const R_NONCE_OVERFLOW: u64 = 37u64;
+const R_CREATE_SIZE_LIMIT: u64 = 38u64;
+const R_CREATE_EF: u64 = 39u64;
+const R_INITCODE_SIZE_LIMIT: u64 = 40u64;
+// The host failed; never a consensus result.
+const R_FATAL: u64 = 99u64;
+
+fn r_is_ok(r: u64) -> bool { return r >= R_STOP && r <= R_SELFDESTRUCT; }
+fn r_is_revert(r: u64) -> bool { return r >= R_REVERT && r <= R_OUT_OF_FUNDS; }
+fn r_is_ok_or_revert(r: u64) -> bool { return r_is_ok(r) || r_is_revert(r); }
+fn r_is_error(r: u64) -> bool { return r >= R_OOG; }
+
+const STACK_LIMIT: u64 = 1024u64;
+
+// Per-fork opcode tables, shared by every frame of a transaction.
+struct OpTabs {
+  gas: *mut u64,
+  sin: *mut u8,
+  sout: *mut u8,
+  act: *mut u8,
+}
+
+struct Frame {
+  code: *mut u8,
+  code_len: u64,
+  jd: *mut u8,
+  pc: u64,
+  gas: u64,
+  refund: i64,
+  stack: *mut U256,
+  sp: u64,
+  mem: *mut u8,
+  mem_len: u64,
+  ret: *mut u8,
+  ret_len: u64,
+  input: *mut u8,
+  input_len: u64,
+  words: *mut U256,
+  is_static: u64,
+  depth: u64,
+  out: *mut u8,
+  out_len: u64,
+  acct: u64,
+  tabs: *mut OpTabs,
+  // Explicit frame stack (no native recursion): the parent link, and the
+  // continuation a CALL/CREATE saves before suspending this frame.
+  parent: *mut i8,
+  k_child: *mut i8,
+  k_kind: u64,
+  k_out_off: u64,
+  k_out_len: u64,
+  k_jn: u64,
+  k_ln: u64,
+  k_idx: u64,
+  k_buf_a: *mut u8,
+  k_buf_b: *mut u8,
+}
+
+// Continuation kinds saved in a suspended frame.
+const K_NONE: u64 = 0u64;
+const K_CALL: u64 = 1u64;
+const K_CREATE: u64 = 2u64;
+
+// Frame words: index 0 is the target (storage) address, 1 the caller, 2 the call value.
+const FW_TARGET: u64 = 0u64;
+const FW_CALLER: u64 = 1u64;
+const FW_VALUE: u64 = 2u64;
+
+fn tabs_new(spec: u64) -> *mut OpTabs {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<OpTabs>() as u64) };
+  let t: *mut OpTabs = raw;
+  let g: *mut i8 = unsafe { vx_calloc(256u64, 8u64) };
+  let si: *mut i8 = unsafe { vx_calloc(256u64, 1u64) };
+  let so: *mut i8 = unsafe { vx_calloc(256u64, 1u64) };
+  let ac: *mut i8 = unsafe { vx_calloc(256u64, 1u64) };
+  let tr: &mut OpTabs = unsafe { &mut t[0u64] };
+  tr.gas = g;
+  tr.sin = si;
+  tr.sout = so;
+  tr.act = ac;
+  fill_op_tables(spec, tr.gas, tr.sin, tr.sout, tr.act);
+  return t;
+}
+
+fn frame_word(f: *mut Frame, i: u64) -> U256 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let w: *mut U256 = fr.words;
+  return unsafe { w[i] };
+}
+
+fn frame_new(code: *mut u8, code_len: u64, jd: *mut u8, gas: u64, input: *mut u8, input_len: u64,
+             target: U256, caller: U256, value: U256, is_static: bool, depth: u64, acct: u64,
+             tabs: *mut OpTabs) -> *mut Frame {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Frame>() as u64) };
+  let f: *mut Frame = raw;
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  fr.code = code;
+  fr.code_len = code_len;
+  fr.jd = jd;
+  fr.gas = gas;
+  let st: *mut i8 = unsafe { vx_calloc(STACK_LIMIT, 32u64) };
+  fr.stack = st;
+  fr.mem = zalloc(32u64);
+  fr.ret = zalloc(1u64);
+  fr.input = input;
+  fr.input_len = input_len;
+  let w: *mut i8 = unsafe { vx_calloc(4u64, 32u64) };
+  fr.words = w;
+  let wp: *mut U256 = fr.words;
+  unsafe { wp[0u64] = target; wp[1u64] = caller; wp[2u64] = value; }
+  if is_static { fr.is_static = 1u64; }
+  fr.depth = depth;
+  fr.out = zalloc(1u64);
+  fr.acct = acct;
+  fr.tabs = tabs;
+  return f;
+}
+
+// Frees the frame's own buffers. The output buffer is returned to the caller first.
+fn frame_free(f: *mut Frame) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let st: *mut i8 = fr.stack;
+  let w: *mut i8 = fr.words;
+  unsafe { vx_free(st); vx_free(w); }
+  mfree(fr.mem);
+  mfree(fr.ret);
+  let fp: *mut i8 = f;
+  unsafe { vx_free(fp); }
+}
+
+// Charges gas; false when there is not enough.
+fn charge(f: *mut Frame, cost: u64) -> bool {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  if cost > fr.gas { return false; }
+  fr.gas = fr.gas - cost;
+  return true;
+}
+
+fn frame_gas(f: *mut Frame) -> u64 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  return fr.gas;
+}
+
+fn add_refund(f: *mut Frame, r: i64) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  fr.refund = fr.refund + r;
+}
+
+// Grows memory to cover [off, off + len) and charges the expansion. len > 0.
+// Returns R_CONTINUE, R_OOG, or R_FATAL when the host cannot allocate.
+fn mem_expand(f: *mut Frame, off: u64, len: u64) -> u64 {
+  let end: u64 = sat_add(off, len);
+  let words: u64 = num_words(end);
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let cur: u64 = fr.mem_len / 32u64;
+  if words <= cur { return R_CONTINUE; }
+  let cost: u64 = memory_cost(words) - memory_cost(cur);
+  if cost > fr.gas { return R_OOG; }
+  // 4 GiB of memory costs over 2^43 gas; refuse to allocate beyond that.
+  if words > 134217728u64 { return R_FATAL; }
+  fr.gas = fr.gas - cost;
+  fr.mem = grow_bytes(fr.mem, fr.mem_len, words * 32u64);
+  fr.mem_len = words * 32u64;
+  return R_CONTINUE;
+}
+
+// Checks a U256 offset or length fits in a u64 (revm as_usize_or_fail).
+fn fits(v: U256) -> bool { return u256_fits_u64(v); }
+
+fn stack_get(f: *mut Frame, from_top: u64) -> U256 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let st: *mut U256 = fr.stack;
+  return unsafe { st[fr.sp - 1u64 - from_top] };
+}
+
+fn stack_pop(f: *mut Frame) -> U256 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let st: *mut U256 = fr.stack;
+  fr.sp = fr.sp - 1u64;
+  return unsafe { st[fr.sp] };
+}
+
+fn stack_push(f: *mut Frame, v: U256) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let st: *mut U256 = fr.stack;
+  unsafe { st[fr.sp] = v; }
+  fr.sp = fr.sp + 1u64;
+}
+
+// Sets the frame output to a copy of memory [off, off + len).
+fn set_output_from_mem(f: *mut Frame, off: u64, len: u64) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  mfree(fr.out);
+  let src: *mut u8 = offset_mut(fr.mem, off as i64);
+  fr.out = dup_bytes(src, len);
+  fr.out_len = len;
+}
+
+// Copies len bytes of src (src_len bytes long) starting at src_off into memory at
+// mem_off, zero filling past the end of src. Memory must already cover the range.
+fn mem_set_data(f: *mut Frame, mem_off: u64, src: *mut u8, src_len: u64, src_off: u64, len: u64) -> void {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let dst: *mut u8 = offset_mut(fr.mem, mem_off as i64);
+  if src_off >= src_len {
+    zero_bytes(dst, len);
+    return;
+  }
+  let mut avail: u64 = src_len - src_off;
+  if avail > len { avail = len; }
+  let s: *mut u8 = offset_mut(src, src_off as i64);
+  copy_bytes(dst, s, avail);
+  if avail < len {
+    let rest: *mut u8 = offset_mut(dst, avail as i64);
+    zero_bytes(rest, len - avail);
+  }
+}
+
+// Pool-aware frame allocation: reuses a retired frame's struct, operand-stack
+// buffer and words buffer. The stack needs no zeroing (sp guards all reads);
+// every other field is set here.
+fn frame_get(c: *mut Ctx, code: *mut u8, code_len: u64, jd: *mut u8, gas: u64,
+             input: *mut u8, input_len: u64, target: U256, caller: U256, value: U256,
+             is_static: bool, depth: u64, acct: u64, tabs: *mut OpTabs) -> *mut Frame {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.fpool_n == 0u64 {
+    return frame_new(code, code_len, jd, gas, input, input_len, target, caller, value,
+                     is_static, depth, acct, tabs);
+  }
+  cx.fpool_n = cx.fpool_n - 1u64;
+  let bp: *mut PtrBox = cx.fpool;
+  let bx: &mut PtrBox = unsafe { &mut bp[cx.fpool_n] };
+  let f: *mut Frame = bx.p;
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  fr.code = code;
+  fr.code_len = code_len;
+  fr.jd = jd;
+  fr.pc = 0u64;
+  fr.gas = gas;
+  fr.refund = 0i64;
+  fr.sp = 0u64;
+  fr.mem = zalloc(32u64);
+  fr.mem_len = 0u64;
+  fr.ret = zalloc(1u64);
+  fr.ret_len = 0u64;
+  fr.input = input;
+  fr.input_len = input_len;
+  let wp: *mut U256 = fr.words;
+  unsafe { wp[0u64] = target; wp[1u64] = caller; wp[2u64] = value; }
+  fr.is_static = 0u64;
+  if is_static { fr.is_static = 1u64; }
+  fr.depth = depth;
+  fr.out = zalloc(1u64);
+  fr.out_len = 0u64;
+  fr.acct = acct;
+  fr.tabs = tabs;
+  fr.parent = null_i8();
+  fr.k_child = null_i8();
+  fr.k_kind = K_NONE;
+  fr.k_buf_a = null_u8();
+  fr.k_buf_b = null_u8();
+  return f;
+}
+
+// Retires a frame into the pool: its transient buffers are freed, the struct
+// and its stack/words buffers are kept. A full pool frees outright.
+fn frame_put(c: *mut Ctx, f: *mut Frame) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.fpool_n == cx.fpool_cap {
+    frame_free(f);
+    return;
+  }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  mfree(fr.mem);
+  mfree(fr.ret);
+  fr.mem = null_u8();
+  fr.ret = null_u8();
+  let bp: *mut PtrBox = cx.fpool;
+  let bx: &mut PtrBox = unsafe { &mut bp[cx.fpool_n] };
+  let fp: *mut i8 = f;
+  bx.p = fp;
+  cx.fpool_n = cx.fpool_n + 1u64;
+}
+
+fn tabs_free(t: *mut OpTabs) -> void {
+  let tr: &mut OpTabs = unsafe { &mut t[0u64] };
+  let g: *mut i8 = tr.gas;
+  let si: *mut i8 = tr.sin;
+  let so: *mut i8 = tr.sout;
+  let ac: *mut i8 = tr.act;
+  let tp: *mut i8 = t;
+  unsafe { vx_free(g); vx_free(si); vx_free(so); vx_free(ac); vx_free(tp); }
+}

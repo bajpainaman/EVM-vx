@@ -1,0 +1,162 @@
+// Memory, stack, control-flow and data-copy opcodes.
+
+fn op_mload(f: *mut Frame) -> u64 {
+  let off: U256 = stack_pop(f);
+  if !fits(off) { return R_INVALID_OPERAND_OOG; }
+  let r: u64 = mem_expand(f, off.l0, 32u64);
+  if r != R_CONTINUE { return r; }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let p: *mut u8 = offset_mut(fr.mem, off.l0 as i64);
+  stack_push(f, u256_load_be(p));
+  return R_CONTINUE;
+}
+
+fn op_mstore(f: *mut Frame, one_byte: bool) -> u64 {
+  let off: U256 = stack_pop(f);
+  let v: U256 = stack_pop(f);
+  if !fits(off) { return R_INVALID_OPERAND_OOG; }
+  let mut n: u64 = 32u64;
+  if one_byte { n = 1u64; }
+  let r: u64 = mem_expand(f, off.l0, n);
+  if r != R_CONTINUE { return r; }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let p: *mut u8 = offset_mut(fr.mem, off.l0 as i64);
+  if one_byte { unsafe { p[0u64] = (v.l0 & 255u64) as u8; } }
+  else { u256_store_be(p, v); }
+  return R_CONTINUE;
+}
+
+// Pops (memory offset, length) for a copy, charges 3 gas per word and expands
+// memory. Writes the memory offset to *dst; returns R_CONTINUE or an error.
+// A zero length skips memory (revm copy_cost_and_memory_resize).
+fn copy_prepare(f: *mut Frame, mem_off: U256, len: u64, dst: *mut u64) -> u64 {
+  if !charge(f, copy_cost(len)) { return R_OOG; }
+  if len == 0u64 { return R_CONTINUE; }
+  if !fits(mem_off) { return R_INVALID_OPERAND_OOG; }
+  let r: u64 = mem_expand(f, mem_off.l0, len);
+  if r != R_CONTINUE { return r; }
+  unsafe { dst[0u64] = mem_off.l0; }
+  return R_CONTINUE;
+}
+
+// CALLDATACOPY (src 0), CODECOPY (src 1) and RETURNDATACOPY (src 2).
+fn op_copy(f: *mut Frame, src_kind: u64, tmp: *mut u64) -> u64 {
+  let mem_off: U256 = stack_pop(f);
+  let data_off: U256 = stack_pop(f);
+  let lenw: U256 = stack_pop(f);
+  if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = lenw.l0;
+  let doff: u64 = u256_sat_u64(data_off);
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let mut src: *mut u8 = fr.input;
+  let mut src_len: u64 = fr.input_len;
+  if src_kind == 1u64 { src = fr.code; src_len = fr.code_len; }
+  if src_kind == 2u64 {
+    src = fr.ret;
+    src_len = fr.ret_len;
+    if sat_add(doff, len) > src_len { return R_OUT_OF_OFFSET; }
+  }
+  let r: u64 = copy_prepare(f, mem_off, len, tmp);
+  if r != R_CONTINUE || len == 0u64 { return r; }
+  let moff: u64 = unsafe { tmp[0u64] };
+  mem_set_data(f, moff, src, src_len, doff, len);
+  return R_CONTINUE;
+}
+
+fn op_mcopy(f: *mut Frame) -> u64 {
+  let dst: U256 = stack_pop(f);
+  let src: U256 = stack_pop(f);
+  let lenw: U256 = stack_pop(f);
+  if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = lenw.l0;
+  if !charge(f, copy_cost(len)) { return R_OOG; }
+  if len == 0u64 { return R_CONTINUE; }
+  if !fits(dst) || !fits(src) { return R_INVALID_OPERAND_OOG; }
+  let mut hi: u64 = dst.l0;
+  if src.l0 > hi { hi = src.l0; }
+  let r: u64 = mem_expand(f, hi, len);
+  if r != R_CONTINUE { return r; }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let d: *mut u8 = offset_mut(fr.mem, dst.l0 as i64);
+  let s: *mut u8 = offset_mut(fr.mem, src.l0 as i64);
+  copy_bytes(d, s, len);
+  return R_CONTINUE;
+}
+
+fn op_keccak(f: *mut Frame) -> u64 {
+  let off: U256 = stack_pop(f);
+  let lenw: U256 = stack_pop(f);
+  if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = lenw.l0;
+  if !charge(f, sat_mul(6u64, num_words(len))) { return R_OOG; }
+  if len == 0u64 {
+    stack_push(f, keccak_empty());
+    return R_CONTINUE;
+  }
+  if !fits(off) { return R_INVALID_OPERAND_OOG; }
+  let r: u64 = mem_expand(f, off.l0, len);
+  if r != R_CONTINUE { return r; }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let p: *mut u8 = offset_mut(fr.mem, off.l0 as i64);
+  stack_push(f, keccak256(p, len));
+  return R_CONTINUE;
+}
+
+// RETURN and REVERT: set the output from memory.
+fn op_return(f: *mut Frame, result: u64) -> u64 {
+  let off: U256 = stack_pop(f);
+  let lenw: U256 = stack_pop(f);
+  if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
+  let len: u64 = lenw.l0;
+  if len != 0u64 {
+    if !fits(off) { return R_INVALID_OPERAND_OOG; }
+    let r: u64 = mem_expand(f, off.l0, len);
+    if r != R_CONTINUE { return r; }
+    set_output_from_mem(f, off.l0, len);
+  }
+  return result;
+}
+
+fn op_dup(f: *mut Frame, n: u64) -> u64 {
+  stack_push(f, stack_get(f, n - 1u64));
+  return R_CONTINUE;
+}
+
+fn op_swap(f: *mut Frame, n: u64) -> u64 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let st: *mut U256 = fr.stack;
+  let top: u64 = fr.sp - 1u64;
+  let a: U256 = unsafe { st[top] };
+  let b: U256 = unsafe { st[top - n] };
+  unsafe { st[top] = b; st[top - n] = a; }
+  return R_CONTINUE;
+}
+
+// PUSH0..PUSH32: n immediate bytes, zero padded at the end of code.
+fn op_push(f: *mut Frame, n: u64) -> u64 {
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  let v: U256 = u256_load_be_n(fr.code, fr.code_len, fr.pc, n);
+  fr.pc = fr.pc + n;
+  stack_push(f, v);
+  return R_CONTINUE;
+}
+
+// JUMP and JUMPI. pc already points past the opcode.
+fn op_jump(f: *mut Frame, conditional: bool) -> u64 {
+  let dest: U256 = stack_pop(f);
+  if conditional {
+    let cond: U256 = stack_pop(f);
+    if u256_is_zero(cond) { return R_CONTINUE; }
+  }
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  if !is_jumpdest(fr.jd, fr.code_len, dest) { return R_INVALID_JUMP; }
+  fr.pc = dest.l0;
+  return R_CONTINUE;
+}
+
+fn op_calldataload(f: *mut Frame) -> u64 {
+  let off: U256 = stack_pop(f);
+  let fr: &mut Frame = unsafe { &mut f[0u64] };
+  stack_push(f, u256_load_padded(fr.input, fr.input_len, u256_sat_u64(off)));
+  return R_CONTINUE;
+}

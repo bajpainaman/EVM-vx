@@ -1,0 +1,580 @@
+// The transaction handler and the exported C entry point.
+// Follows revm handler/src/handler.rs: validate, deduct caller, run the first
+// frame, refund, reimburse the caller, reward the beneficiary, collect state.
+
+const BLOB_GAS_PER_BLOB: u64 = 131072u64;
+
+// Intrinsic gas (revm initial_tx_gas): base, calldata tokens, access list,
+// create cost, initcode words, 7702 auth.
+fn intrinsic_gas(c: *mut Ctx, env: *mut VxEnv) -> u64 {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let mut g: u64 = 21000u64;
+  let mut nonzero_mult: u64 = 17u64;
+  let _nz: u64 = nonzero_mult;
+  if e.spec >= SPEC_ISTANBUL { nonzero_mult = 4u64; }
+  let mut tokens: u64 = 0u64;
+  let mut i: u64 = 0u64;
+  while i < e.data_len {
+    let b: u8 = unsafe { e.data[i] };
+    if b == 0u8 { tokens = tokens + 1u64; } else { tokens = tokens + nonzero_mult; }
+    i = i + 1u64;
+  }
+  g = sat_add(g, sat_mul(tokens, 4u64));
+  if e.is_create != 0u64 {
+    if e.spec >= SPEC_HOMESTEAD { g = sat_add(g, 32000u64); }
+    if e.spec >= SPEC_SHANGHAI { g = sat_add(g, sat_mul(2u64, num_words(e.data_len))); }
+  }
+  g = sat_add(g, sat_mul(e.al_count, 2400u64));
+  let mut s: u64 = 0u64;
+  let nsp: *mut u64 = e.al_nslots;
+  let mut k: u64 = 0u64;
+  while k < e.al_count {
+    s = s + unsafe { nsp[k] };
+    k = k + 1u64;
+  }
+  g = sat_add(g, sat_mul(s, 1900u64));
+  if e.spec >= SPEC_PRAGUE { g = sat_add(g, sat_mul(e.auth_count, 25000u64)); }
+  return g;
+}
+
+// EIP-7623 floor gas (Prague+): 21000 + 10 per calldata token.
+fn floor_gas(c: *mut Ctx, env: *mut VxEnv) -> u64 {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let mut nonzero_mult: u64 = 4u64;
+  let mut tokens: u64 = 0u64;
+  let mut i: u64 = 0u64;
+  while i < e.data_len {
+    let b: u8 = unsafe { e.data[i] };
+    if b == 0u8 { tokens = tokens + 1u64; } else { tokens = tokens + nonzero_mult; }
+    i = i + 1u64;
+  }
+  return sat_add(21000u64, sat_mul(tokens, 10u64));
+}
+
+// Warms the access list and, from Shanghai, the coinbase.
+fn warm_access_list(c: *mut Ctx, env: *mut VxEnv) -> void {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if e.spec >= SPEC_SHANGHAI { map_put(cx.almap, e.coinbase, u256_zero(), 1u64); }
+  let addrs: *mut U256 = e.al_addrs;
+  let nsp: *mut u64 = e.al_nslots;
+  let slots: *mut U256 = e.al_slots;
+  let mut si: u64 = 0u64;
+  let mut k: u64 = 0u64;
+  while k < e.al_count {
+    let a: U256 = unsafe { addrs[k] };
+    map_put(cx.almap, a, u256_zero(), 1u64);
+    let n: u64 = unsafe { nsp[k] };
+    let mut j: u64 = 0u64;
+    while j < n {
+      let key: U256 = unsafe { slots[si] };
+      map_put(cx.almap_slots, a, key, 1u64);
+      si = si + 1u64;
+      j = j + 1u64;
+    }
+    k = k + 1u64;
+  }
+}
+
+// Validates the transaction against the block and the caller's state.
+// Returns 0 (ok) or 1 (invalid). Host errors set the fatal flag.
+fn validate_tx(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, intrinsic: u64) -> u64 {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  // Merge needs prevrandao, Cancun needs blob gas.
+  if e.spec >= SPEC_MERGE && e.has_prevrandao == 0u64 { return 1u64; }
+  // Transaction type must be enabled by the fork.
+  if e.tx_type == TX_EIP2930 && e.spec < SPEC_BERLIN { return 1u64; }
+  if e.tx_type == TX_EIP1559 && e.spec < SPEC_LONDON { return 1u64; }
+  if e.tx_type == TX_EIP4844 && e.spec < SPEC_CANCUN { return 1u64; }
+  if e.tx_type == TX_EIP7702 && e.spec < SPEC_PRAGUE { return 1u64; }
+  if e.tx_type == TX_EIP4844 && e.is_create != 0u64 { return 1u64; }
+  if e.tx_type == TX_EIP7702 && e.auth_count == 0u64 { return 1u64; }
+  // Cancun needs the blob gas fields.
+  if e.spec >= SPEC_CANCUN && e.has_blob == 0u64 { return 1u64; }
+  // A nonce of u64::MAX can never be bumped.
+  if e.nonce == 18446744073709551615u64 { return 1u64; }
+  // Priority fee above max fee (EIP-1559 family).
+  if e.tx_type >= TX_EIP1559 && e.has_priority_fee != 0u64 && (e.cfg_flags & CFG_DISABLE_PRIORITY_FEE_CHECK) == 0u64 {
+    if u256_gt(e.priority_fee, e.gas_price) { return 1u64; }
+  }
+  // EIP-4844 blob transactions.
+  if e.tx_type == TX_EIP4844 {
+    if u256_gt(e.blob_gasprice, e.max_fee_per_blob_gas) { return 1u64; }
+    if e.blob_count == 0u64 { return 1u64; }
+    let hs: *mut U256 = e.blob_hashes;
+    let mut bi: u64 = 0u64;
+    while bi < e.blob_count {
+      let h: U256 = unsafe { hs[bi] };
+      if (h.l3 >> 56u64) != 1u64 { return 1u64; }
+      bi = bi + 1u64;
+    }
+    if e.max_blobs_per_tx != 0u64 && e.blob_count > e.max_blobs_per_tx { return 1u64; }
+  }
+  // Chain id.
+  if (e.cfg_flags & CFG_TX_CHAIN_ID_CHECK) != 0u64 {
+    if e.has_tx_chain_id != 0u64 { if e.tx_chain_id != e.chain_id { return 1u64; } }
+    else if e.tx_type != TX_LEGACY { return 1u64; }
+  }
+  // Gas limit vs block and cap.
+  if (e.cfg_flags & CFG_DISABLE_BLOCK_GAS_LIMIT) == 0u64 && e.gas_limit > e.block_gas_limit { return 1u64; }
+  if e.tx_gas_limit_cap != 0u64 && e.gas_limit > e.tx_gas_limit_cap { return 1u64; }
+  // Base fee.
+  if (e.cfg_flags & CFG_DISABLE_BASE_FEE) == 0u64 {
+    if u256_lt(e.gas_price, u256_from_u64(e.basefee)) { return 1u64; }
+    if e.has_priority_fee != 0u64 && u256_lt(e.gas_price, e.priority_fee) { return 1u64; }
+  }
+  // Create initcode size (Shanghai+).
+  if e.spec >= SPEC_SHANGHAI && e.is_create != 0u64 && e.data_len > e.max_initcode_size { return 1u64; }
+  // Intrinsic gas and the Prague floor.
+  if intrinsic > e.gas_limit { return 1u64; }
+  if e.spec >= SPEC_PRAGUE && floor_gas(c, env) > e.gas_limit { return 1u64; }
+  // Nonce.
+  if (e.cfg_flags & CFG_DISABLE_NONCE_CHECK) == 0u64 {
+    if e.nonce != acc_nonce(c, caller_idx) { return 1u64; }
+  }
+  // EIP-3607: a caller with code (not a 7702 delegation) is rejected.
+  if (e.cfg_flags & CFG_DISABLE_EIP3607) == 0u64 {
+    let code: *mut u8 = acc_code(c, caller_idx);
+    let len: u64 = acc_code_len(c, caller_idx);
+    if len != 0u64 && !is_delegation(code, len) { return 1u64; }
+  }
+  return 0u64;
+}
+
+// revm max_balance_spending: gas_limit * max_fee (as u128) + value + blob_gas *
+// max_fee_per_blob_gas. Sets *overflow when any step overflows (invalid tx).
+fn max_spend(env: *mut VxEnv, overflow: *mut u64) -> U256 {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let gas_cost: U256 = u256_mul(u256_from_u64(e.gas_limit), e.gas_price);
+  if gas_cost.l2 != 0u64 || gas_cost.l3 != 0u64 { unsafe { overflow[0u64] = 1u64; } }
+  let mut total: U256 = u256_add(gas_cost, e.value);
+  if u256_lt(total, gas_cost) { unsafe { overflow[0u64] = 1u64; } }
+  if e.tx_type == TX_EIP4844 {
+    let blob_gas: u64 = sat_mul(BLOB_GAS_PER_BLOB, e.blob_count);
+    let data_fee: U256 = u256_mul(u256_from_u64(blob_gas), e.max_fee_per_blob_gas);
+    let t2: U256 = u256_add(total, data_fee);
+    if u256_lt(t2, total) { unsafe { overflow[0u64] = 1u64; } }
+    total = t2;
+  }
+  return total;
+}
+
+// The gas fee plus blob fee deducted from the caller before execution.
+fn gas_fee(c: *mut Ctx, env: *mut VxEnv) -> U256 {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let mut fee: U256 = u256_mul(u256_from_u64(e.gas_limit), effective_gas_price(c));
+  if e.tx_type == TX_EIP4844 {
+    let blob_gas: u64 = sat_mul(BLOB_GAS_PER_BLOB, e.blob_count);
+    fee = u256_add(fee, u256_mul(u256_from_u64(blob_gas), e.blob_gasprice));
+  }
+  return fee;
+}
+
+fn result_alloc() -> *mut VxResult {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<VxResult>() as u64) };
+  let r: *mut VxResult = raw;
+  return r;
+}
+
+// Collects touched accounts, their changed slots, and logs into the result.
+fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  // Count emitted accounts.
+  let mask: u64 = ACC_TOUCHED | ACC_CREATED | ACC_SELFDESTRUCTED;
+  let mut na: u64 = 0u64;
+  let mut i: u64 = 0u64;
+  while i < cx.ac_n {
+    if (acc_flags(c, i) & mask) != 0u64 { na = na + 1u64; }
+    i = i + 1u64;
+  }
+  let araw: *mut i8 = unsafe { vx_calloc(na + 1u64, sizeof<OutAccount>() as u64) };
+  let accs: *mut OutAccount = araw;
+  let sraw: *mut i8 = unsafe { vx_calloc(cx.sl_n + 1u64, sizeof<OutSlot>() as u64) };
+  let slots: *mut OutSlot = sraw;
+  let mut ai: u64 = 0u64;
+  let mut so: u64 = 0u64;
+  i = 0u64;
+  while i < cx.ac_n {
+    if (acc_flags(c, i) & mask) != 0u64 {
+      let start: u64 = so;
+      let mut s: u64 = 0u64;
+      while s < cx.sl_n {
+        let mp: *mut SlotMeta = slot_meta(c, s);
+        let m: &mut SlotMeta = unsafe { &mut mp[0u64] };
+        if m.acct == i {
+          unsafe { slots[so] = OutSlot { key: slot_key(c, s), original: slot_orig(c, s), present: slot_cur(c, s) }; }
+          so = so + 1u64;
+        }
+        s = s + 1u64;
+      }
+      unsafe {
+        accs[ai] = OutAccount { address: acc_addr(c, i), balance: acc_bal(c, i), nonce: acc_nonce(c, i),
+                                code_hash: acc_hash(c, i), code: acc_code(c, i), code_len: acc_code_len(c, i),
+                                flags: acc_flags(c, i), slot_start: start, slot_count: so - start };
+      }
+      ai = ai + 1u64;
+    }
+    i = i + 1u64;
+  }
+  r.accounts = accs;
+  r.account_count = na;
+  r.slots = slots;
+  r.slot_count = so;
+  // Logs.
+  let lraw: *mut i8 = unsafe { vx_calloc(cx.lg_n + 1u64, sizeof<OutLog>() as u64) };
+  let logs: *mut OutLog = lraw;
+  let mut li: u64 = 0u64;
+  while li < cx.lg_n {
+    let ap: *mut U256 = cx.lg_addr;
+    let mp: *mut LogMeta = offset_mut(cx.lg_meta, li as i64);
+    let m: &mut LogMeta = unsafe { &mut mp[0u64] };
+    let tp: *mut U256 = cx.lg_topics;
+    unsafe {
+      logs[li] = OutLog { address: ap[li], topic_count: m.topic_count,
+                          t0: tp[li * 4u64], t1: tp[li * 4u64 + 1u64], t2: tp[li * 4u64 + 2u64], t3: tp[li * 4u64 + 3u64],
+                          data: dup_bytes(m.data, m.data_len), data_len: m.data_len };
+    }
+    li = li + 1u64;
+  }
+  r.logs = logs;
+  r.log_count = cx.lg_n;
+}
+
+fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let cxt: &mut Ctx = unsafe { &mut c[0u64] };
+  let mut tabs: *mut OpTabs = cxt.tabs_shared;
+  if is_null_tabs(tabs) { tabs = tabs_new(e.spec); }
+  let res: *mut VxResult = result_alloc();
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+
+  let caller_idx: u64 = acc_load(c, e.caller);
+  let intrinsic: u64 = intrinsic_gas(c, env);
+  if is_fatal(c) { r.status = RES_HOST_FAILURE; return res; }
+  if validate_tx(c, env, caller_idx, intrinsic) != 0u64 { r.status = RES_INVALID_TX; return res; }
+  let ovf: *mut u64 = limbs_alloc(1u64);
+  let spend: U256 = max_spend(env, ovf);
+  let overflowed: bool = unsafe { ovf[0u64] } != 0u64;
+  limbs_free(ovf);
+  if overflowed { r.status = RES_INVALID_TX; return res; }
+  if (e.cfg_flags & CFG_DISABLE_BALANCE_CHECK) == 0u64 {
+    if u256_lt(acc_bal(c, caller_idx), spend) { r.status = RES_INVALID_TX; return res; }
+  }
+
+  // Deduct the gas fee and bump the nonce (a call bumps here; a create bumps
+  // when the frame is built).
+  if (e.cfg_flags & CFG_DISABLE_FEE_CHARGE) == 0u64 {
+    acc_set_balance(c, caller_idx, u256_sub(acc_bal(c, caller_idx), gas_fee(c, env)));
+  }
+  warm_access_list(c, env);
+
+  let gas_avail: u64 = e.gas_limit - intrinsic;
+  let mut gas_left: u64 = 0u64;
+  let mut refund: i64 = 0i64;
+  let mut result: u64 = R_STOP;
+  let mut out: *mut u8 = zalloc(1u64);
+  let mut out_len: u64 = 0u64;
+  let mut created_addr: U256 = u256_zero();
+  let mut auth_refund: u64 = 0u64;
+
+  if e.is_create != 0u64 {
+    run_tx_create(c, env, caller_idx, gas_avail, tabs, res);
+    gas_left = r.gas_used;         // run_tx_* stash gas_left in gas_used temporarily
+    refund = u256_to_i64_refund(r.gas_refunded);
+    result = r.reason;
+    out = r.output;
+    out_len = r.output_len;
+    created_addr = r.created_address;
+  } else {
+    acc_bump_nonce(c, caller_idx);
+    auth_refund = apply_auth_list(c, env);
+    run_tx_call(c, env, caller_idx, gas_avail, tabs, res);
+    gas_left = r.gas_used;
+    refund = u256_to_i64_refund(r.gas_refunded);
+    result = r.reason;
+    out = r.output;
+    out_len = r.output_len;
+  }
+  if is_fatal(c) { r.status = RES_HOST_FAILURE; return res; }
+
+  // Refund, capped by spent / quotient.
+  let spent: u64 = e.gas_limit - gas_left;
+  let mut quotient: u64 = 2u64;
+  if e.spec >= SPEC_LONDON { quotient = 5u64; }
+  let cap: i64 = (spent / quotient) as i64;
+  let mut rf: i64 = refund + (auth_refund as i64);
+  if rf > cap { rf = cap; }
+  let mut final_left: u64 = gas_left;
+  if rf >= 0i64 { final_left = final_left + (rf as u64); }
+  else { final_left = final_left - ((0i64 - rf) as u64); }
+
+  // EIP-7623 floor: used gas cannot drop below the floor.
+  if e.spec >= SPEC_PRAGUE {
+    let fl: u64 = floor_gas(c, env);
+    let used: u64 = e.gas_limit - final_left;
+    if used < fl { final_left = e.gas_limit - fl; }
+  }
+
+  // Reimburse the caller for the unused gas.
+  if (e.cfg_flags & CFG_DISABLE_FEE_CHARGE) == 0u64 {
+    let back: U256 = u256_mul(u256_from_u64(final_left), effective_gas_price(c));
+    acc_incr_balance(c, caller_idx, back);
+    // Reward the beneficiary with the priority fee on the used gas.
+    let used: u64 = e.gas_limit - final_left;
+    let mut coinbase_price: U256 = effective_gas_price(c);
+    if e.spec >= SPEC_LONDON { coinbase_price = u256_sub(coinbase_price, u256_from_u64(e.basefee)); }
+    let fee: U256 = u256_mul(u256_from_u64(used), coinbase_price);
+    let cxf: &mut Ctx = unsafe { &mut c[0u64] };
+    if is_null_mut(cxf.mv) {
+      let cb_idx: u64 = acc_load(c, e.coinbase);
+      acc_incr_balance(c, cb_idx, fee);
+    } else {
+      // Block mode: the fee is a delta the block executor sums at the end
+      // (SPEC §6 fee-recipient deltas), so paying it does not serialize txs.
+      let fp: *mut U256 = cxf.coinbase_fee;
+      unsafe { fp[0u64] = fee; }
+    }
+  }
+
+  let gas_used: u64 = e.gas_limit - final_left;
+  r.gas_used = gas_used;
+  r.gas_refunded = 0u64;
+  r.output = out;
+  r.output_len = out_len;
+  r.created_address = U256 { l0: created_addr.l0, l1: created_addr.l1, l2: created_addr.l2, l3: created_addr.l3 };
+  if e.is_create != 0u64 && r_is_ok(result) { r.created = 1u64; }
+  if r_is_ok(result) { r.status = RES_SUCCESS; }
+  else if result == R_REVERT { r.status = RES_REVERT; }
+  else { r.status = RES_HALT; }
+  r.reason = result;
+  finalize_state(c);
+  collect_state(c, res);
+  return res;
+}
+
+// Refunds are carried as an i64 bit pattern in the u64 gas_refunded slot.
+fn u256_to_i64_refund(x: u64) -> i64 { return x as i64; }
+fn i64_to_slot(x: i64) -> u64 { return x as u64; }
+
+// Runs a top-level message call; stashes (gas_left, refund, result, output) in res.
+fn run_tx_call(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: *mut OpTabs, res: *mut VxResult) -> void {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  let to: U256 = e.to;
+  let target_idx: u64 = acc_load(c, to);
+  // Delegated code resolution without gas (the tx pays intrinsic only).
+  let mut code_idx: u64 = target_idx;
+  let code: *mut u8 = acc_code(c, target_idx);
+  let clen: u64 = acc_code_len(c, target_idx);
+  if e.spec >= SPEC_PRAGUE && is_delegation(code, clen) {
+    code_idx = acc_load(c, delegation_address(code));
+  }
+  let jn: u64 = journal_len(c);
+  let ln: u64 = log_len(c);
+  // Value transfer.
+  let err: u64 = transfer_loaded(c, caller_idx, target_idx, e.value);
+  if err != 0u64 {
+    journal_revert(c, jn, ln);
+    r.gas_used = gas;
+    r.reason = R_OUT_OF_FUNDS;
+    r.output = zalloc(1u64);
+    r.output_len = 0u64;
+    return;
+  }
+  let input: *mut u8 = dup_bytes(e.data, e.data_len);
+  let pid: u64 = precompile_id(to, c);
+  let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
+  let o: *mut ChildOut = oraw;
+  if pid != 0u64 {
+    run_child_precompile(c, pid, input, e.data_len, gas, o);
+  } else {
+    let clen2: u64 = acc_code_len(c, code_idx);
+    if clen2 == 0u64 {
+      let oc: &mut ChildOut = unsafe { &mut o[0u64] };
+      oc.result = R_STOP; oc.gas_left = gas; oc.refund = 0i64; oc.out = zalloc(1u64); oc.out_len = 0u64;
+    } else {
+      let ccode: *mut u8 = acc_code(c, code_idx);
+      let jd: *mut u8 = acc_jumpdests(c, code_idx);
+      let child: *mut Frame = frame_get(c, ccode, clen2, jd, gas, input, e.data_len,
+                                        to, e.caller, e.value, false, 0u64, target_idx, tabs);
+      let rr: u64 = run_frame(c, child);
+      let cf: &mut Frame = unsafe { &mut child[0u64] };
+      let oc: &mut ChildOut = unsafe { &mut o[0u64] };
+      oc.result = rr;
+      oc.gas_left = 0u64;
+      if r_is_ok_or_revert(rr) { oc.gas_left = cf.gas; }
+      oc.refund = 0i64;
+      if r_is_ok(rr) { oc.refund = cf.refund; }
+      oc.out = dup_bytes(cf.out, cf.out_len);
+      oc.out_len = cf.out_len;
+      frame_put(c, child);
+    }
+  }
+  let oc: &mut ChildOut = unsafe { &mut o[0u64] };
+  if !r_is_ok(oc.result) { journal_revert(c, jn, ln); }
+  r.gas_used = oc.gas_left;
+  r.gas_refunded = i64_to_slot(oc.refund);
+  r.reason = oc.result;
+  r.output = dup_bytes(oc.out, oc.out_len);
+  r.output_len = oc.out_len;
+  mfree(oc.out);
+  mfree(input);
+  unsafe { vx_free(oraw); }
+}
+
+// Runs a top-level contract creation.
+fn run_tx_create(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: *mut OpTabs, res: *mut VxResult) -> void {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  let old_nonce: u64 = acc_nonce(c, caller_idx);
+  acc_bump_nonce(c, caller_idx);
+  let created: U256 = create_address(e.caller, old_nonce);
+  let cad: U256 = created;
+  r.created_address = U256 { l0: cad.l0, l1: cad.l1, l2: cad.l2, l3: cad.l3 };
+  let created_idx: u64 = acc_load(c, created);
+  let jn: u64 = journal_len(c);
+  let ln: u64 = log_len(c);
+  let cerr: u64 = create_account(c, caller_idx, created_idx, e.value);
+  if cerr != 0u64 {
+    journal_revert(c, jn, ln);
+    r.gas_used = 0u64;
+    r.reason = R_CREATE_COLLISION;
+    r.output = zalloc(1u64);
+    r.output_len = 0u64;
+    return;
+  }
+  let init: *mut u8 = dup_bytes(e.data, e.data_len);
+  let jd: *mut u8 = analyze_jumpdests(init, e.data_len);
+  let child: *mut Frame = frame_get(c, init, e.data_len, jd, gas, zalloc(1u64), 0u64,
+                                    created, e.caller, e.value, false, 0u64, created_idx, tabs);
+  let rr: u64 = run_frame(c, child);
+  let cf: &mut Frame = unsafe { &mut child[0u64] };
+  let mut gleft: u64 = 0u64;
+  if r_is_ok_or_revert(rr) { gleft = cf.gas; }
+  let mut rfd: i64 = 0i64;
+  if r_is_ok(rr) { rfd = cf.refund; }
+  let outp: *mut u8 = dup_bytes(cf.out, cf.out_len);
+  let outl: u64 = cf.out_len;
+  let cinput: *mut u8 = cf.input;
+  frame_put(c, child);
+  mfree(cinput);
+  mfree(jd);
+  mfree(init);
+
+  let gbuf: *mut u64 = limbs_alloc(1u64);
+  unsafe { gbuf[0u64] = gleft; }
+  let mut fr: u64 = rr;
+  if r_is_ok(rr) { fr = finish_create(c, created_idx, outp, outl, gleft, gbuf); }
+  let dep_left: u64 = unsafe { gbuf[0u64] };
+  limbs_free(gbuf);
+
+  if r_is_ok(fr) {
+    r.gas_used = dep_left;
+    r.gas_refunded = i64_to_slot(rfd);
+    r.reason = R_RETURN;
+    r.output = zalloc(1u64);
+    r.output_len = 0u64;
+  } else {
+    journal_revert(c, jn, ln);
+    r.reason = fr;
+    if fr == R_REVERT {
+      r.gas_used = gleft;
+      r.output = dup_bytes(outp, outl);
+      r.output_len = outl;
+    } else {
+      r.gas_used = 0u64;
+      r.output = zalloc(1u64);
+      r.output_len = 0u64;
+    }
+  }
+  mfree(outp);
+}
+
+pub fn evmvx_result_free(res: *mut VxResult) -> void {
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  mfree(r.output);
+  // The result owns a copy of each log's data (the Ctx's buffers are reused
+  // across transactions by the block executor).
+  let lp: *mut OutLog = r.logs;
+  let mut li: u64 = 0u64;
+  while li < r.log_count {
+    let lg: &mut OutLog = unsafe { &mut lp[li] };
+    mfree(lg.data);
+    li = li + 1u64;
+  }
+  let a: *mut i8 = r.accounts;
+  let s: *mut i8 = r.slots;
+  let l: *mut i8 = r.logs;
+  unsafe { vx_free(a); vx_free(s); vx_free(l); }
+  let rp: *mut i8 = res;
+  unsafe { vx_free(rp); }
+}
+
+// Struct sizes the Vx side sees, for a layout check against the Rust harness.
+pub fn evmvx_abi_sizes(out: *mut u64) -> void {
+  unsafe {
+    out[0u64] = sizeof<VxEnv>() as u64;
+    out[1u64] = sizeof<HostAccount>() as u64;
+    out[2u64] = sizeof<OutAccount>() as u64;
+    out[3u64] = sizeof<OutSlot>() as u64;
+    out[4u64] = sizeof<OutLog>() as u64;
+    out[5u64] = sizeof<VxResult>() as u64;
+    out[6u64] = sizeof<VxAuth>() as u64;
+  }
+}
+
+// A system call (revm run_system_call): a call from env.caller to env.to with
+// env.gas_limit gas, without validation, fees, nonce bump, authorizations or
+// refunds. Used by the block layer for EIP-2935, EIP-4788, EIP-7002 and
+// EIP-7251.
+fn system_call_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  let tabs: *mut OpTabs = tabs_new(e.spec);
+  let res: *mut VxResult = result_alloc();
+  let r: &mut VxResult = unsafe { &mut res[0u64] };
+  let caller_idx: u64 = acc_load(c, e.caller);
+  run_tx_call(c, env, caller_idx, e.gas_limit, tabs, res);
+  if is_fatal(c) { r.status = RES_HOST_FAILURE; return res; }
+  let gas_left: u64 = r.gas_used;
+  let result: u64 = r.reason;
+  r.gas_used = e.gas_limit - gas_left;
+  r.gas_refunded = 0u64;
+  if r_is_ok(result) { r.status = RES_SUCCESS; }
+  else if result == R_REVERT { r.status = RES_REVERT; }
+  else { r.status = RES_HALT; }
+  finalize_state(c);
+  collect_state(c, res);
+  return res;
+}
+
+// Entry points. The host variants read state through the evmvx_host_*
+// callbacks; the db variants read it from a StateDb and make no host calls.
+
+pub fn evmvx_transact(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
+  return transact_with(ctx_new(host, env), env);
+}
+
+pub fn evmvx_system_call(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
+  return system_call_with(ctx_new(host, env), env);
+}
+
+fn ctx_new_db(db: *mut StateDb, env: *mut VxEnv) -> *mut Ctx {
+  let c: *mut Ctx = ctx_new(null_i8(), env);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  cx.db = db;
+  return c;
+}
+
+pub fn evmvx_transact_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
+  return transact_with(ctx_new_db(db, env), env);
+}
+
+pub fn evmvx_system_call_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
+  return system_call_with(ctx_new_db(db, env), env);
+}
+
+fn is_null_tabs(t: *mut OpTabs) -> bool {
+  let p: *mut i8 = t;
+  return is_null_mut(p);
+}

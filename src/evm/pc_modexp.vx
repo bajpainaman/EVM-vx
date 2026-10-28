@@ -1,0 +1,96 @@
+// MODEXP precompile (0x05): EIP-198 (Byzantium), EIP-2565 (Berlin), EIP-7883 and
+// EIP-7823 (Osaka). Follows revm precompile/src/modexp.rs.
+
+// Copies n bytes starting at off of data (len bytes), zero padded past the end.
+fn padded_slice(data: *mut u8, len: u64, off: u64, n: u64) -> *mut u8 {
+  let out: *mut u8 = zalloc(n);
+  if off < len {
+    let mut avail: u64 = len - off;
+    if avail > n { avail = n; }
+    let src: *mut u8 = offset_mut(data, off as i64);
+    copy_bytes(out, src, avail);
+  }
+  return out;
+}
+
+fn modexp_iterations(mult: u64, exp_len: u64, highp: U256) -> u64 {
+  let bits: u64 = u256_bit_len(highp) as u64;
+  let mut it: u64 = 0u64;
+  if exp_len <= 32u64 {
+    if bits > 0u64 { it = bits - 1u64; }
+  } else {
+    let mut hb: u64 = bits;
+    if hb < 1u64 { hb = 1u64; }
+    it = sat_add(sat_mul(mult, exp_len - 32u64), hb - 1u64);
+  }
+  if it < 1u64 { it = 1u64; }
+  return it;
+}
+
+fn modexp_complexity(spec: u64, x: u64) -> U256 {
+  let xx: U256 = u256_mul(u256_from_u64(x), u256_from_u64(x));
+  if spec >= SPEC_OSAKA {
+    if x <= 32u64 { return u256_from_u64(16u64); }
+    let w: U256 = u256_from_u64(x / 8u64 + ((x % 8u64) + 7u64) / 8u64);
+    return u256_mul(u256_mul(w, w), u256_from_u64(2u64));
+  }
+  if spec >= SPEC_BERLIN {
+    let w: U256 = u256_from_u64(x / 8u64 + ((x % 8u64) + 7u64) / 8u64);
+    return u256_mul(w, w);
+  }
+  if x <= 64u64 { return xx; }
+  let xu: U256 = u256_from_u64(x);
+  if x <= 1024u64 {
+    return u256_sub(u256_add(u256_div(xx, u256_from_u64(4u64)), u256_mul(u256_from_u64(96u64), xu)), u256_from_u64(3072u64));
+  }
+  return u256_sub(u256_add(u256_div(xx, u256_from_u64(16u64)), u256_mul(u256_from_u64(480u64), xu)), u256_from_u64(199680u64));
+}
+
+fn pc_modexp(spec: u64, input: *mut u8, len: u64, gas_limit: u64, out: *mut PcOut) -> void {
+  let none: *mut u8 = null_u8();
+  let mut min_gas: u64 = 0u64;
+  let mut mult: u64 = 8u64;
+  let mut divisor: u64 = 20u64;
+  if spec >= SPEC_BERLIN { min_gas = 200u64; divisor = 3u64; }
+  if spec >= SPEC_OSAKA { min_gas = 500u64; mult = 16u64; divisor = 1u64; }
+  if min_gas > gas_limit { pc_set(out, PC_OOG, gas_limit, none, 0u64); return; }
+  let blw: U256 = u256_load_padded(input, len, 0u64);
+  let elw: U256 = u256_load_padded(input, len, 32u64);
+  let mlw: U256 = u256_load_padded(input, len, 64u64);
+  if !u256_fits_u64(blw) || !u256_fits_u64(mlw) {
+    pc_set(out, PC_ERROR, gas_limit, none, 0u64);
+    return;
+  }
+  let bl: u64 = blw.l0;
+  let ml: u64 = mlw.l0;
+  let el: u64 = u256_sat_u64(elw);
+  if spec >= SPEC_OSAKA && (bl > 1024u64 || ml > 1024u64 || el > 1024u64) {
+    pc_set(out, PC_ERROR, gas_limit, none, 0u64);
+    return;
+  }
+  // The data after the 96-byte header.
+  let mut dlen: u64 = 0u64;
+  if len > 96u64 { dlen = len - 96u64; }
+  let data: *mut u8 = offset_mut(input, 96i64);
+  let mut hn: u64 = el;
+  if hn > 32u64 { hn = 32u64; }
+  let mut highp: U256 = u256_zero();
+  if bl < dlen { highp = u256_load_be_n(data, dlen, bl, hn); }
+  let mut x: u64 = bl;
+  if ml > x { x = ml; }
+  let cplx: U256 = modexp_complexity(spec, x);
+  let g256: U256 = u256_div(u256_mul(cplx, u256_from_u64(modexp_iterations(mult, el, highp))), u256_from_u64(divisor));
+  let mut gas: u64 = u256_sat_u64(g256);
+  if gas < min_gas { gas = min_gas; }
+  if gas > gas_limit { pc_set(out, PC_OOG, gas_limit, none, 0u64); return; }
+  if bl == 0u64 && ml == 0u64 { pc_set(out, PC_OK, gas, zalloc(1u64), 0u64); return; }
+  let b: *mut u8 = padded_slice(data, dlen, 0u64, bl);
+  let e: *mut u8 = padded_slice(data, dlen, bl, el);
+  let m: *mut u8 = padded_slice(data, dlen, sat_add(bl, el), ml);
+  let o: *mut u8 = zalloc(ml);
+  modexp_bytes(b, bl, e, el, m, ml, o, ml);
+  mfree(b);
+  mfree(e);
+  mfree(m);
+  pc_set(out, PC_OK, gas, o, ml);
+}
