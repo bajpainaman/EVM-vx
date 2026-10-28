@@ -113,6 +113,7 @@ static uint8_t *carve(Heap *h, uint64_t total) {
 void *evx_malloc(uint64_t n) {
     if (n == 0) n = 1;
     if (n > MAX_CLASS_SIZE) {
+        if (n > UINT64_MAX - HDR) return NULL;
         uint8_t *p = (uint8_t *)malloc(n + HDR);
         if (!p) return NULL;
         ((uint64_t *)p)[0] = LARGE;
@@ -137,8 +138,10 @@ void *evx_malloc(uint64_t n) {
 }
 
 void *evx_calloc(uint64_t n, uint64_t size) {
-    uint64_t total = n * size;
+    uint64_t total;
+    if (__builtin_mul_overflow(n, size, &total)) return NULL;
     if (total > MAX_CLASS_SIZE) {
+        if (total > UINT64_MAX - HDR) return NULL;
         /* libc calloc maps fresh zero pages for big blocks and never touches
          * them; malloc + memset would fault in every page up front. */
         uint8_t *p = (uint8_t *)calloc(1, total + HDR);
