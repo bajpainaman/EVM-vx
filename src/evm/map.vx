@@ -9,6 +9,9 @@ struct Map {
   used: *mut u8,
   cap: u64,
   len: u64,
+  // MVCC replacement tables own their predecessors until readers stop.
+  // Ordinary mutable maps leave this null.
+  previous: *mut Map,
 }
 
 const MAP_NONE: u64 = 18446744073709551615u64;
@@ -139,13 +142,18 @@ fn map_len(m: *mut Map) -> u64 {
 }
 
 fn map_free(m: *mut Map) -> void {
-  let mr: &mut Map = unsafe { &mut m[0u64] };
-  let fa: *mut i8 = mr.ka;
-  let fb: *mut i8 = mr.kb;
-  let fv: *mut i8 = mr.vals;
-  let fu: *mut i8 = mr.used;
-  let fm: *mut i8 = m;
-  unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); vx_free(fm); }
+  let mut current: *mut Map = m;
+  while !is_null_mut(current) {
+    let mr: &mut Map = unsafe { &mut current[0u64] };
+    let previous: *mut Map = mr.previous;
+    let fa: *mut i8 = mr.ka;
+    let fb: *mut i8 = mr.kb;
+    let fv: *mut i8 = mr.vals;
+    let fu: *mut i8 = mr.used;
+    let fm: *mut i8 = current;
+    unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); vx_free(fm); }
+    current = previous;
+  }
 }
 
 // Clears the map in place; capacity and buffers stay.

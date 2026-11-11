@@ -10,6 +10,8 @@ mod ffi;
 mod host;
 mod pexec;
 mod pfuzz;
+#[cfg(test)]
+mod e2e;
 
 use ffi::*;
 use host::Host;
@@ -38,6 +40,7 @@ fn run_case(
     want_logs: B256,
     cache: &revm::database::CacheState,
 ) -> Outcome {
+    let pre = host;
     let mut host = host.clone();
     if host::db_mode() {
         host.attach_db();
@@ -45,7 +48,9 @@ fn run_case(
     let eb = env::build(spec, cfg, block, tx);
     let res = host.transact(&eb.env);
     let r = unsafe { &*res };
-    let outcome = match r.status {
+    // StateDb commit can replace code buffers referenced by the delta.
+    let observation = diff::enabled().then(|| diff::Observation::vx(r));
+    let mut outcome = match r.status {
         RES_HOST_FAILURE => Outcome::Fail(format!("host failure (reason {})", r.reason)),
         RES_INVALID_TX if expect_exception => Outcome::Pass,
         RES_INVALID_TX => Outcome::Fail(format!("unexpected invalid tx (reason {})", r.reason)),
@@ -68,6 +73,11 @@ fn run_case(
             }
         }
     };
+    if let Some(observation) = observation {
+        if let Err(e) = diff::check(pre, cfg, block, tx, &observation, &host) {
+            outcome = Outcome::Fail(e);
+        }
+    }
     unsafe { evmvx_result_free(res) };
     host.detach_db();
     outcome

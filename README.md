@@ -19,7 +19,7 @@ Block preparation, system calls, withdrawals, rewards, and receipt construction 
 
 ## Build and run a conflict test
 
-The first check runs generated blocks through **revm sequential, Vx sequential, and Vx parallel**. It compares transaction success flags, gas used, and final account/code/storage snapshots. Cases include shared senders and storage, transfers, reverts, nested calls, contract creation, and fee-recipient balance reads.
+The first check runs generated blocks through **revm sequential, Vx sequential, and Vx parallel**. It compares transaction status, gas/refund, full output, logs, created address/deployed code, and final account/code/storage snapshots. Cases include shared senders and storage, transfers, reverts, nested calls, contract creation, and fee-recipient balance reads.
 
 Prerequisites:
 
@@ -38,6 +38,12 @@ harness/target/release/evmvx-test pfuzz --blocks 200 --txs 64 --threads 8 --seed
 
 The build produces `build/libevmvx.a` and links it into `harness/target/release/evmvx-test`. A successful fuzzer run prints `revm == vx-seq == vx-par` and reports transaction, re-execution, and fee-recipient rerun counts. Its seed is reproducible; worker scheduling can change the re-execution counts.
 
+### Native end-to-end acceptance and ownership
+
+For native Cancun end-to-end acceptance, run `scripts/check-e2e.sh` from the repository root. It rebuilds O0/O2 with AST fallback disabled, checks success/REVERT/OOG, validation, exact gas/refunds and settlement through both state adapters, then differentially checks conflict blocks against pinned **revm 43.0.3**. Set `EVMVX_FIXTURES` to add runtime-supplied state-test JSON. See the [acceptance profile](docs/SPEC.md#native-transaction-acceptance-profile-2026-11-11) for compiler digest/provenance options, compared observations and limitations. This is not an evm2 benchmark or a full-EVM certification.
+
+`StateDb` transaction/system-call entry points reuse a database-owned context and fork-specific opcode tables; calls on one database must be exclusive and non-reentrant. Standalone results own their buffers and remain valid after database destruction. The [ownership contract](docs/SPEC.md#native-ownership-and-context-reuse) also covers callback mode, rollback, and the parallel executor's deferred reclamation.
+
 ## Run Ethereum fixtures
 
 Fixture fetching needs Python 3.12 or newer. The fetch script downloads EEST v5.4.0 develop/stable archives, a pinned Glamsterdam devnet archive, and the legacy tests into the directory you supply:
@@ -55,7 +61,7 @@ EVMVX_DB=1 harness/target/release/evmvx-test statetest build/fixtures/main/devel
 EVMVX_BLOCK=8 harness/target/release/evmvx-test btest build/fixtures/main/develop/fixtures/blockchain_tests/cancun
 ```
 
-`EVMVX_BLOCK` selects the worker count and attaches a StateDb. Eligible blocks use the parallel executor; invalid-block cases and aborted attempts use the sequential path. The runner prints parallel-block and fallback counts. `EVMVX_DIFF=1` adds a revm comparison when a state test's final state root differs.
+`EVMVX_BLOCK` selects the worker count and attaches a StateDb. Eligible blocks use the parallel executor; invalid-block cases and aborted attempts use the sequential path. The runner prints parallel-block and fallback counts. `EVMVX_DIFF=1` compares full transaction observations and persistent state with revm on every state-test case, in addition to fixture root checks.
 
 Check that the summary contains nonzero file and case counts: a missing fixture path can produce a zero-case run. State tests check expected invalidity, state roots, and logs hashes. Blockchain tests check gas and receipt roots where applicable, plus fixture post-state. Skip lists and fork exclusions are in [main.rs](harness/src/main.rs) and [bctest.rs](harness/src/bctest.rs).
 

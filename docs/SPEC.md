@@ -1,7 +1,87 @@
 # EVM-vx: execution and parallelism contract
 
-Status: **draft 0.1, for review; not an implemented or mechanically verified specification**.
+Status: **draft 0.1 design contract; native implementation acceptance is recorded below, not a mechanically verified specification**.
 Date: 2026-10-26. Project: [EVM-vx](https://github.com/bajpainaman/EVM-vx).
+
+## Native transaction acceptance profile (2026-11-11)
+
+The checkout already contains a sequential Vx EVM and a speculative block executor; this profile verifies that implementation rather than introducing another engine. It does not establish full EVM or consensus-client conformance. The focused default is **Cancun, chain ID 1, unsigned legacy execution transactions with a supplied sender**, sequential switch dispatch, four little-endian `u64` limbs per word, and pointer/scalar native ABI state. Signature recovery, wire encoding, networking and consensus are outside this transaction acceptance boundary. Environment and prestate are supplied at runtime, not embedded in the Vx compiler.
+
+`scripts/check-e2e.sh` builds native Vx at O0 and O2 with `VX_NO_AST_FALLBACK=1`, links the Rust harness, runs directed transactions through both host callbacks and the Vx in-memory `StateDb`, then runs four-worker conflict blocks. Transaction semantics, journal/rollback, storage/memory/stack gas and settlement execute in Vx; Rust supplies state, environments and the independent reference. No Python transaction model is used.
+
+The comparator is **revm 43.0.3**, pinned in `harness/Cargo.toml` and `Cargo.lock`, not evm2. The complete-state checker uses revm's `State`/`CacheState` state-test commit path, not a cache-entry approximation that loses the distinction between missing, touched-empty and untouched-empty accounts. Directed expectations also check gas/refunds and basefee burning/beneficiary tips independently of the reference. The test mutates gas, refund, status, full output bytes, logs, created address, balance, nonce, storage, code and account existence to ensure the checker rejects incorrect results.
+
+Observations include success/REVERT/halt/invalid category, **all** return/revert bytes, exact gas used and effective capped refund, ordered logs (address/topics/data), created address, code bytes/hash and complete balances/nonces/storage/account existence after commit. Successful CREATE keeps the existing Vx API convention: deployed code is exposed in the created account delta, while transaction output is empty. The comparator checks those entire deployment bytes separately against revm's CREATE output; it does not discard or truncate them. For valid transactions the status/gas/log observations cover receipt status, transaction gas and receipt-log contents; cumulative gas and bloom are derivable, but this harness does not claim to validate encoded receipts, transaction roots or receipt-trie construction.
+
+Directed cases cover a predeployed calldata-driven storage writer with 64-byte output and LOG1, REVERT and OOG after writes/logs, persistent nonce/fee settlement with reverted value/storage/logs, nonce/funding/intrinsic validation, zero/nonzero calldata charging, cold/warm reads and writes, dirty-slot refund cancellation/restoration and the one-fifth cap, the 2300-gas SSTORE sentry, stack underflow/1024/1025 boundaries, and exact/one-short memory gas at word and quadratic boundaries. A Prague calldata-floor case protects the refund result-field fix without changing the Cancun default.
+
+### Reproduce
+
+Run from the repository root:
+
+```sh
+VXC=/data/fast/vx-toolchain/vxc \
+VXC_BINARY=/data/fast/vx-toolchain/vx-compiler-fixes-build/target/debug/vxc \
+VXC_SHA256=bcdd182c2547da191e53c9df94eacc655988338c59b54ab674d05888ee4a281b \
+EVMVX_FIXTURES=/data/hdd/evm-fixtures/main/develop/fixtures/state_tests/cancun \
+scripts/check-e2e.sh
+```
+
+`VXC` selects a fixed compiler wrapper; `LLVM_BIN` selects LLVM tools (default `/usr/lib/llvm-22/bin`). `VXC_BINARY` identifies the actual executable rather than its wrapper; `VXC_SHA256` optionally verifies it. The script prints provenance and fails with a missing-tool diagnostic. The verified binary is Vx 0.0.3, matching the archived dc6a460-plus-local-fixes compiler digest above; its preserved source directory's Git worktree metadata points to a deleted `/tmp` checkout, so fresh source-revision verification is not claimed. Installed Vx 0.0.2 is not an accepted substitute. The build uses `--emit-llvm` MLIR → `mlir-translate` → native-target `opt` → PIC `llc`, **not** compiler-internal `-c`. Rust 1.93.0 builds the locked revm dependency graph here. Heavy Cargo work uses the runner's queue and at most four jobs.
+
+`EVMVX_FIXTURES` is optional and accepts an existing EEST/legacy state-test file or directory. These inputs supply real transaction/environment/prestate variations: `EVMVX_DIFF=1` now checks full observations and state on **every** case, in addition to fixture state/log roots, rather than only printing a diff after a failure. Files under the EEST Cancun directory also contain Prague/Osaka variants; their own fork IDs are honored rather than silently relabeled Cancun. The fixture download command/version remains in `scripts/fetch-fixtures.py`. Existing runner skip rules still apply; cases rejected while constructing the Rust transaction environment do not reach native execution.
+
+### Native ownership and context reuse
+
+- A `StateDb` owns one lazily allocated context for `evmvx_transact_db` and `evmvx_system_call_db`. These entry points require **exclusive, non-reentrant access to that database**, as do state mutations and destruction. Separate databases can execute independently. Block workers use independent contexts, not this cache; use the block API for parallel execution over a shared base.
+- Every standalone call clears its transaction state before returning, including error exits. Account/slot/access-list/transient maps, journal, refunds, logs and host-failure state cannot carry into the next transaction. Frame stacks and context capacities remain reusable high-water allocations until database destruction. The environment and its input buffers are borrowed only during the call; cached contexts do not retain the environment afterward.
+- Opcode tables belong to the standalone context and are reused only for the same fork. Selecting another fork frees and replaces them. A block owns its own immutable tables, borrowed by worker contexts and freed by `evmvx_block_free` after all workers stop.
+- A standalone `VxResult` owns its output, account/slot arrays, nonempty account-code copies and log payloads. It remains readable after later transactions, commits, code replacement and database/host destruction. Release it exactly once with `evmvx_result_free`. Results borrowed from `evmvx_block_result` instead belong to the block; do not free those individually.
+- Callback-mode entry points allocate an ephemeral context and destroy it before returning the independently owned result. Frames own their original output buffers; callers copy output before retiring a frame. CREATE/7702 code versions remain context-owned through journal rollback and are released after result collection/reset. Discarded log payloads are freed when their checkpoint reverts.
+- Multi-version entries borrow result code. Superseded results therefore stay alive until block destruction, not merely until replacement. Replaced MVCC hash tables likewise remain alive for lock-free readers; the current table owns its predecessor chain, reclaimed only after worker join. The host must keep the base database and block input environments alive throughout execution, join workers before finish/free, and stop using block results before block destruction.
+
+The CPU allocator intentionally retains mapped size-class chunks and orphaned thread heaps for reuse. Releasing every live engine allocation does **not** promise that RSS returns to its initial value or that every mapping is unmapped. Cached capacities and deliberately retained block versions are bounded by workload high-water state, not a fixed process-wide memory limit. Structured allocation-exhaustion recovery is still outside the verified contract.
+
+### Fresh evidence and timing
+
+Measurements were executed on `naman-linux`, local branch `vx-evm`, baseline HEAD `b3890ba1feb8bdf5e4281e3dd11e6e12f7edcbfe` plus the acceptance/refund-field and lifetime/reuse changes, before shipping. That baseline is distinct from `origin/main` at measurement time (`74ba1036c5fcb290c42b3b96503c36bc27321fab`).
+
+| Check | O0 | O2 |
+|---|---|---|
+| Focused native transaction/lifetime tests (suite covers both adapters) | 9 passed | 9 passed |
+| EEST Cancun-directory files, host adapter, full differential + fixture roots | 60 files / 4,425 cases passed | 60 files / 4,425 cases passed |
+| Same fixture run, Vx StateDb adapter | 4,425 cases passed | 4,425 cases passed |
+| Four-worker conflict blocks, seeds 1 and 8675309 | 400 blocks / 6,871 transactions passed | 400 blocks / 6,871 transactions passed |
+
+The first directed storage-writing success and REVERT both returned all 64 bytes at 27,717 gas; OOG consumed its 50,000-gas limit. The stronger checker reproduced a real result-field defect: clearing an originally nonzero slot settled at 21,206 gas correctly but exported refund zero instead of 4,800. `api.vx` now reports the already-applied effective capped refund; account settlement was not changed. The regression failed before this fix and passes afterward. The complete matrix command above exited zero. The intentionally ignored timing test is separate from correctness.
+
+Lifetime regressions retain complete results across code replacement, success/REVERT/OOG/invalid exits, London→Shanghai→London→Cancun table switches, system-call/transaction alternation, and database/host destruction. Injected storage-provider failures after a log allocation return Host Failure, publish no state/log delta, and permit a subsequent valid transaction. The Linux memory regression alternates successful and reverting storage writers with 4 KiB log payloads: after 2,000 warmups, another 10,000 transactions grow RSS by **0 bytes** on each adapter at O0 and O2. Its 8 MiB tolerance rejects transaction-proportional growth; against the pre-log-cleanup library it failed with **16 MiB** growth.
+
+Additional O2 link-time allocator checks track every engine allocation/free, poison freed payloads, and fail on nonzero live requested bytes at process exit. The nine directed tests, 4,425 state cases per adapter, 1,392 blockchain cases per adapter, four-worker blockchain execution (1,527 blocks), and 200 conflict blocks/3,441 transactions all passed with **zero live requested engine bytes after teardown**. Blockchain checks include fixture state/receipt roots; six transition cases retain the runner's existing skip policy. These diagnostics exposed and verified fixes for discarded-log buffers, empty-return-data temporaries, and unreclaimed replaced MVCC tables. They are not an address/thread sanitizer or a proof of all possible lifetimes. Instrumented timing is not used below.
+
+After correctness passed, run the following **alone**, leaving the O2 library produced by the matrix in place:
+
+```sh
+ETO_BUILD_JOBS=4 cargo test --locked --release --manifest-path harness/Cargo.toml -j4 \
+  native_tx_timing -- --ignored --nocapture --test-threads=1
+```
+
+The workload is 1,000 consecutive unsigned legacy transactions from one sender to a predeployed storage writer/word-returner, varying calldata and advancing nonce on each transaction. Both engines use preloaded in-memory state; Vx uses `StateDb` with no per-op host callback/FFI. Each sample resets the same prestate outside the timer. Environment preparation, process/compiler startup, database preload and reference-context construction are outside; transaction validation, intrinsic/dynamic gas, execution, fees/nonce settlement, native state commit and retaining the result are inside. Result normalization/checking/freeing and database teardown are outside for both. Both engines reuse execution contexts within a window; Vx's lazy context/table construction is included in the first transaction of each window. Windows are serialized and engine order alternates; two complete warmup windows precede ten measured windows. Every transaction's observations and each final committed account/slot are checked after timing. Vx is native-target O2, Rust/revm uses the repository's release profile and machine-local compiler defaults.
+
+| Engine | Run | Median per 1,000 tx | Min–max, ten samples |
+|---|---|---|---|
+| Vx, lifetime fixes + reuse | First | 0.738862 ms | 0.708741–0.885164 ms |
+| revm 43.0.3 | First | 1.665796 ms | 1.622208–1.794675 ms |
+| Vx, lifetime fixes + reuse | Repeat | 0.833206 ms | 0.752103–0.937303 ms |
+| revm 43.0.3 | Repeat | 1.868355 ms | 1.598273–2.172830 ms |
+
+Before these lifetime changes, initial acceptance measured Vx at 38.136749 ms versus revm at 1.684333 ms; later baseline profiling measured Vx medians of 34.095216–36.272226 ms on the same workload. Repeated construction and retained contexts, stacks and tables dominated that cost. The post-fix repeat process peaked at 13,760 KiB RSS versus roughly 941 MiB in baseline profiling. These are small-workload API measurements, not a general EVM ranking, block-throughput result or 20× claim. The Ryzen 9 5900X runner is shared (post-fix load averages 3.41/3.14/3.25); contention and different state representations limit attribution. Broader arithmetic/crypto/CREATE-heavy timings remain unmeasured.
+
+Raw initial evidence is in `.amp/in/artifacts/evm-e2e-20261111/` and profiling evidence in `.amp/in/artifacts/evm-profile-20261111/`. The final ownership runs are under `.amp/in/artifacts/evm-reuse-20261111/`: `acceptance-final-with-map-reclamation.log`, `poison-*-reclaimed*.log`, the failing `log-leak-negative-control.log`, and `timing-{final,repeat-final}-O2.log`. These are local review evidence, not tracked fixtures. Diagnostic wrappers are archived separately and removed from normal linkage before timing.
+
+### Limits
+
+The existing engine goes beyond this focused profile (nested CALL/CREATE, additional forks, precompiles and a parallel executor). Passing this profile is not certification of those complete surfaces. Pairing/KZG/BLS crypto uses the host's revm precompile provider, so those results are not independent all-Vx crypto verification. Host failures have a distinct result category and forced storage-provider errors are tested; forced crypto-provider failures and allocation exhaustion remain uncovered. The current allocator includes abort/null paths, so do not claim total structured OOM recovery. No new capability is disguised as EVM INVALID/OOG to make these tests pass. No GPU, full-chain replay or 20× claim follows from these results.
 
 ## 1. Direction
 
@@ -13,7 +93,7 @@ The proposed parallel design below is an ordered speculative executor. It is a r
 
 ### What this draft does not claim
 
-- No complete EVM, consensus client, scheduler model, or formal proof exists in these artifacts.
+- No complete EVM/consensus-client certification, mechanically checked scheduler model or formal proof is claimed by these artifacts.
 - No 20× EVM improvement has been demonstrated. Kernel ratios are not end-to-end speedups.
 - Passing Vx feasibility probes is not Ethereum conformance.
 - This draft is not fork-complete until the semantic profile and conformance matrix are filled in.
@@ -34,7 +114,7 @@ The profile must record fork name/activation rules, chain ID/configuration, enab
 
 ## 3. Scope and external boundary
 
-The initial target is an embeddable CPU execution library, not networking, consensus, a mempool, a database server, or a GPU EVM. A host supplies immutable execution context and state access; the engine returns an execution result and a state delta. Exact C ABI and allocation ownership remain open.
+The initial target is an embeddable CPU execution library, not networking, consensus, a mempool, a database server, or a GPU EVM. A host supplies immutable execution context and state access; the engine returns an execution result and a state delta. The current native ABI's allocation and reuse contract is recorded in the acceptance profile above; a stable cross-device ABI remains future work.
 
 Define two layers so a message interpreter is not mistaken for transaction or block execution:
 

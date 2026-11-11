@@ -35,6 +35,8 @@ struct StateDb {
   bn: u64,
   bcap: u64,
   bhash: *mut U256,
+  // Lazy serial transaction/system-call context, never used by block workers.
+  context: *mut Ctx,
 }
 
 fn db_new() -> *mut StateDb {
@@ -361,11 +363,13 @@ pub fn evmvx_db_balance_incr(db: *mut StateDb, addr: *mut U256, amount: *mut U25
 
 pub fn evmvx_db_free(db: *mut StateDb) -> void {
   let d: &mut StateDb = unsafe { &mut db[0u64] };
+  if !is_null_mut(d.context) { ctx_free(d.context); }
   let mut i: u64 = 0u64;
   while i < d.an {
     let mp: *mut DbAcct = db_meta(db, i);
     let m: &mut DbAcct = unsafe { &mut mp[0u64] };
     mfree(m.code);
+    mfree(m.jd);
     i = i + 1u64;
   }
   map_free(d.amap);

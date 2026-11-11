@@ -27,6 +27,13 @@ const BX_READY: u64 = 0u64;
 const BX_EXECUTED: u64 = 2u64;
 const BX_COMMITTED: u64 = 3u64;
 
+// Readers can still hold code from a superseded incarnation. Reclaim its
+// result only after all workers have stopped, along with the version store.
+struct RetiredResult {
+  result: *mut VxResult,
+  next: *mut RetiredResult,
+}
+
 struct BlockExec {
   db: *mut StateDb,
   mv: *mut MvMem,
@@ -39,6 +46,7 @@ struct BlockExec {
   status: *mut u64,
   incarnation: *mut u64,
   res: *mut PtrBox,
+  retired: *mut RetiredResult,
   fees: *mut U256,
   // Write-location log: per-tx segments into one shared array.
   wl: *mut u64,
@@ -265,12 +273,17 @@ fn bx_execute_ov(b: *mut BlockExec, c: *mut Ctx, i: u64, inc: u64, cb_exact: boo
   let cp: *mut u64 = bx.wl_count;
   unsafe { sp[i] = new_start; cp[i] = new_count; }
   limbs_free(seg);
-  // Free the previous incarnation's result; publish the new one.
+  // Re-execution holds commit_lock. Keep the old code alive for workers
+  // that already copied a version entry, then publish the new result.
   let rp: *mut PtrBox = bx.res;
   let rbox: &mut PtrBox = unsafe { &mut rp[i] };
   if !is_null_mut(rbox.p) {
-    let orp: *mut VxResult = rbox.p;
-    evmvx_result_free(orp);
+    let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<RetiredResult>() as u64) };
+    let old: *mut RetiredResult = raw;
+    let node: &mut RetiredResult = unsafe { &mut old[0u64] };
+    node.result = rbox.p;
+    node.next = bx.retired;
+    bx.retired = old;
   }
   let rr: *mut i8 = res;
   rbox.p = rr;
@@ -508,7 +521,8 @@ pub fn evmvx_block_aborted(b: *mut BlockExec) -> u64 {
 
 // Frees a finished block: results, the multi-version store and its versioned
 // entries, the arenas and the executor itself. The host calls it once it no
-// longer reads any result. Code buffers in entries are borrowed (never owned).
+// longer reads any result and all workers have stopped. Version entries
+// borrow code from final or retired results, which are reclaimed here.
 pub fn evmvx_block_free(b: *mut BlockExec) -> void {
   let bx: &mut BlockExec = unsafe { &mut b[0u64] };
   let mut i: u64 = 0u64;
@@ -522,6 +536,15 @@ pub fn evmvx_block_free(b: *mut BlockExec) -> void {
     i = i + 1u64;
   }
   mv_free(bx.mv);
+  let mut old: *mut RetiredResult = bx.retired;
+  while !is_null_mut(old) {
+    let node: &mut RetiredResult = unsafe { &mut old[0u64] };
+    let next: *mut RetiredResult = node.next;
+    evmvx_result_free(node.result);
+    let raw: *mut i8 = old;
+    unsafe { vx_free(raw); }
+    old = next;
+  }
   tabs_free(bx.tabs);
   limbs_free(bx.exec_cursor);
   limbs_free(bx.k);

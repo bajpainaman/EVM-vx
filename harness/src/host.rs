@@ -24,6 +24,8 @@ pub struct Host {
     /// Address of an attached Vx StateDb (EVMVX_DB=1 mode), or 0. When set,
     /// transactions run with a null host, so a stray callback would crash.
     pub db: usize,
+    #[cfg(test)]
+    pub fail_storage_reads: bool,
 }
 
 /// Frees an attached db. Hosts are only cloned before attach_db, so no two
@@ -241,6 +243,8 @@ pub extern "C" fn evmvx_host_account(host: *mut c_void, addr: *const Word, out: 
 #[no_mangle]
 pub extern "C" fn evmvx_host_storage(host: *mut c_void, addr: *const Word, key: *const Word, out: *mut Word) -> u64 {
     let host = unsafe { &*(host as *const Host) };
+    #[cfg(test)]
+    if host.fail_storage_reads { return HOST_ERROR; }
     let a = unsafe { *addr }.address();
     let k = unsafe { *key }.u256();
     let v = host

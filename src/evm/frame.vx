@@ -113,6 +113,19 @@ fn tabs_new(spec: u64) -> *mut OpTabs {
   return t;
 }
 
+// Block tables are borrowed. Standalone tables belong to the context and
+// are replaced when the caller selects a different fork.
+fn ctx_tabs(c: *mut Ctx, spec: u64) -> *mut OpTabs {
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if !is_null_mut(cx.tabs_shared) { return cx.tabs_shared; }
+  if is_null_mut(cx.tabs_owned) || cx.tabs_spec != spec {
+    if !is_null_mut(cx.tabs_owned) { tabs_free(cx.tabs_owned); }
+    cx.tabs_owned = tabs_new(spec);
+    cx.tabs_spec = spec;
+  }
+  return cx.tabs_owned;
+}
+
 fn frame_word(f: *mut Frame, i: u64) -> U256 {
   let fr: &mut Frame = unsafe { &mut f[0u64] };
   let w: *mut U256 = fr.words;
@@ -147,7 +160,7 @@ fn frame_new(code: *mut u8, code_len: u64, jd: *mut u8, gas: u64, input: *mut u8
   return f;
 }
 
-// Frees the frame's own buffers. The output buffer is returned to the caller first.
+// Callers copy output before retiring a frame; the frame owns its original.
 fn frame_free(f: *mut Frame) -> void {
   let fr: &mut Frame = unsafe { &mut f[0u64] };
   let st: *mut i8 = fr.stack;
@@ -155,6 +168,7 @@ fn frame_free(f: *mut Frame) -> void {
   unsafe { vx_free(st); vx_free(w); }
   mfree(fr.mem);
   mfree(fr.ret);
+  mfree(fr.out);
   let fp: *mut i8 = f;
   unsafe { vx_free(fp); }
 }
@@ -303,8 +317,10 @@ fn frame_put(c: *mut Ctx, f: *mut Frame) -> void {
   let fr: &mut Frame = unsafe { &mut f[0u64] };
   mfree(fr.mem);
   mfree(fr.ret);
+  mfree(fr.out);
   fr.mem = null_u8();
   fr.ret = null_u8();
+  fr.out = null_u8();
   let bp: *mut PtrBox = cx.fpool;
   let bx: &mut PtrBox = unsafe { &mut bp[cx.fpool_n] };
   let fp: *mut i8 = f;

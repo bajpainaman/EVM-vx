@@ -171,13 +171,16 @@ fn mv_map_insert(mp: *mut Map, a: U256, b: U256, v: u64) -> void {
 }
 
 // Grows a shard (under its exclusive lock): builds a doubled table privately,
-// then publishes it with one release store. The old table stays valid.
+// then publishes it with one release store. The old table stays valid until
+// mv_free, after all workers have stopped; the new table owns that chain.
 fn mv_map_grow(m: *mut MvMem, is_acct: bool, a: U256) -> *mut Map {
   let bp: *mut PtrBox = mv_map_box(m, is_acct, a);
   let bx: &mut PtrBox = unsafe { &mut bp[0u64] };
   let old: *mut Map = bx.p;
   let om: &mut Map = unsafe { &mut old[0u64] };
   let nm: *mut Map = mv_map_new_cap(om.cap * 2u64);
+  let next: &mut Map = unsafe { &mut nm[0u64] };
+  next.previous = old;
   let mut j: u64 = 0u64;
   let oka: *mut U256 = om.ka;
   let okb: *mut U256 = om.kb;

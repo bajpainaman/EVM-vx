@@ -79,8 +79,15 @@ struct Ctx {
   coinbase_fee: *mut U256,
   // Scratch MvEntry for block-mode reads (one per Ctx, not one per read).
   mv_scratch: *mut MvEntry,
-  // Opcode tables shared across a block (block mode); null means build own.
+  // Block tables are borrowed; standalone tables are context-owned.
   tabs_shared: *mut OpTabs,
+  tabs_owned: *mut OpTabs,
+  tabs_spec: u64,
+  // Every code buffer installed by CREATE/7702 stays alive through journal
+  // rollback. The context releases them together after collecting the result.
+  owned_code: *mut PtrBox,
+  owned_code_n: u64,
+  owned_code_cap: u64,
   // Block mode: set when the transaction loads the coinbase account. The
   // committer then re-executes it with cb_ov (the exact coinbase account,
   // fees folded in) when cb_ov_on is 1; cb_ov_exists 0 means missing.
@@ -399,7 +406,12 @@ fn log_len(c: *mut Ctx) -> u64 {
 fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
   let sd: bool = spec_on(c, SPEC_SPURIOUS_DRAGON);
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  cx.lg_n = ln;
+  while cx.lg_n > ln {
+    cx.lg_n = cx.lg_n - 1u64;
+    let lp: *mut LogMeta = offset_mut(cx.lg_meta, cx.lg_n as i64);
+    let l: &mut LogMeta = unsafe { &mut lp[0u64] };
+    mfree(l.data);
+  }
   while cx.j_n > jn {
     let k: u64 = cx.j_n - 1u64;
     let jp: *mut JEntry = cx.j;
@@ -442,6 +454,7 @@ fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
       acc_set_hash_raw(c, a, v);
       let mp: *mut AcctMeta = acc_meta(c, a);
       let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
+      if m.jd_shared == 0u64 { mfree(m.jd); }
       m.code = e.p;
       m.code_len = e.n;
       let none: *mut u8 = null_u8();
@@ -658,9 +671,22 @@ fn acc_bump_nonce(c: *mut Ctx, i: u64) -> bool {
 
 fn acc_set_code(c: *mut Ctx, i: u64, hash: U256, code: *mut u8, len: u64) -> void {
   acc_touch(c, i);
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  if cx.owned_code_n == cx.owned_code_cap {
+    let mut nc: u64 = cx.owned_code_cap * 2u64;
+    if nc == 0u64 { nc = 8u64; }
+    let raw: *mut i8 = cx.owned_code;
+    cx.owned_code = realloc_raw(raw, nc * (sizeof<PtrBox>() as u64));
+    cx.owned_code_cap = nc;
+  }
+  let cp: *mut PtrBox = cx.owned_code;
+  let cb: &mut PtrBox = unsafe { &mut cp[cx.owned_code_n] };
+  cb.p = code;
+  cx.owned_code_n = cx.owned_code_n + 1u64;
   let mp: *mut AcctMeta = acc_meta(c, i);
   let m: &mut AcctMeta = unsafe { &mut mp[0u64] };
   journal_push(c, J_CODE_CHANGE, i, 0u64, 0u64, acc_hash(c, i), m.code, m.code_len);
+  if m.jd_shared == 0u64 { mfree(m.jd); }
   m.code = code;
   m.code_len = len;
   let none: *mut u8 = null_u8();
@@ -976,8 +1002,8 @@ fn finalize_state(c: *mut Ctx) -> void {
 
 // Resets a Ctx for the next transaction in a block: frees per-transaction
 // owned buffers (jumpdest tables, log payloads), clears counters and maps,
-// and keeps every capacity. CREATE-deployed code copies leak here, exactly as
-// they do when a Ctx is dropped today.
+// and keeps every capacity. Code copies belong to the context, including
+// versions no longer reachable after journal rollback. Null env is teardown.
 fn ctx_reset(c: *mut Ctx, env: *mut VxEnv) -> void {
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
   let mut i: u64 = 0u64;
@@ -987,6 +1013,15 @@ fn ctx_reset(c: *mut Ctx, env: *mut VxEnv) -> void {
     if m.jd_shared == 0u64 { mfree(m.jd); }
     i = i + 1u64;
   }
+  i = 0u64;
+  while i < cx.owned_code_n {
+    let cp: *mut PtrBox = cx.owned_code;
+    let cb: &mut PtrBox = unsafe { &mut cp[i] };
+    let raw: *mut i8 = cb.p;
+    unsafe { vx_free(raw); }
+    i = i + 1u64;
+  }
+  cx.owned_code_n = 0u64;
   i = 0u64;
   while i < cx.lg_n {
     let lp: *mut LogMeta = offset_mut(cx.lg_meta, i as i64);
@@ -1013,8 +1048,10 @@ fn ctx_reset(c: *mut Ctx, env: *mut VxEnv) -> void {
   map_reset(cx.almap);
   map_reset(cx.almap_slots);
   cx.env = env;
-  let e: &mut VxEnv = unsafe { &mut env[0u64] };
-  cx.spec = e.spec;
+  if !is_null_mut(env) {
+    let e: &mut VxEnv = unsafe { &mut env[0u64] };
+    cx.spec = e.spec;
+  }
 }
 
 fn free_words(p: *mut U256) -> void { let r: *mut i8 = p; unsafe { vx_free(r); } }
@@ -1023,9 +1060,7 @@ fn free_words(p: *mut U256) -> void { let r: *mut i8 = p; unsafe { vx_free(r); }
 // per-transaction buffers (jump tables, log payloads) go through ctx_reset's
 // rules first.
 fn ctx_free(c: *mut Ctx) -> void {
-  let c0: &mut Ctx = unsafe { &mut c[0u64] };
-  let env: *mut VxEnv = c0.env;
-  ctx_reset(c, env);
+  ctx_reset(c, null_i8());
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
   let mut i: u64 = 0u64;
   while i < cx.fpool_n {
@@ -1058,6 +1093,9 @@ fn ctx_free(c: *mut Ctx) -> void {
   map_free(cx.tmap);
   map_free(cx.almap);
   map_free(cx.almap_slots);
+  if !is_null_mut(cx.tabs_owned) { tabs_free(cx.tabs_owned); }
+  let codes: *mut i8 = cx.owned_code;
+  unsafe { vx_free(codes); }
   let p0: *mut i8 = cx.cb_ov;
   unsafe { vx_free(p0); }
   let p1: *mut i8 = cx.mv_scratch;

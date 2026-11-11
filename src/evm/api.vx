@@ -208,9 +208,12 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
         }
         s = s + 1u64;
       }
+      let mut code: *mut u8 = null_u8();
+      let code_len: u64 = acc_code_len(c, i);
+      if code_len > 0u64 { code = dup_bytes(acc_code(c, i), code_len); }
       unsafe {
         accs[ai] = OutAccount { address: acc_addr(c, i), balance: acc_bal(c, i), nonce: acc_nonce(c, i),
-                                code_hash: acc_hash(c, i), code: acc_code(c, i), code_len: acc_code_len(c, i),
+                                code_hash: acc_hash(c, i), code: code, code_len: code_len,
                                 flags: acc_flags(c, i), slot_start: start, slot_count: so - start };
       }
       ai = ai + 1u64;
@@ -243,9 +246,7 @@ fn collect_state(c: *mut Ctx, res: *mut VxResult) -> void {
 
 fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let e: &mut VxEnv = unsafe { &mut env[0u64] };
-  let cxt: &mut Ctx = unsafe { &mut c[0u64] };
-  let mut tabs: *mut OpTabs = cxt.tabs_shared;
-  if is_null_tabs(tabs) { tabs = tabs_new(e.spec); }
+  let tabs: *mut OpTabs = ctx_tabs(c, e.spec);
   let res: *mut VxResult = result_alloc();
   let r: &mut VxResult = unsafe { &mut res[0u64] };
 
@@ -273,7 +274,7 @@ fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let mut gas_left: u64 = 0u64;
   let mut refund: i64 = 0i64;
   let mut result: u64 = R_STOP;
-  let mut out: *mut u8 = zalloc(1u64);
+  let mut out: *mut u8 = null_u8();
   let mut out_len: u64 = 0u64;
   let mut created_addr: U256 = u256_zero();
   let mut auth_refund: u64 = 0u64;
@@ -313,7 +314,7 @@ fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   if e.spec >= SPEC_PRAGUE {
     let fl: u64 = floor_gas(c, env);
     let used: u64 = e.gas_limit - final_left;
-    if used < fl { final_left = e.gas_limit - fl; }
+    if used < fl { final_left = e.gas_limit - fl; rf = 0i64; }
   }
 
   // Reimburse the caller for the unused gas.
@@ -340,6 +341,9 @@ fn transact_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let gas_used: u64 = e.gas_limit - final_left;
   r.gas_used = gas_used;
   r.gas_refunded = 0u64;
+  // Report the capped effective refund already used by settlement, not the
+  // temporary frame refund bit pattern (nor an unconditional zero).
+  if rf > 0i64 { r.gas_refunded = rf as u64; }
   r.output = out;
   r.output_len = out_len;
   r.created_address = U256 { l0: created_addr.l0, l1: created_addr.l1, l2: created_addr.l2, l3: created_addr.l3 };
@@ -494,6 +498,13 @@ fn run_tx_create(c: *mut Ctx, env: *mut VxEnv, caller_idx: u64, gas: u64, tabs: 
 pub fn evmvx_result_free(res: *mut VxResult) -> void {
   let r: &mut VxResult = unsafe { &mut res[0u64] };
   mfree(r.output);
+  let accs: *mut OutAccount = r.accounts;
+  let mut ai: u64 = 0u64;
+  while ai < r.account_count {
+    let a: &mut OutAccount = unsafe { &mut accs[ai] };
+    mfree(a.code);
+    ai = ai + 1u64;
+  }
   // The result owns a copy of each log's data (the Ctx's buffers are reused
   // across transactions by the block executor).
   let lp: *mut OutLog = r.logs;
@@ -530,7 +541,7 @@ pub fn evmvx_abi_sizes(out: *mut u64) -> void {
 // EIP-7251.
 fn system_call_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
   let e: &mut VxEnv = unsafe { &mut env[0u64] };
-  let tabs: *mut OpTabs = tabs_new(e.spec);
+  let tabs: *mut OpTabs = ctx_tabs(c, e.spec);
   let res: *mut VxResult = result_alloc();
   let r: &mut VxResult = unsafe { &mut res[0u64] };
   let caller_idx: u64 = acc_load(c, e.caller);
@@ -552,11 +563,17 @@ fn system_call_with(c: *mut Ctx, env: *mut VxEnv) -> *mut VxResult {
 // callbacks; the db variants read it from a StateDb and make no host calls.
 
 pub fn evmvx_transact(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
-  return transact_with(ctx_new(host, env), env);
+  let c: *mut Ctx = ctx_new(host, env);
+  let res: *mut VxResult = transact_with(c, env);
+  ctx_free(c);
+  return res;
 }
 
 pub fn evmvx_system_call(host: *mut i8, env: *mut VxEnv) -> *mut VxResult {
-  return system_call_with(ctx_new(host, env), env);
+  let c: *mut Ctx = ctx_new(host, env);
+  let res: *mut VxResult = system_call_with(c, env);
+  ctx_free(c);
+  return res;
 }
 
 fn ctx_new_db(db: *mut StateDb, env: *mut VxEnv) -> *mut Ctx {
@@ -567,14 +584,28 @@ fn ctx_new_db(db: *mut StateDb, env: *mut VxEnv) -> *mut Ctx {
 }
 
 pub fn evmvx_transact_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
-  return transact_with(ctx_new_db(db, env), env);
+  let c: *mut Ctx = db_context(db, env);
+  let res: *mut VxResult = transact_with(c, env);
+  ctx_reset(c, null_i8());
+  return res;
 }
 
 pub fn evmvx_system_call_db(db: *mut StateDb, env: *mut VxEnv) -> *mut VxResult {
-  return system_call_with(ctx_new_db(db, env), env);
+  let c: *mut Ctx = db_context(db, env);
+  let res: *mut VxResult = system_call_with(c, env);
+  ctx_reset(c, null_i8());
+  return res;
 }
 
-fn is_null_tabs(t: *mut OpTabs) -> bool {
-  let p: *mut i8 = t;
-  return is_null_mut(p);
+// A StateDb owns one serial-use context. Block workers never use this cache:
+// they allocate independent contexts and borrow the block's opcode tables.
+fn db_context(db: *mut StateDb, env: *mut VxEnv) -> *mut Ctx {
+  let d: &mut StateDb = unsafe { &mut db[0u64] };
+  if is_null_mut(d.context) { d.context = ctx_new_db(db, env); }
+  let c: *mut Ctx = d.context;
+  let cx: &mut Ctx = unsafe { &mut c[0u64] };
+  let e: &mut VxEnv = unsafe { &mut env[0u64] };
+  cx.env = env;
+  cx.spec = e.spec;
+  return c;
 }

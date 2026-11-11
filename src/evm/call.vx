@@ -271,7 +271,6 @@ fn take_child(c: *mut Ctx, child: *mut Frame, res: u64) -> *mut ChildOut {
   if r_is_ok(res) { r.refund = cf.refund; }
   r.out = dup_bytes(cf.out, cf.out_len);
   r.out_len = cf.out_len;
-  mfree(cf.out);
   frame_put(c, child);
   return o;
 }
@@ -303,7 +302,7 @@ fn resume_parent(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -
 // return data. `_result` records why for readability.
 fn finish_call(c: *mut Ctx, f: *mut Frame, o: *mut ChildOut, ok: bool, child_gas: u64, out_off: u64, out_len: u64, _result: u64) -> void {
   frame_add_gas(f, child_gas);
-  set_return_data(f, zalloc(1u64), 0u64);
+  set_return_data(f, null_u8(), 0u64);
   stack_push(f, u256_from_bool(ok));
 }
 
@@ -361,7 +360,7 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
   // Depth or insufficient balance: push 0, return the child gas, keep nonce.
   if frame_depth(f) + 1u64 > CALL_DEPTH_LIMIT || u256_lt(acc_bal(c, caller_idx), value) {
     frame_add_gas(f, child_gas);
-    set_return_data(f, zalloc(1u64), 0u64);
+    set_return_data(f, null_u8(), 0u64);
     stack_push(f, u256_zero());
     mfree(init);
     return R_CONTINUE;
@@ -370,7 +369,7 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
   let old_nonce: u64 = acc_nonce(c, caller_idx);
   if !acc_bump_nonce(c, caller_idx) {
     frame_add_gas(f, child_gas);
-    set_return_data(f, zalloc(1u64), 0u64);
+    set_return_data(f, null_u8(), 0u64);
     stack_push(f, u256_zero());
     mfree(init);
     return R_CONTINUE;
@@ -388,7 +387,7 @@ fn op_create(c: *mut Ctx, f: *mut Frame, is2: bool) -> u64 {
   let err: u64 = create_account(c, caller_idx, created_idx, value);
   if err != 0u64 {
     journal_revert(c, jn, ln);
-    set_return_data(f, zalloc(1u64), 0u64);
+    set_return_data(f, null_u8(), 0u64);
     // Collision consumes the child gas; funds/overflow are caught above.
     stack_push(f, u256_zero());
     mfree(init);
@@ -430,7 +429,6 @@ fn resume_create(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -
   let outp: *mut u8 = dup_bytes(cf.out, cf.out_len);
   let outl: u64 = cf.out_len;
   let cinput: *mut u8 = cf.input;
-  mfree(cf.out);
   frame_put(c, child);
   mfree(cinput);
   mfree(jd);
@@ -448,7 +446,7 @@ fn resume_create(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -
     frame_add_gas(f, deposit_left);
     add_refund(f, refund);
     // Successful create returns no data; revert data is set below only on revert.
-    set_return_data(f, zalloc(1u64), 0u64);
+    set_return_data(f, null_u8(), 0u64);
     stack_push(f, created);
   } else {
     journal_revert(c, jn, ln);
@@ -456,7 +454,7 @@ fn resume_create(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -
       frame_add_gas(f, gas_left);
       set_return_data(f, outp, outl);
     } else {
-      set_return_data(f, zalloc(1u64), 0u64);
+      set_return_data(f, null_u8(), 0u64);
     }
     stack_push(f, u256_zero());
   }

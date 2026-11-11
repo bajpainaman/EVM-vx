@@ -4,9 +4,11 @@
 //! conditional reverter, coinbase tips, BALANCE reads of other accounts and of
 //! the coinbase, nested calls, CREATE plus calls to the new contract) and runs
 //! each block three ways: revm sequential, Vx sequential, Vx parallel. Final
-//! state and every transaction's status and gas must match exactly.
+//! state and every transaction's status, gas/refund, full output, logs and
+//! created address must match exactly.
 
 use crate::env;
+use crate::diff::Observation;
 use crate::ffi::*;
 use crate::host::Host;
 use revm::context::{cfg::CfgEnv, BlockEnv, TxEnv};
@@ -224,7 +226,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
             let mut evm = Context::mainnet().with_block(block.clone()).with_cfg(cfg.clone()).with_db(&mut rdb).build_mainnet();
             for t in &txs {
                 match evm.transact_commit(t.clone()) {
-                    Ok(r) => rgas.push((r.is_success(), r.tx_gas_used())),
+                    Ok(r) => rgas.push(Observation::reference(&r)),
                     Err(e) => return Err(format!("block {bi}: revm rejected a tx: {e}")),
                 }
             }
@@ -244,7 +246,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
             if r.status == RES_INVALID_TX || r.status == RES_HOST_FAILURE {
                 return Err(format!("block {bi}: vx-seq status {} reason {}", r.status, r.reason));
             }
-            sgas.push((r.status == RES_SUCCESS, r.gas_used));
+            sgas.push(Observation::vx(r));
             hs.commit(r);
             unsafe { evmvx_result_free(res) };
         }
@@ -266,7 +268,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
         let mut pgas = Vec::new();
         for i in 0..n {
             let r = unsafe { &*evmvx_block_result(b, i as u64) };
-            pgas.push((r.status == RES_SUCCESS, r.gas_used));
+            pgas.push(Observation::vx(r));
             hp.commit_excluding(r, None);
         }
         let mut tail = Word::default();
@@ -275,7 +277,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
         reexecs += unsafe { evmvx_block_reexecs(b) };
         cbtx += unsafe { evmvx_block_coinbase_txs(b) };
 
-        // Every transaction: same status and gas on all three.
+        // Every transaction: all exposed observations agree on all three.
         for i in 0..n {
             if rgas[i] != sgas[i] || sgas[i] != pgas[i] {
                 return Err(format!(
