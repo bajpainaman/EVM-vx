@@ -89,6 +89,37 @@ def boundary_values():
     return sorted(x & MASK for x in v)
 
 
+def division_cases(smoke):
+    """Full-width numerators, narrow-divisor boundaries and correction cases."""
+    base = 1 << 64
+    divisors = [0, 1, 2, base - 1, base, base + 1,
+                (1 << 80) + 13, (1 << 127) - 1, 1 << 127, (1 << 128) - 1]
+    # The first product needs two quotient-estimate corrections; the second
+    # reaches the saturated estimate. Expectations still come only from ints.
+    d = (1 << 127) + base - 1
+    pairs = [((base - 2) * d - 1, d), ((base - 1) * d - 1, d)]
+    for d in divisors:
+        for a in [0, 1, (1 << 128) - 1, 1 << 128, (1 << 192) + base + 7, MASK]:
+            pairs.append((a, d))
+        for q in [1, base - 3, base - 1, base, base + 1, (1 << 128) - 1]:
+            for r in [0, 1, max(0, d - 1)]:
+                a = q * d + r
+                if a <= MASK:
+                    pairs.append((a, d))
+    rng = random.Random(SEED ^ 0xD1_128)
+    for _ in range(100 if smoke else 5000):
+        a = rng.getrandbits(rng.choice((129, 140, 191, 192, 255, 256)))
+        b = rng.getrandbits(rng.choice((1, 60, 64, 65, 80, 96, 127, 128)))
+        pairs.append((a, b))
+    for op in (0x04, 0x05, 0x06, 0x07):
+        for a, b in pairs:
+            yield op, a, b, 0
+            if op in (0x05, 0x07):
+                yield op, (-a) & MASK, b, 0
+                yield op, a, (-b) & MASK, 0
+                yield op, (-a) & MASK, (-b) & MASK, 0
+
+
 def cases(smoke):
     rng = random.Random(SEED)
     values = boundary_values()
@@ -104,6 +135,7 @@ def cases(smoke):
             # Mix widths so random cases also exercise small-operand fast paths.
             a, b, c = (rng.getrandbits(rng.choice((8, 64, 128, 200, 256))) for _ in range(3))
             out.append((op, a, b, c))
+    out.extend(division_cases(smoke))
     return out
 
 

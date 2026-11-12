@@ -195,6 +195,69 @@ pub fn u512_rem(w: U512, m: U256) -> U256 {
   return r;
 }
 
+// Full-width numerator divided by one limb. The carried remainder is below
+// d, so each 128-by-64 step has a quotient that fits in one limb.
+fn divrem_u64(a: U256, d: u64, want_rem: bool) -> U256 {
+  let mut q = u256_zero();
+  let mut r: u128 = 0u128;
+  let mut i: i32 = 3;
+  while i >= 0 {
+    let x: u128 = (r << 64u128) | (u256_limb(a, i) as u128);
+    q = set_limb(q, i, (x / (d as u128)) as u64);
+    r = x % (d as u128);
+    i = i - 1;
+  }
+  if want_rem { return u256_from_u64(r as u64); }
+  return q;
+}
+
+// Knuth's normalized two-limb division. After each digit r < d; appending
+// the next numerator limb gives a three-limb value with a one-limb quotient.
+fn divrem_u128(a: U256, b: U256, want_rem: bool) -> U256 {
+  let shift: u64 = (64 - u64_bit_len(b.l1)) as u64;
+  let d: u128 = ((b.l0 as u128) | ((b.l1 as u128) << 64u128)) << (shift as u128);
+  let hi: u128 = d >> 64u128;
+  let lo: u128 = (d as u64) as u128;
+  let base: u128 = 1u128 << 64u128;
+  let n = u256_shl(a, u256_from_u64(shift));
+  let mut r: u128 = 0u128;
+  // Normalization can produce a fifth limb. Avoid a shift by 64 at shift=0.
+  if shift != 0u64 { r = (a.l3 >> (64u64 - shift)) as u128; }
+  let mut q = u256_zero();
+  let mut i: i32 = 3;
+  while i >= 0 {
+    let next: u128 = u256_limb(n, i) as u128;
+    let mut digit: u128 = base - 1u128;
+    let mut trial: u128 = ((r as u64) as u128) + hi;
+    // r's high limb can equal hi: then r/hi may not fit a quotient limb.
+    if (r >> 64u128) != hi {
+      digit = r / hi;
+      trial = r % hi;
+    }
+    // The normalized estimate is at most two too large. A trial remainder
+    // of at least base makes the comparison false without overflowing u128.
+    while trial < base && digit * lo > ((trial << 64u128) | next) {
+      digit = digit - 1u128;
+      trial = trial + hi;
+    }
+    let p0: u128 = digit * lo;
+    let p1: u128 = digit * hi + (p0 >> 64u128);
+    // Subtract the exact product using explicit borrows, not wrapping u128
+    // intermediates. The high limb cancels because the corrected digit is exact.
+    let t0: u128 = base + next - ((p0 as u64) as u128);
+    let borrow: u128 = 1u128 - (t0 >> 64u128);
+    let t1: u128 = base + ((r as u64) as u128) - ((p1 as u64) as u128) - borrow;
+    r = (((t1 as u64) as u128) << 64u128) | ((t0 as u64) as u128);
+    q = set_limb(q, i, digit as u64);
+    i = i - 1;
+  }
+  if want_rem {
+    r = r >> (shift as u128);
+    return U256 { l0: r as u64, l1: (r >> 64u128) as u64, l2: 0u64, l3: 0u64 };
+  }
+  return q;
+}
+
 // Unsigned division. DIV and MOD by zero return zero.
 pub fn u256_divrem(a: U256, b: U256, want_rem: bool) -> U256 {
   if u256_is_zero(b) { return u256_zero(); }
@@ -210,6 +273,9 @@ pub fn u256_divrem(a: U256, b: U256, want_rem: bool) -> U256 {
     if want_rem { v = x % y; }
     return U256 { l0: v as u64, l1: (v >> 64u128) as u64, l2: 0u64, l3: 0u64 };
   }
+  // Small divisors remain cheap even when the numerator spans all four limbs.
+  if (b.l1 | b.l2 | b.l3) == 0u64 { return divrem_u64(a, b.l0, want_rem); }
+  if (b.l2 | b.l3) == 0u64 { return divrem_u128(a, b, want_rem); }
   let mut q = u256_zero();
   let mut r = u256_zero();
   let mut i: i32 = 255;
