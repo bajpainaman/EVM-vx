@@ -1,8 +1,10 @@
 # EVM-vx matched native probes: combined findings
 
-Date: 2026-10-26. Research artifacts, not a production EVM or 20× claim.
+Snapshot date: 2026-10-26. Historical kernel experiments, not a production EVM or 20× claim.
 
-**Publication note:** this document summarizes executed local experiments. Raw sources, samples, logs, compiler patches and binaries remain in the author's research archive and are not included in this documentation-only repository. Public source and compiler issue citations are in the [feasibility report](feasibility.md). This checkout alone is not a reproducible benchmark package.
+**Current repository status (2026-11-12):** native EVM transactions, lifetime/context reuse and nine compiled Solidity workloads have since been verified against revm 43.0.3. Use the [current benchmark command](../../README.md#representative-contract-benchmarks) and [transaction results with timing boundaries and spread](../SPEC.md#representative-compiled-contract-benchmarks-2026-11-12). Transfers are near parity in those runs, while compounding is about 10× slower. These are different workloads and ratios from the C/Vx kernel experiments below; none establishes a general EVM speedup.
+
+**Publication note:** this document preserves the original local kernel experiments and their then-open next steps. Raw sources, samples, logs, compiler patches and binaries for those probes remain in the author's research archive and are not bundled here. Public source and compiler issue citations are in the [feasibility report](feasibility.md). The newer engine harness and contract bytecode are checked in, but still require the externally supplied fixed Vx toolchain.
 
 ## Decision summary
 
@@ -86,6 +88,6 @@ The preserved local smoke checks the compiler hash, runs arithmetic correctness 
 4. Compare equivalent optimized low-product algorithms and realistic arithmetic mixes under quieter host conditions; retain raw spreads rather than cherry-picking the best ratio.
 5. Measure ordered transaction parallelism with independent and conflicting state access, counting validation, retries, serial fallback, state I/O and commitment costs. Existing native worker overlap is feasibility evidence, not scheduler throughput.
 
-The measurement pass produced research artifacts only, not a product EVM. This repository publishes the documentation, not the compiler build or experiment binaries.
+That measurement pass produced research artifacts only, not an EVM. The repository now contains the later native engine and its separate acceptance/benchmark harness; it still does not bundle the fixed compiler build or original probe binaries.
 
-Next: review the [draft specification's open decisions](../SPEC.md#12-open-decisions-before-implementation-acceptance) before selecting the implementation strategy.
+For current execution, use the [README build and test instructions](../../README.md). The original [draft specification's open decisions](../SPEC.md#12-open-decisions-before-implementation-acceptance) remain historical design context; the focused Cancun profile and measured transaction workloads are recorded above that draft.

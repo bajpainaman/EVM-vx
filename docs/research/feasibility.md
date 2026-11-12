@@ -1,10 +1,12 @@
 # EVM in Vx: consolidated findings
 
-**Date:** 2026-10-26. **Status:** research and feasibility experiments completed, two compiler fixes implemented locally. No product EVM is implemented.
+**Snapshot date:** 2026-10-26. **Status at that date:** research and feasibility experiments completed, two compiler fixes implemented locally; no product EVM was implemented.
+
+**Current repository status (2026-11-12):** the repository now contains a native sequential EVM, StateDb, a speculative block executor, lifetime/context-reuse fixes, and compiled-contract differential benchmarks against revm 43.0.3. See the [README](../../README.md), [native acceptance and ownership contract](../SPEC.md#native-transaction-acceptance-profile-2026-11-11), and [representative contract results](../SPEC.md#representative-compiled-contract-benchmarks-2026-11-12). The sections below preserve the original research findings, outstanding work and delivery state as of the snapshot; they are not the current implementation checklist.
 
 This document consolidates the source investigation, five executed probes, compiler fixes, final coverage update, packaging evidence, and remaining decisions. Earlier reports remain available as historical evidence. Their original failures must not be confused with the locally fixed results below.
 
-**Publication note:** this is the feasibility snapshot from before the matched timing pass. See [performance findings](performance.md) for the subsequent measurements and the [draft spec](../SPEC.md) for the proposed contract. Raw experiment sources, logs, compiler binaries, and patches remain in the author's local research archive; they are not included in this documentation-only repository snapshot. Reported execution results are not independently reproducible from this checkout alone.
+**Publication note:** this feasibility snapshot predates the matched kernel timing pass. See [historical performance findings](performance.md) for those measurements. Raw sources, logs, compiler binaries and patches for the original probes remain in the author's local research archive; those probe assets are not bundled here. This limits reproduction of the historical probes, not the newer engine harness: current native build/test/benchmark commands and fixed-toolchain requirements are documented in the [README](../../README.md).
 
 ## 1. Bottom line
 
@@ -340,7 +342,7 @@ The author's local research archive retains the shared protocol, five probe spec
 
 Public source citations above refer to the exact upstream pin. The compiler issue reports in section 8 contain public reproducer and verification details. The tests described here require the recorded source pin plus the local fixes; a stock compiler with the same version string is not equivalent.
 
-The original smoke retains the original compiler failures. Fixed-compiler reruns are separate evidence, not rewrites of the original results. There is no portable build/test command in this repository yet; publishing a self-contained experiment harness is follow-up work, not an existing feature.
+The original smoke retains the original compiler failures. Fixed-compiler reruns are separate evidence, not rewrites of the original results. There was no portable build/test command at the feasibility snapshot. The original probe suite still requires its archived assets; the newer engine has separate [build and acceptance commands](../../README.md#build-and-run-a-conflict-test), with the fixed compiler still an external prerequisite.
 
 ## 13. Prioritized next steps, not yet executed
 
@@ -351,6 +353,6 @@ The original smoke retains the original compiler failures. Fixed-compiler reruns
 5. **Establish aligned state storage and rollback.** Test a small U256-keyed store or host boundary against independent expectations.
 6. **Add bounded transaction parallelism.** Validate conflicts and ordered commit against the sequential core before making speed claims.
 
-No EVM implementation was started after the request to consolidate these findings. The next implementation scope remains a decision, not an implicit completed plan.
+At the close of this feasibility snapshot, no EVM implementation had been started. Later engine implementation and verification do not retroactively change these research results.
 
-Next: read the [matched performance results](performance.md) and review the [draft execution contract](../SPEC.md).
+For current work, start with the [README](../../README.md) and [native acceptance and contract benchmarks](../SPEC.md#native-transaction-acceptance-profile-2026-11-11). The [matched kernel results](performance.md) remain historical evidence.

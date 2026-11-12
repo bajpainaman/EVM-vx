@@ -112,7 +112,7 @@ That driver also needs the fixed compiler's `libvx_std_core` runtime library. Se
 
 ## Measure performance
 
-Two benchmark modes are implemented:
+For native StateDb transaction comparisons with full differential checks, use the [representative contract suite](#representative-contract-benchmarks) above. Two additional CLI benchmark modes are implemented:
 
 ```sh
 harness/target/release/evmvx-test bench build/fixtures/main/develop/fixtures/state_tests/cancun --reps 3
@@ -122,7 +122,7 @@ harness/target/release/evmvx-test pexec --txs 2000 --contracts 2000 --threads 8 
 - [`bench`](harness/src/bench.rs) times sequential execution and commit for parsed state-test cases in Vx and revm. It reports `vx/revm` elapsed time: values above 1 mean Vx took longer. Run conformance checks separately; this mode collects timings.
 - [`pexec`](harness/src/pexec.rs) times a synthetic storage-counter workload with Vx sequential, revm sequential, and Vx parallel execution. It checks the parallel results and state against Vx sequential execution. Reduce `--contracts` to increase contention.
 
-The state backends differ: sequential Vx uses Rust host maps, revm uses its own state adapters, and parallel Vx uses StateDb. Interpret results with the workload, worker count, backend, compiler, and machine specified. The earlier [Vx/C kernel measurements](docs/research/performance.md) cover arithmetic and toy dispatch; the 20× target remains a research goal.
+The state backends in these CLI modes differ: sequential Vx uses Rust host maps, revm uses its own state adapters, and parallel Vx uses StateDb. The representative contract suite instead uses StateDb for sequential Vx and preloaded revm state, with owned inputs prepared outside both timers. These modes have different setup and validation boundaries; do not combine their ratios into one ranking. Interpret results with the workload, worker count, backend, compiler, and machine specified. The earlier [Vx/C kernel measurements](docs/research/performance.md) cover arithmetic and toy dispatch; the 20× target remains a research goal.
 
 ## Precompiles and the GPU path
 
@@ -139,7 +139,7 @@ The interpreter uses an explicit frame stack for CALL/CREATE, and allocations go
 | [block.vx](src/evm/block.vx), [mvmem.vx](src/evm/mvmem.vx), [db.vx](src/evm/db.vx) | Ordered validation, speculative versions, and committed state. |
 | [harness/src/pfuzz.rs](harness/src/pfuzz.rs) | Three-way conflict testing against revm. |
 | [docs/VX_NOTES.md](docs/VX_NOTES.md) | Build constraints and compiler workarounds. |
-| [docs/SPEC.md](docs/SPEC.md) | The original draft execution contract, invariants, and acceptance obligations. Some proposed mechanisms differ from the current code; use the source for implemented behavior. |
+| [docs/SPEC.md](docs/SPEC.md) | Current native acceptance, ownership/reuse contract, benchmark results and reproduction commands, followed by the original design draft. Some historical proposed mechanisms differ from the current code. |
 | [Feasibility](docs/research/feasibility.md) and [performance](docs/research/performance.md) reports | Original compiler, embedding, concurrency, and kernel experiments. Their raw artifacts remain in the author's local research archive. |
 
-Next work: publish reproducible parallel conformance and conflict-test results, measure representative blocks across contention levels and worker counts, package the fixed toolchain, and complete the device-port prerequisites. Start with [the conflict fuzzer](harness/src/pfuzz.rs), [the block executor](src/evm/block.vx), or [the Vx build notes](docs/VX_NOTES.md).
+Next work: profile the measured compounding/hash/copy gaps, broaden parallel conformance beyond the focused acceptance matrix, measure representative blocks across contention levels and worker counts, package the fixed toolchain, and complete the device-port prerequisites. The focused conformance and conflict-test evidence is recorded in [the acceptance profile](docs/SPEC.md#fresh-evidence-and-timing); it is not full-EVM certification. Start with [the contract benchmarks](harness/src/e2e.rs), [the conflict fuzzer](harness/src/pfuzz.rs), or [the block executor](src/evm/block.vx).
