@@ -75,9 +75,66 @@ The workload is 1,000 consecutive unsigned legacy transactions from one sender t
 | Vx, lifetime fixes + reuse | Repeat | 0.833206 ms | 0.752103–0.937303 ms |
 | revm 43.0.3 | Repeat | 1.868355 ms | 1.598273–2.172830 ms |
 
-Before these lifetime changes, initial acceptance measured Vx at 38.136749 ms versus revm at 1.684333 ms; later baseline profiling measured Vx medians of 34.095216–36.272226 ms on the same workload. Repeated construction and retained contexts, stacks and tables dominated that cost. The post-fix repeat process peaked at 13,760 KiB RSS versus roughly 941 MiB in baseline profiling. These are small-workload API measurements, not a general EVM ranking, block-throughput result or 20× claim. The Ryzen 9 5900X runner is shared (post-fix load averages 3.41/3.14/3.25); contention and different state representations limit attribution. Broader arithmetic/crypto/CREATE-heavy timings remain unmeasured.
+Before these lifetime changes, initial acceptance measured Vx at 38.136749 ms versus revm at 1.684333 ms; later baseline profiling measured Vx medians of 34.095216–36.272226 ms on the same workload. Repeated construction and retained contexts, stacks and tables dominated that cost. The post-fix repeat process peaked at 13,760 KiB RSS versus roughly 941 MiB in baseline profiling. These are small-workload API measurements, not a general EVM ranking, block-throughput result or 20× claim. The Ryzen 9 5900X runner is shared (post-fix load averages 3.41/3.14/3.25); contention and different state representations limit attribution. These storage-writer measurements predate the representative-contract suite below. Its shared timer additionally prepares revm's owned transaction/calldata inputs outside the timed window, symmetrically with the native inputs; do not treat the historical numbers as a current cross-workload ranking.
 
 Raw initial evidence is in `.amp/in/artifacts/evm-e2e-20261111/` and profiling evidence in `.amp/in/artifacts/evm-profile-20261111/`. The final ownership runs are under `.amp/in/artifacts/evm-reuse-20261111/`: `acceptance-final-with-map-reclamation.log`, `poison-*-reclaimed*.log`, the failing `log-leak-negative-control.log`, and `timing-{final,repeat-final}-O2.log`. These are local review evidence, not tracked fixtures. Diagnostic wrappers are archived separately and removed from normal linkage before timing.
+
+### Representative compiled-contract benchmarks (2026-11-12)
+
+The small Solidity contracts in `tests/contracts/workloads.sol` exercise nine transaction shapes. They are benchmark kernels, not audited production ERC-20/AMM implementations or mainnet replay. Checked-in bytecode in `workloads.json` was generated with solc `0.8.35+commit.47b9dedd.Linux.g++`, Cancun, optimizer enabled with 200 runs and no metadata hash. Running acceptance/timing needs no Solidity compiler. To regenerate with that exact compiler from the repository root:
+
+```sh
+solc --evm-version cancun --optimize --optimize-runs 200 --metadata-hash none \
+  --combined-json bin,bin-runtime tests/contracts/workloads.sol > tests/contracts/workloads.json
+```
+
+The compiler binary SHA256 was `fa8ac9a32d301ad023a36ee5a29f8e291fe3200c60244e43c142539e82a617f4`; the generated JSON SHA256 is `7613106f590120e9adb393bfb8986dab0abf8f635992596d1fd37f9b895c3691`. The Vx/LLVM/Rust provenance is the acceptance toolchain above (Rust 1.93.0; native O2 for timings), and the independent comparator remains **revm 43.0.3, not evm2**.
+
+Run correctness first, then timing alone, with no concurrent build or benchmark:
+
+```sh
+VXC_BINARY=/data/fast/vx-toolchain/vx-compiler-fixes-build/target/debug/vxc \
+VXC_SHA256=bcdd182c2547da191e53c9df94eacc655988338c59b54ab674d05888ee4a281b \
+EVMVX_FIXTURES=/path/to/state_tests/cancun scripts/check-e2e.sh
+ETO_BUILD_JOBS=4 cargo test --locked --release --manifest-path harness/Cargo.toml -j4 \
+  representative_contract_timing -- --ignored --nocapture --test-threads=1
+```
+
+`VXC`, `LLVM_BIN`, `VXC_BINARY` and `VXC_SHA256` remain configurable as above; omit `EVMVX_FIXTURES` if external fixtures are unavailable. The acceptance script leaves the library at native O2. The ordinary `representative_contract_correctness` test checks two 32-transaction windows per workload at each optimization. The ignored timer uses two warmups and ten measured 1,000-transaction windows, resetting the same prestate outside each window, alternating engine order, and advancing nonce/committing state within each window. Access warmth resets every transaction; state and reusable capacities evolve within the window. Unsigned legacy execution uses sender-supplied transactions, chain ID 1, gas limit 2,000,000, basefee 7 and gas price 13.
+
+Both engines prepare owned inputs and preloaded databases outside timing. Validation, execution, gas accounting, fee/nonce settlement, native commit and retaining results are inside; comparison/free/teardown are outside. Contexts are reused within each window and Vx's first lazy context/table creation remains inside. Every transaction compares status, complete return/revert bytes, exact gas/refund, ordered logs, created address and deployed code. Complete final persistent state is compared with revm, including fees/nonces; balances/nonces/code/slots are also read back from the native StateDb. The nested rollback case requires the outer revert reason, rejecting an earlier failed token transfer as a false positive.
+
+Fresh O0/O2 runs with `VX_NO_AST_FALLBACK=1` passed 10 tests (two timings ignored), 4,425 state cases per adapter, and 400 four-worker conflict blocks / 6,871 transactions per optimization. Both complete timing sweeps passed every comparison. These are sequential native transaction timings, not parallel block throughput.
+
+Median milliseconds per 1,000 transactions; the repeat is a second complete serialized sweep. A Vx/revm elapsed-time ratio above 1 means Vx is slower.
+
+| Workload | Vx median | revm median | Vx/revm | Repeat Vx / revm |
+|---|---:|---:|---:|---:|
+| ERC-20-style transfer + log | 4.101 | 4.205 | 0.98× | 4.145 / 4.209 |
+| Proxy DELEGATECALL transfer | 4.645 | 4.845 | 0.96× | 4.657 / 4.779 |
+| Constant-product swap math/storage/log | 2.705 | 3.096 | 0.87× | 2.773 / 3.074 |
+| 32-period fixed-point compounding | 76.914 | 7.699 | 9.99× | 76.163 / 7.694 |
+| Eight Keccak rounds over 1 KiB | 49.738 | 24.752 | 2.01× | 49.596 / 24.667 |
+| ABI copy/return 4 KiB | 15.262 | 7.173 | 2.13× | 15.027 / 7.195 |
+| SHA-256 precompile over 1 KiB | 12.696 | 3.921 | 3.24× | 12.778 / 3.894 |
+| Token transfer/log followed by outer REVERT | 5.891 | 5.545 | 1.06× | 5.676 / 5.457 |
+| CREATE token, mint constructor + 540-byte runtime | 7.284 | 5.673 | 1.28× | 7.158 / 5.673 |
+
+First-sweep ten-sample min–max ranges, in the same units:
+
+| Workload | Vx min–max | revm min–max |
+|---|---:|---:|
+| ERC-20 transfer | 4.050–4.293 | 4.107–4.328 |
+| Proxy transfer | 4.543–5.082 | 4.743–5.034 |
+| Swap | 2.637–2.836 | 3.050–3.231 |
+| Compounding | 75.095–77.887 | 7.453–8.032 |
+| Keccak | 49.242–50.447 | 24.553–24.953 |
+| Memory copy | 14.665–17.778 | 7.127–7.405 |
+| SHA-256 | 12.160–13.138 | 3.855–3.987 |
+| Nested REVERT | 5.623–6.046 | 5.449–5.666 |
+| Deployment | 6.933–7.849 | 5.545–6.150 |
+
+The transfer/proxy results are near parity, while compounding is the largest observed relative gap. Hashing, copying and SHA-256 also lag. These timings alone do not identify the responsible symbols: arithmetic/division, copy/ABI paths and precompile implementation need workload-specific profiling before optimization. No suite-wide speedup follows from these results. The Ryzen 9 5900X runner has shared load; close rankings and individual sample outliers are not isolated-core claims. Both processes peaked at about 70 MiB RSS. Local evidence in `.amp/in/artifacts/contract-bench-20261112/` contains `correctness-O0-O2.log`, all samples/gas ranges in `timing-{1,2}.log`, `results.json`, and toolchain/source/archive hashes in `provenance.txt`.
 
 ### Limits
 

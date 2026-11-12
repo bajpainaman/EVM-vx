@@ -44,6 +44,17 @@ For native Cancun end-to-end acceptance, run `scripts/check-e2e.sh` from the rep
 
 `StateDb` transaction/system-call entry points reuse a database-owned context and fork-specific opcode tables; calls on one database must be exclusive and non-reentrant. Standalone results own their buffers and remain valid after database destruction. The [ownership contract](docs/SPEC.md#native-ownership-and-context-reuse) also covers callback mode, rollback, and the parallel executor's deferred reclamation.
 
+### Representative contract benchmarks
+
+After `scripts/check-e2e.sh` passes (it leaves a native O2 library), run timing alone:
+
+```sh
+ETO_BUILD_JOBS=4 cargo test --locked --release --manifest-path harness/Cargo.toml -j4 \
+  representative_contract_timing -- --ignored --nocapture --test-threads=1
+```
+
+Nine compiled Solidity workloads cover token/proxy transfers, swap math/storage, fixed-point compounding, Keccak, memory copying, SHA-256, nested rollback and deployment. Every transaction's full observations and final committed state are checked against revm outside the timer. Bytecode is checked in, so running needs no solc. See [results and reproduction](docs/SPEC.md#representative-compiled-contract-benchmarks-2026-11-12) for compiler provenance, reset/settlement boundaries, medians/spread and limitations. Transfers are near parity in these runs; compounding is about 10× slower. This is not mainnet replay or a general speedup claim.
+
 ## Run Ethereum fixtures
 
 Fixture fetching needs Python 3.12 or newer. The fetch script downloads EEST v5.4.0 develop/stable archives, a pinned Glamsterdam devnet archive, and the legacy tests into the directory you supply:

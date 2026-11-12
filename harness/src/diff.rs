@@ -177,7 +177,6 @@ pub fn reference_state(pre: &Host) -> State<revm::database::EmptyDB> {
 /// observation and the complete persistent state (including code bytes).
 pub fn check(pre: &Host, cfg: &CfgEnv, block: &BlockEnv, tx: &TxEnv,
              actual: &Observation, post: &Host) -> Result<(), String> {
-    use revm::primitives::B256;
     let mut db = reference_state(pre);
     let reference = Context::mainnet().with_block(block.clone()).with_cfg(cfg.clone())
         .with_db(&mut db).build_mainnet().transact_commit(tx.clone());
@@ -196,6 +195,12 @@ pub fn check(pre: &Host, cfg: &CfgEnv, block: &BlockEnv, tx: &TxEnv,
             if *actual != expected { return Err(format!("observations: Vx={actual:?}; revm={expected:?}")); }
         }
     }
+    check_state(&db, post)
+}
+
+/// Compare a committed sequence without re-executing its growing prefix.
+pub fn check_state(db: &State<revm::database::EmptyDB>, post: &Host) -> Result<(), String> {
+    use revm::primitives::B256;
     let mut expected = Host::default();
     for (a, acc) in db.cache.trie_account() {
         let hash = if acc.info.code_hash == B256::ZERO { KECCAK_EMPTY } else { acc.info.code_hash };

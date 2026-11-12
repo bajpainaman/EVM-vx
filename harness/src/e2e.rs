@@ -348,8 +348,6 @@ fn transaction_memory_stays_bounded() {
 #[test]
 #[ignore = "timing must run alone, after O0/O2 correctness"]
 fn native_tx_timing() {
-    use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
-    use std::time::Instant;
     let (h, cfg, b, tx) = setup(bytes("60003560005560005460005260206000f3"), 9);
     let txs: Vec<_> = (0..1000u64).map(|i| {
         let mut t = tx.clone();
@@ -357,9 +355,17 @@ fn native_tx_timing() {
         t.data = U256::from(i + 1).to_be_bytes::<32>().to_vec().into();
         t
     }).collect();
+    time_transactions("storage_writer", &h, &cfg, &b, &txs, RES_SUCCESS, 10);
+}
+
+fn time_transactions(name: &str, h: &Host, cfg: &CfgEnv, b: &BlockEnv,
+                     txs: &[TxEnv], status: u64, samples: usize) {
+    use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+    use std::time::Instant;
     let ebs: Vec<_> = txs.iter().map(|t| env::build(cfg.spec, &cfg, &b, t)).collect();
     let mut times = [Vec::new(), Vec::new()];
-    for rep in 0..12 {
+    let mut gas_range = (u64::MAX, 0);
+    for rep in 0..samples + 2 {
         // Reset/preload both databases and build the reference context outside
         // each window. The Vx StateDb path has no per-op host callbacks.
         let mut vx = h.clone();
@@ -367,6 +373,9 @@ fn native_tx_timing() {
         let mut db = diff::reference_state(&h);
         let mut evm = Context::mainnet().with_block(b.clone()).with_cfg(cfg.clone())
             .with_db(&mut db).build_mainnet();
+        // Both input representations are prepared outside timing, including
+        // reference calldata ownership. Do not charge only revm for cloning it.
+        let reference_txs = txs.to_vec();
         let mut vr = Vec::with_capacity(txs.len());
         let mut rr = Vec::with_capacity(txs.len());
         let mut run_vx = || {
@@ -378,9 +387,9 @@ fn native_tx_timing() {
             }
             start.elapsed().as_secs_f64() * 1000.0
         };
-        let mut run_revm = || {
+        let run_revm = || {
             let start = Instant::now();
-            for t in &txs { rr.push(evm.transact_commit(t.clone()).unwrap()); }
+            for t in reference_txs { rr.push(evm.transact_commit(t).unwrap()); }
             start.elapsed().as_secs_f64() * 1000.0
         };
         // Serialized windows with alternating order, not concurrent timings.
@@ -390,38 +399,128 @@ fn native_tx_timing() {
             let r = run_revm(); (run_vx(), r)
         };
         drop(evm);
+        let mut post = h.clone();
         for (p, expected) in vr.into_iter().zip(rr) {
             let actual = unsafe { &*p };
-            assert_eq!(Observation::vx(actual), Observation::reference(&expected));
-            assert_eq!(actual.status, RES_SUCCESS);
+            let observation = Observation::vx(actual);
+            assert_eq!(observation, Observation::reference(&expected), "{name} window {rep}");
+            assert_eq!(actual.status, status, "{name}");
+            if name == "nested_revert" {
+                // A failed token call must not masquerade as the intended
+                // rollback after a successful transfer and Transfer log.
+                let message = b"rollback after transfer";
+                assert!(observation.output.windows(message.len()).any(|w| w == message));
+            }
+            gas_range.0 = gas_range.0.min(actual.gas_used);
+            gas_range.1 = gas_range.1.max(actual.gas_used);
+            // Normalize all native deltas outside timing, including accounts
+            // created by deployment and slots deleted by rollback/refunds.
+            post.commit_excluding(actual, None);
             unsafe { evmvx_result_free(p) };
         }
-        // Compare actual native committed state with revm, including fees and
-        // nonce progression. This workload writes only slot zero.
-        let mut count = 0;
-        for (a, acc) in db.cache.trie_account() {
-            count += 1;
-            let aw = Word::from(a);
+        diff::check_state(&db, &post).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Also read back the actual native DB, not only its reported deltas.
+        for (a, acc) in &post.accounts {
+            let aw = Word::from(*a);
             let mut out = HostAccount { balance: Word::default(), nonce: 0, code_hash: Word::default(), code: std::ptr::null(), code_len: 0 };
             assert_eq!(unsafe { evmvx_db_get_account(vx.db as _, &aw, &mut out) }, HOST_OK);
-            assert_eq!((out.balance.u256(), out.nonce, out.code_hash.b256()), (acc.info.balance, acc.info.nonce, acc.info.code_hash));
-            let code = db.cache.contracts.get(&acc.info.code_hash).map(|c| c.original_bytes()).unwrap_or_default();
-            assert_eq!(unsafe { crate::host::slice(out.code, out.code_len) }, code.as_ref());
+            assert_eq!((out.balance.u256(), out.nonce, out.code_hash.b256()), (acc.balance, acc.nonce, acc.code_hash));
+            assert_eq!(unsafe { crate::host::slice(out.code, out.code_len) }, acc.code.as_ref());
             for (k, v) in &acc.storage {
                 let mut value = Word::default();
                 unsafe { evmvx_db_get_slot(vx.db as _, &aw, &Word::from(*k), &mut value) };
                 assert_eq!(value.u256(), *v);
             }
         }
-        assert_eq!(count, 3);
         if rep >= 2 {
             times[0].push(vt); times[1].push(rt);
-            eprintln!("sample {}: Vx={vt:.6} ms revm={rt:.6} ms (1000 tx)", rep - 1);
+            eprintln!("{name} sample {}: Vx={vt:.6} ms revm={rt:.6} ms ({} tx)", rep - 1, txs.len());
         }
     }
-    for (name, samples) in ["Vx", "revm"].into_iter().zip(&mut times) {
-        samples.sort_by(f64::total_cmp);
-        eprintln!("{name}: 10 measured windows after 2 warmups; median={:.6} ms min={:.6} max={:.6}",
-            (samples[4] + samples[5]) / 2.0, samples[0], samples[9]);
+    eprintln!("{name}: verified {} tx/window, gas={}..{}, status={status}", txs.len(), gas_range.0, gas_range.1);
+    for (engine, values) in ["Vx", "revm"].into_iter().zip(&mut times) {
+        values.sort_by(f64::total_cmp);
+        if !values.is_empty() {
+            let n = values.len();
+            eprintln!("{name} {engine}: {n} measured windows after 2 warmups; median={:.6} ms min={:.6} max={:.6}",
+                (values[(n - 1) / 2] + values[n / 2]) / 2.0, values[0], values[n - 1]);
+        }
     }
+}
+
+fn solidity_workloads(n: u64, samples: usize) {
+    use revm::primitives::keccak256;
+    let compiled: serde_json::Value = serde_json::from_str(include_str!("../../tests/contracts/workloads.json")).unwrap();
+    assert_eq!(compiled["version"], "0.8.35+commit.47b9dedd.Linux.g++");
+    let code = |name: &str, field: &str| bytes(compiled["contracts"][format!("tests/contracts/workloads.sol:{name}")][field].as_str().unwrap());
+    let call = |signature: &str, args: &[U256], payload: Option<&[u8]>| {
+        let mut data = keccak256(signature.as_bytes())[..4].to_vec();
+        for arg in args { data.extend_from_slice(&arg.to_be_bytes::<32>()); }
+        if let Some(p) = payload {
+            data.extend_from_slice(&U256::from(p.len()).to_be_bytes::<32>());
+            data.extend_from_slice(p);
+            data.resize(4 + (data.len() - 4).div_ceil(32) * 32, 0);
+        }
+        Bytes::from(data)
+    };
+    let balance_slot = |owner: Address| {
+        let mut key = [0u8; 64];
+        key[12..32].copy_from_slice(owner.as_slice());
+        U256::from_be_bytes(keccak256(key).0)
+    };
+    let funding = U256::from(10u64).pow(U256::from(24));
+    for name in ["erc20_transfer", "proxy_transfer", "amm_swap", "compound_32", "keccak_1k_8", "memory_copy_4k", "sha256_1k", "nested_revert", "deploy_token"] {
+        let (mut h, cfg, b, mut tx) = setup(code("BenchWorkloads", "bin-runtime"), 0);
+        h.accounts.get_mut(&address(1)).unwrap().balance = funding;
+        h.accounts.get_mut(&address(2)).unwrap().storage.clear();
+        h.insert(address(5), U256::ZERO, 1, code("BenchToken", "bin-runtime"),
+            [(balance_slot(address(1)), funding), (balance_slot(address(2)), funding)].into());
+        if name == "proxy_transfer" {
+            h.insert(address(2), U256::ZERO, 1, code("BenchProxy", "bin-runtime"), [
+                (balance_slot(address(1)), funding),
+                (U256::from_be_slice(&bytes("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")), U256::from_be_slice(address(5).as_slice())),
+            ].into());
+        }
+        if name == "amm_swap" {
+            h.accounts.get_mut(&address(2)).unwrap().storage = [(U256::ZERO, funding), (U256::ONE, funding * U256::from(2))].into();
+        }
+        tx.value = U256::ZERO;
+        tx.gas_limit = 2_000_000;
+        let txs: Vec<_> = (0..n).map(|i| {
+            let mut t = tx.clone();
+            t.nonce += i;
+            let amount = U256::from(i + 1);
+            let recipient = U256::from_be_slice(address(4 + (i % 2) as u8 * 2).as_slice());
+            let payload: Vec<u8> = (0..if name == "memory_copy_4k" { 4096 } else { 1024 })
+                .map(|j| (j as u64 + i) as u8).collect();
+            t.data = match name {
+                "erc20_transfer" | "proxy_transfer" => {
+                    if name == "erc20_transfer" { t.kind = TxKind::Call(address(5)); }
+                    call("transfer(address,uint256)", &[recipient, amount], None)
+                }
+                "amm_swap" => call("swap(uint256)", &[amount * U256::from(1_000_000)], None),
+                "compound_32" => call("compound(uint256,uint256,uint256)", &[funding + amount, U256::from(1_000_500_000_000_000_000u64), U256::from(32)], None),
+                "keccak_1k_8" => call("hashChain(bytes,uint256)", &[U256::from(64), U256::from(8)], Some(&payload)),
+                "memory_copy_4k" => call("copy(bytes)", &[U256::from(32)], Some(&payload)),
+                "sha256_1k" => call("sha(bytes)", &[U256::from(32)], Some(&payload)),
+                "nested_revert" => call("transferAndRevert(address,address,uint256)", &[U256::from_be_slice(address(5).as_slice()), recipient, amount], None),
+                "deploy_token" => { t.kind = TxKind::Create; code("BenchToken", "bin") },
+                _ => unreachable!(),
+            };
+            t
+        }).collect();
+        let status = if name == "nested_revert" { RES_REVERT } else { RES_SUCCESS };
+        time_transactions(name, &h, &cfg, &b, &txs, status, samples);
+    }
+}
+
+#[test]
+fn representative_contract_correctness() {
+    solidity_workloads(32, 0);
+}
+
+#[test]
+#[ignore = "run alone against native O2, after O0/O2 correctness"]
+fn representative_contract_timing() {
+    solidity_workloads(1000, 10);
 }
