@@ -1,7 +1,7 @@
 # EVM-vx: execution and parallelism contract
 
 Status: **draft 0.1 design contract; native implementation acceptance is recorded below, not a mechanically verified specification**.
-Date: 2026-10-26. Project: [EVM-vx](https://github.com/bajpainaman/EVM-vx).
+Original design date: 2026-10-26. Native acceptance and benchmark evidence updated: 2026-11-12. Project: [EVM-vx](https://github.com/bajpainaman/EVM-vx).
 
 ## Native transaction acceptance profile (2026-11-11)
 
@@ -139,6 +139,10 @@ The transfer/proxy results are near parity, while compounding is the largest obs
 ### Limits
 
 The existing engine goes beyond this focused profile (nested CALL/CREATE, additional forks, precompiles and a parallel executor). Passing this profile is not certification of those complete surfaces. Pairing/KZG/BLS crypto uses the host's revm precompile provider, so those results are not independent all-Vx crypto verification. Host failures have a distinct result category and forced storage-provider errors are tested; forced crypto-provider failures and allocation exhaustion remain uncovered. The current allocator includes abort/null paths, so do not claim total structured OOM recovery. No new capability is disguised as EVM INVALID/OOG to make these tests pass. No GPU, full-chain replay or 20× claim follows from these results.
+
+## Reading the original design draft
+
+The numbered sections below preserve the 2026-10-26 candidate design and its acceptance obligations. They are not a description of every mechanism now implemented. In particular, the candidate forbids speculative predecessor reads, while the current executor uses versioned speculative writes and ordered validation; see [the implementation overview](../README.md#whats-built). The native profile above records the selected Cancun scope, revm comparator, API ownership, executed evidence and timing contract. Treat the numbered open-decision list as historical context, not a reason to repeat already-completed implementation work. Broader conformance, resource limits, compiler packaging, performance optimization and device portability remain open.
 
 ## 1. Direction
 
