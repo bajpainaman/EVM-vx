@@ -2,6 +2,17 @@
 
 use revm::primitives::{Address, B256, U256};
 
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct BlockConflict {
+    pub address: Word,
+    pub key: Word,
+    pub kind: u64,
+    pub expected: u64,
+    pub observed: u64,
+    pub reason: u64,
+}
+
 /// Four little-endian u64 limbs, the layout of the Vx `U256` struct.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -190,6 +201,8 @@ extern "C" {
     /// until the block commits; finish applies it to the db.
     pub fn evmvx_block_new(db: *mut core::ffi::c_void, envs: *const VxEnv, n: u64) -> *mut core::ffi::c_void;
     pub fn evmvx_block_worker(b: *mut core::ffi::c_void);
+    pub fn evmvx_block_cancel(b: *mut core::ffi::c_void);
+    pub fn evmvx_block_conflict(b: *mut core::ffi::c_void, i: u64, out: *mut BlockConflict) -> u64;
     pub fn evmvx_block_result(b: *mut core::ffi::c_void, i: u64) -> *mut VxResult;
     pub fn evmvx_block_reexecs(b: *mut core::ffi::c_void) -> u64;
     pub fn evmvx_block_finish(b: *mut core::ffi::c_void) -> u64;

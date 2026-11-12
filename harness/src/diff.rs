@@ -143,9 +143,9 @@ impl Observation {
         let bytes = r.output().map(|b| b.to_vec()).unwrap_or_default();
         Self {
             status: match r { Success { .. } => RES_SUCCESS, Revert { .. } => RES_REVERT, Halt { .. } => RES_HALT },
-            // Vx exposes successful deployment bytes in the account delta,
-            // not call returndata. Compare them separately without truncation.
-            output: if created.is_some() { Vec::new() } else { bytes.clone() },
+            // Vx returns deployed bytes as the create output, as revm does,
+            // and also in the account delta; compare both without truncation.
+            output: bytes.clone(),
             gas: r.tx_gas_used(),
             refund: r.gas().final_refunded(),
             logs: r.logs().to_vec(),

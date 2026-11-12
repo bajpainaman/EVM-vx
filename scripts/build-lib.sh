@@ -23,9 +23,8 @@ SRC="$OUT/evmvx.vx"
   done < "$ROOT/src/evm/MANIFEST"
 } > "$SRC"
 "$ROOT/scripts/vxbuild" "$SRC" "$OUT/evmvx-O$OPT.o" "$OPT"
-# CPU-only atomics for the Vx scheduler; a device build replaces this shim.
-cc -O2 -fPIC -c "$ROOT/src/native/atomic_shim.c" -o "$OUT/atomic_shim.o"
+# Scheduling atomics are emitted by Vx; allocation remains a CPU runtime ABI.
 cc -O2 -fPIC -c "$ROOT/src/native/alloc_shim.c" -o "$OUT/alloc_shim.o"
 rm -f "$OUT/libevmvx.a"
-ar rcs "$OUT/libevmvx.a" "$OUT/evmvx-O$OPT.o" "$OUT/atomic_shim.o" "$OUT/alloc_shim.o"
+ar rcs "$OUT/libevmvx.a" "$OUT/evmvx-O$OPT.o" "$OUT/alloc_shim.o"
 echo "built $OUT/libevmvx.a (O$OPT)"
