@@ -106,7 +106,7 @@ Both engines prepare owned inputs and preloaded databases outside timing. Valida
 
 Fresh O0/O2 runs with `VX_NO_AST_FALLBACK=1` passed 10 tests (two timings ignored), 4,425 state cases per adapter, and 400 four-worker conflict blocks / 6,871 transactions per optimization. Both complete timing sweeps passed every comparison. These are sequential native transaction timings, not parallel block throughput.
 
-Median milliseconds per 1,000 transactions; the repeat is a second complete serialized sweep. A Vx/revm elapsed-time ratio above 1 means Vx is slower.
+The following two tables retain the original pre-division-fix measurements; see [the narrow-divisor results below](#narrow-divisor-division-fix-2026-11-12) for the updated compounding result. Median milliseconds per 1,000 transactions; the repeat is a second complete serialized sweep. A Vx/revm elapsed-time ratio above 1 means Vx is slower.
 
 | Workload | Vx median | revm median | Vx/revm | Repeat Vx / revm |
 |---|---:|---:|---:|---:|
@@ -135,6 +135,29 @@ First-sweep ten-sample min–max ranges, in the same units:
 | Deployment | 6.933–7.849 | 5.545–6.150 |
 
 The transfer/proxy results are near parity, while compounding is the largest observed relative gap. Hashing, copying and SHA-256 also lag. These timings alone do not identify the responsible symbols: arithmetic/division, copy/ABI paths and precompile implementation need workload-specific profiling before optimization. No suite-wide speedup follows from these results. The Ryzen 9 5900X runner has shared load; close rankings and individual sample outliers are not isolated-core claims. Both processes peaked at about 70 MiB RSS. Local evidence in `.amp/in/artifacts/contract-bench-20261112/` contains `correctness-O0-O2.log`, all samples/gas ranges in `timing-{1,2}.log`, `results.json`, and toolchain/source/archive hashes in `provenance.txt`.
+
+### Narrow-divisor division fix (2026-11-12)
+
+The representative tables above are the pre-fix baseline. Profiling the unchanged compounding contract found 88.69% of phase-gated Vx cycle samples in `u256_divrem`: all 64 divisions per transaction have 140-bit numerators, so the existing both-operands-fit-u128 path missed both the 60-bit fixed-point divisor and the 80-bit overflow-check divisor.
+
+Full-width numerators now use limb-wise u128/u64 division for one-limb divisors and normalized two-limb division for divisors up to 128 bits. Quotient correction handles saturation and up to two corrections; normalization preserves the fifth numerator limb and denormalizes remainders. Zero divisors, signed wrappers, the existing small-numerator path and the general larger-divisor fallback retain their semantics. No bytecode, gas schedule, transaction semantics or reference fallback changed.
+
+The independent Python-int oracle checks 214,320 arithmetic cases at each of O0/O2, both through compiler-internal `-c` and through the engine's explicit MLIR → LLVM 22 → native pipeline, with `VX_NO_AST_FALLBACK=1`. Coverage includes full-width numerators, 64/128-bit transitions, zero/max words, signed DIV/MOD, randomized widths, quotient-estimate saturation, two corrections, normalization carry and remainder denormalization. All ten intentionally incorrect arithmetic variants are rejected, including four controls for the new division path. This is differential testing, not a proof over all words.
+
+Isolated division-PR O0/O2 acceptance passed 10 focused tests, 4,425 Cancun state cases per adapter and 400 four-worker conflict blocks / 6,871 transactions per optimization. The full Cargo suite on that branch passed 10 native tests, with two timing tests intentionally ignored. A preceding combined development checkout also passed the broad native O2 corpus on both callback and StateDb adapters: **63,314 cases across 2,723 files per adapter**, preserving existing exclusions. Those broader results include separate readiness comparator fixes for EIP-7702 account-code reconstruction, an additional signed-authorization regression and CLI input checks; those changes are not part of the division PR. The broad result must not be attributed to the isolated PR's older comparator without those fixes. This is not exclusion-free fork certification or reth replay.
+
+After correctness, four complete unchanged representative benchmark sweeps ran in baseline / fixed / fixed / baseline order under `build/e2e.lock`. Each workload retained two warmups, ten measured 1,000-transaction windows, identical reset/preload/settlement/commit/result-retention boundaries, alternating engine order and full post-window observation/state checks. Baseline and fixed executables differ in the statically linked Vx arithmetic implementation, not in contract bytecode or benchmark work. Comparator: revm 43.0.3; compiler: the pinned fixed local binary above; native O2; AST fallback disabled.
+
+| Compounding run | Vx median ms / 1,000 tx | Vx ten-sample min–max | revm median | revm ten-sample min–max |
+|---|---:|---:|---:|---:|
+| Baseline first | 79.127 | 77.736–82.900 | 7.748 | 7.613–8.107 |
+| Fixed first | 9.148 | 8.941–9.460 | 7.879 | 7.727–8.018 |
+| Fixed repeat | 9.197 | 8.882–9.734 | 7.755 | 7.645–8.464 |
+| Baseline repeat | 78.906 | 78.499–79.730 | 7.831 | 7.754–7.944 |
+
+Compounding is **8.58–8.65× faster than its fresh baseline**, but remains **1.16–1.19× revm's elapsed time**. The other eight workloads passed every correctness check; their reference-normalized movements ranged from about 4.3% slower to 2.5% faster, with shared-load drift and inconsistent repeat direction. No improvement or absence of small regressions is claimed for them. This fixes the measured division bottleneck, not general EVM throughput or current-reth integration.
+
+Reproduce the primitive gates with `VX_NO_AST_FALLBACK=1 python3 tests/u256/run.py -O 0 2` and `VX_NO_AST_FALLBACK=1 python3 tests/u256/mutants.py`; use the acceptance and timing commands above for native transactions. The broad commands are `EVMVX_DIFF=1 harness/target/release/evmvx-test statetest /path/to/state_tests` and the same with `EVMVX_DB=1` after the native O2 build. Evidence in `.amp/in/artifacts/division-fix-20261112/` includes raw samples, `results.json`, correctness/mutation logs, exact commands, source snapshots and compiler/archive/executable hashes. The full-width arithmetic algorithm remains Vx; Python provides only the independent integer oracle.
 
 ### Limits
 

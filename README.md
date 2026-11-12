@@ -53,7 +53,7 @@ ETO_BUILD_JOBS=4 cargo test --locked --release --manifest-path harness/Cargo.tom
   representative_contract_timing -- --ignored --nocapture --test-threads=1
 ```
 
-Nine compiled Solidity workloads cover token/proxy transfers, swap math/storage, fixed-point compounding, Keccak, memory copying, SHA-256, nested rollback and deployment. Every transaction's full observations and final committed state are checked against revm outside the timer. Bytecode is checked in, so running needs no solc. See [results and reproduction](docs/SPEC.md#representative-compiled-contract-benchmarks-2026-11-12) for compiler provenance, reset/settlement boundaries, medians/spread and limitations. Transfers are near parity in these runs; compounding is about 10× slower. This is not mainnet replay or a general speedup claim.
+Nine compiled Solidity workloads cover token/proxy transfers, swap math/storage, fixed-point compounding, Keccak, memory copying, SHA-256, nested rollback and deployment. Every transaction's full observations and final committed state are checked against revm outside the timer. Bytecode is checked in, so running needs no solc. See [results and reproduction](docs/SPEC.md#representative-compiled-contract-benchmarks-2026-11-12) for compiler provenance, reset/settlement boundaries, medians/spread and limitations. The [narrow-divisor fix](docs/SPEC.md#narrow-divisor-division-fix-2026-11-12) reduced compounding from 78.9–79.1 to 9.15–9.20 ms per 1,000 transactions (8.6× faster than its baseline), still 16–19% slower than revm. This is not mainnet replay or a general speedup claim.
 
 ## Run Ethereum fixtures
 

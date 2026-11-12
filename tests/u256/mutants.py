@@ -28,6 +28,16 @@ MUTANTS = [
      'if count.l0 >= 256u64 { return 256; }'),
     ('SIGNEXTEND off by one byte',
      'let bit = (b.l0 as i32) * 8 + 7;', 'let bit = (b.l0 as i32) * 8 + 15;'),
+    ('two-limb quotient corrected only once',
+     'while trial < base && digit * lo > ((trial << 64u128) | next) {',
+     'if trial < base && digit * lo > ((trial << 64u128) | next) {'),
+    ('two-limb quotient estimate narrowed before correction',
+     'if (r >> 64u128) != hi {\n      digit = r / hi;',
+     'if true {\n      digit = ((r / hi) as u64) as u128;'),
+    ('two-limb normalization loses the fifth limb',
+     'if shift != 0u64 { r = (a.l3 >> (64u64 - shift)) as u128; }', ''),
+    ('two-limb remainder not denormalized',
+     'r = r >> (shift as u128);', ''),
 ]
 
 
@@ -39,7 +49,7 @@ def main():
             sys.exit(f'mutant {name!r}: pattern must match exactly once')
         with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / 'repo'
-            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns('build', '.git'))
+            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns('build', '.git', '.amp', 'target', '__pycache__'))
             (copy / 'src/evm/u256.vx').write_text(src.replace(old, new))
             proc = subprocess.run([sys.executable, '-I', str(copy / 'tests/u256/run.py'),
                                    '--smoke', '-O', '2'], capture_output=True, text=True)
