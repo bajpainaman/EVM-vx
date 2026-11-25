@@ -1,0 +1,153 @@
+// A persistent pool of Vx tasks for the block executor. Starting a task costs about
+// 10 us on an M4 Pro, so evmvx_block_run's per-block `tasks` spends ~80 us per block
+// on 8 workers; a pool pays that once. The host lends one thread to
+// evmvx_pool_serve, which starts the workers as Vx tasks and returns after
+// evmvx_pool_stop. One block runs at a time.
+extern "C" {
+  fn sched_yield() -> i32;
+  // The Vx runtime's blocking wait (std::sync::wait): sleeps while *word == value,
+  // until the deadline on vx_clock_ns. The waker changes the word first, then calls
+  // vx_wake_all, so no wake is lost.
+  fn vx_wait_while_until(word: *mut i64, value: i64, deadline: i64, or_cancel: i32) -> void;
+  fn vx_wake_all(word: *mut i64) -> void;
+  fn vx_clock_ns() -> i64;
+}
+
+// The address of p; Vx has no pointer-to-integer cast.
+fn ptr_addr(p: *mut i8) -> u64 {
+  return mlir!(inputs: (%p = p : !llvm.ptr), returns: u64, dialects: ["llvm"]) {
+    %r = llvm.ptrtoint %p : !llvm.ptr to i64
+    macro.yield %r : i64
+  };
+}
+
+struct Pool {
+  workers: u64,
+  // Bumped to hand the workers a job, or to stop them.
+  gen: *mut u64,
+  // The address of the job's BlockExec.
+  job: *mut u64,
+  // Workers that left the current job.
+  done: *mut u64,
+  stop: *mut u64,
+}
+
+// Workers only read the Pool and use its cells through atomics.
+unsafe impl Sync for Pool {}
+
+// An idle worker checks this many times before it sleeps in the kernel. Sleeping
+// workers take no CPU, so they do not slow whatever the host runs between blocks.
+const POOL_SPIN: u64 = 4096u64;
+// The waker is a host thread, which the Vx runtime does not count. An untimed wait by
+// every task therefore looks like a deadlock to it, and it aborts the program. A
+// timed wait can always end, so idle workers sleep in naps of this length.
+const POOL_NAP_NS: i64 = 2000000i64;
+
+pub fn evmvx_pool_new(workers: u64) -> *mut Pool {
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Pool>() as u64) };
+  let p: *mut Pool = raw;
+  let mut w: u64 = workers;
+  if w < 1u64 {
+    w = 1u64;
+  }
+  unsafe {
+    p[0u64].workers = w;
+    p[0u64].gen = limbs_alloc(1u64);
+    p[0u64].job = limbs_alloc(1u64);
+    p[0u64].done = limbs_alloc(1u64);
+    p[0u64].stop = limbs_alloc(1u64);
+  }
+  return p;
+}
+
+// Blocks the calling (host) thread until evmvx_pool_stop.
+pub fn evmvx_pool_serve(p: *mut Pool) -> void {
+  let pr: &Pool = unsafe { &p[0u64] };
+  tasks {
+    for _w in 0..pr.workers {
+      spawn {
+        pool_worker(pr);
+      };
+    }
+  };
+}
+
+// Waits until *cell differs from seen, and returns it.
+fn pool_wait_change(cell: *mut u64, seen: u64) -> u64 {
+  let w: *mut i8 = cell;
+  let word: *mut i64 = w;
+  let mut k: u64 = 0u64;
+  loop {
+    let v: u64 = unsafe { evx_aload(cell) };
+    if v != seen {
+      return v;
+    }
+    k = k + 1u64;
+    if k > POOL_SPIN {
+      unsafe { vx_wait_while_until(word, seen as i64, vx_clock_ns() + POOL_NAP_NS, 0i32); }
+    }
+  }
+  return seen;
+}
+
+// Bumps the job generation and wakes the sleeping workers.
+fn pool_signal(p: *mut Pool) -> void {
+  let g: *mut u64 = unsafe { p[0u64].gen };
+  unsafe { evx_afetch_add_acqrel(g, 1u64); }
+  let w: *mut i8 = g;
+  let word: *mut i64 = w;
+  unsafe { vx_wake_all(word); }
+}
+
+fn pool_worker(p: &Pool) -> void {
+  let mut seen: u64 = 0u64;
+  loop {
+    seen = pool_wait_change(p.gen, seen);
+    if (unsafe { evx_aload(p.stop) }) != 0u64 {
+      return;
+    }
+    let b: *mut BlockExec = unsafe { evx_aload(p.job) as *mut BlockExec };
+    block_work(unsafe { &b[0u64] });
+    // Release: the committer may publish to the StateDb once every worker is out.
+    unsafe { evx_afetch_add_acqrel(p.done, 1u64); }
+  }
+}
+
+// evmvx_block_run on the pool's workers instead of new tasks.
+pub fn evmvx_block_run_pool(p: *mut Pool, b: *mut BlockExec) -> u64 {
+  let n: u64 = unsafe { b[0u64].n };
+  if n == 0u64 || (unsafe { b[0u64].finished }) != 0u64 || (unsafe { evx_aload(b[0u64].aborted) }) != 0u64 {
+    return evmvx_block_finish(b);
+  }
+  let workers: u64 = unsafe { p[0u64].workers };
+  unsafe {
+    evx_astore(p[0u64].done, 0u64);
+    evx_astore(p[0u64].job, ptr_addr(b));
+  }
+  pool_signal(p);
+  // As in evmvx_block_run, this thread commits while the workers execute.
+  let committed: bool = bx_commit(b, true);
+  // Every worker must leave the block before the StateDb changes or the host frees it.
+  while (unsafe { evx_afetch_add_acqrel(p[0u64].done, 0u64) }) < workers {
+    unsafe { sched_yield(); }
+  }
+  if !committed {
+    return 0u64;
+  }
+  return bx_publish(b);
+}
+
+// Stops the workers; evmvx_pool_serve then returns. Free after it has returned.
+pub fn evmvx_pool_stop(p: *mut Pool) -> void {
+  unsafe { evx_astore(p[0u64].stop, 1u64); }
+  pool_signal(p);
+}
+
+pub fn evmvx_pool_free(p: *mut Pool) -> void {
+  limbs_free(unsafe { p[0u64].gen });
+  limbs_free(unsafe { p[0u64].job });
+  limbs_free(unsafe { p[0u64].done });
+  limbs_free(unsafe { p[0u64].stop });
+  let raw: *mut i8 = p;
+  unsafe { vx_free(raw); }
+}

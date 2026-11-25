@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs the fixed Vx compiler with this repository's src/ on the module path.
-# The compiler must be upstream Vx dc6a460 plus the local i128-guard and
-# struct-pointer fixes; a stock vxc 0.0.2 is not equivalent.
+# Runs the Vx compiler with this repository's src/ on the module path.
+# The compiler must be the Vx v0.0.5 release. The sources use raw-pointer field
+# reads that the earlier dc6a460 build rejects.
 set -eu
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export VX_EXTRA_PATH="$ROOT/src${VX_EXTRA_PATH:+:$VX_EXTRA_PATH}"

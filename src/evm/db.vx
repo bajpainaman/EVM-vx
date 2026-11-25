@@ -191,14 +191,13 @@ fn db_set_slot(db: *mut StateDb, a: U256, k: U256, v: U256) -> void {
 
 // Fills ha with the account and returns HOST_OK, or HOST_MISSING.
 fn db_account(db: *mut StateDb, a: U256, ha: *mut HostAccount) -> u64 {
-  let d: &mut StateDb = unsafe { &mut db[0u64] };
-  let i: u64 = map_get(d.amap, a, u256_zero());
+  let i: u64 = map_get(unsafe { db[0u64].amap }, a, u256_zero());
   if i == MAP_NONE { return HOST_MISSING; }
   let mp: *mut DbAcct = db_meta(db, i);
   let m: &mut DbAcct = unsafe { &mut mp[0u64] };
   if m.live == 0u64 { return HOST_MISSING; }
-  let pb: *mut U256 = d.abal;
-  let ph: *mut U256 = d.ahash;
+  let pb: *mut U256 = unsafe { db[0u64].abal };
+  let ph: *mut U256 = unsafe { db[0u64].ahash };
   let bal: U256 = unsafe { pb[i] };
   let hash: U256 = unsafe { ph[i] };
   unsafe { ha[0u64] = HostAccount { balance: bal, nonce: m.nonce, code_hash: hash, code: m.code, code_len: m.code_len }; }
@@ -206,17 +205,16 @@ fn db_account(db: *mut StateDb, a: U256, ha: *mut HostAccount) -> u64 {
 }
 
 fn db_storage(db: *mut StateDb, a: U256, k: U256) -> U256 {
-  let d: &mut StateDb = unsafe { &mut db[0u64] };
-  let s: u64 = map_get(d.smap, a, k);
+  let s: u64 = map_get(unsafe { db[0u64].smap }, a, k);
   if s == MAP_NONE { return u256_zero(); }
-  let ai: u64 = map_get(d.amap, a, u256_zero());
+  let ai: u64 = map_get(unsafe { db[0u64].amap }, a, u256_zero());
   if ai == MAP_NONE { return u256_zero(); }
   let mp: *mut DbAcct = db_meta(db, ai);
   let m: &mut DbAcct = unsafe { &mut mp[0u64] };
-  let pg: *mut u64 = d.sgen;
+  let pg: *mut u64 = unsafe { db[0u64].sgen };
   let g: u64 = unsafe { pg[s] };
   if g != m.gen { return u256_zero(); }
-  let pv: *mut U256 = d.sval;
+  let pv: *mut U256 = unsafe { db[0u64].sval };
   return unsafe { pv[s] };
 }
 
@@ -312,8 +310,7 @@ fn db_apply(db: *mut StateDb, res: *mut VxResult) -> void {
 // revm Journal::balance_incr then commit, for withdrawals and block rewards:
 // after EIP-161 an account left empty is removed.
 fn db_balance_incr(db: *mut StateDb, a: U256, amount: U256, eip161: bool) -> void {
-  let d: &mut StateDb = unsafe { &mut db[0u64] };
-  let i: u64 = map_get(d.amap, a, u256_zero());
+  let i: u64 = map_get(unsafe { db[0u64].amap }, a, u256_zero());
   let mut live: bool = false;
   if i != MAP_NONE {
     let mp: *mut DbAcct = db_meta(db, i);
@@ -321,12 +318,12 @@ fn db_balance_incr(db: *mut StateDb, a: U256, amount: U256, eip161: bool) -> voi
     live = m.live != 0u64;
   }
   if live {
-    let pb: *mut U256 = d.abal;
+    let pb: *mut U256 = unsafe { db[0u64].abal };
     let nb: U256 = u256_add(unsafe { pb[i] }, amount);
     unsafe { pb[i] = nb; }
     let mp2: *mut DbAcct = db_meta(db, i);
     let m2: &mut DbAcct = unsafe { &mut mp2[0u64] };
-    let ph: *mut U256 = d.ahash;
+    let ph: *mut U256 = unsafe { db[0u64].ahash };
     let hash: U256 = unsafe { ph[i] };
     if eip161 && m2.nonce == 0u64 && u256_is_zero(nb) && u256_eq(hash, keccak_empty()) { db_delete_account(db, a); } else { }
   } else {
@@ -362,26 +359,25 @@ pub fn evmvx_db_balance_incr(db: *mut StateDb, addr: *mut U256, amount: *mut U25
 }
 
 pub fn evmvx_db_free(db: *mut StateDb) -> void {
-  let d: &mut StateDb = unsafe { &mut db[0u64] };
-  if !is_null_mut(d.context) { ctx_free(d.context); }
+  if !is_null_mut(unsafe { db[0u64].context }) { ctx_free(unsafe { db[0u64].context }); }
   let mut i: u64 = 0u64;
-  while i < d.an {
+  while i < unsafe { db[0u64].an } {
     let mp: *mut DbAcct = db_meta(db, i);
     let m: &mut DbAcct = unsafe { &mut mp[0u64] };
     mfree(m.code);
     mfree(m.jd);
     i = i + 1u64;
   }
-  map_free(d.amap);
-  map_free(d.smap);
-  map_free(d.bmap);
-  let p1: *mut i8 = d.aaddr;
-  let p2: *mut i8 = d.abal;
-  let p3: *mut i8 = d.ahash;
-  let p4: *mut i8 = d.ameta;
-  let p5: *mut i8 = d.sval;
-  let p6: *mut i8 = d.sgen;
-  let p7: *mut i8 = d.bhash;
+  map_free(unsafe { db[0u64].amap });
+  map_free(unsafe { db[0u64].smap });
+  map_free(unsafe { db[0u64].bmap });
+  let p1: *mut i8 = unsafe { db[0u64].aaddr };
+  let p2: *mut i8 = unsafe { db[0u64].abal };
+  let p3: *mut i8 = unsafe { db[0u64].ahash };
+  let p4: *mut i8 = unsafe { db[0u64].ameta };
+  let p5: *mut i8 = unsafe { db[0u64].sval };
+  let p6: *mut i8 = unsafe { db[0u64].sgen };
+  let p7: *mut i8 = unsafe { db[0u64].bhash };
   let p8: *mut i8 = db;
   unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); vx_free(p5); vx_free(p6); vx_free(p7); vx_free(p8); }
 }

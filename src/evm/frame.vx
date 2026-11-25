@@ -261,8 +261,9 @@ fn mem_set_data(f: *mut Frame, mem_off: u64, src: *mut u8, src_len: u64, src_off
 }
 
 // Pool-aware frame allocation: reuses a retired frame's struct, operand-stack
-// buffer and words buffer. The stack needs no zeroing (sp guards all reads);
-// every other field is set here.
+// buffer, words buffer, and its memory, return-data and output buffers. The stack
+// needs no zeroing (sp guards all reads). Memory needs none either: mem_expand
+// zeroes from mem_len, and mem_len starts at 0. Every other field is set here.
 fn frame_get(c: *mut Ctx, code: *mut u8, code_len: u64, jd: *mut u8, gas: u64,
              input: *mut u8, input_len: u64, target: U256, caller: U256, value: U256,
              is_static: bool, depth: u64, acct: u64, tabs: *mut OpTabs) -> *mut Frame {
@@ -283,9 +284,9 @@ fn frame_get(c: *mut Ctx, code: *mut u8, code_len: u64, jd: *mut u8, gas: u64,
   fr.gas = gas;
   fr.refund = 0i64;
   fr.sp = 0u64;
-  fr.mem = zalloc(32u64);
+  if is_null_mut(fr.mem) { fr.mem = zalloc(32u64); }
   fr.mem_len = 0u64;
-  fr.ret = zalloc(1u64);
+  if is_null_mut(fr.ret) { fr.ret = zalloc(1u64); }
   fr.ret_len = 0u64;
   fr.input = input;
   fr.input_len = input_len;
@@ -294,7 +295,7 @@ fn frame_get(c: *mut Ctx, code: *mut u8, code_len: u64, jd: *mut u8, gas: u64,
   fr.is_static = 0u64;
   if is_static { fr.is_static = 1u64; }
   fr.depth = depth;
-  fr.out = zalloc(1u64);
+  if is_null_mut(fr.out) { fr.out = zalloc(1u64); }
   fr.out_len = 0u64;
   fr.acct = acct;
   fr.tabs = tabs;
@@ -306,8 +307,14 @@ fn frame_get(c: *mut Ctx, code: *mut u8, code_len: u64, jd: *mut u8, gas: u64,
   return f;
 }
 
-// Retires a frame into the pool: its transient buffers are freed, the struct
-// and its stack/words buffers are kept. A full pool frees outright.
+// A pooled frame keeps buffers up to this size; bigger ones are freed so the pool
+// holds little memory.
+const POOL_KEEP_BYTES: u64 = 65536u64;
+
+// Retires a frame into the pool, keeping its struct, buffers and any memory,
+// return-data or output buffer up to POOL_KEEP_BYTES. A full pool frees outright.
+// Callers copy a frame's output and return data before retiring it, so no
+// buffer kept here is owned elsewhere.
 fn frame_put(c: *mut Ctx, f: *mut Frame) -> void {
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
   if cx.fpool_n == cx.fpool_cap {
@@ -315,12 +322,9 @@ fn frame_put(c: *mut Ctx, f: *mut Frame) -> void {
     return;
   }
   let fr: &mut Frame = unsafe { &mut f[0u64] };
-  mfree(fr.mem);
-  mfree(fr.ret);
-  mfree(fr.out);
-  fr.mem = null_u8();
-  fr.ret = null_u8();
-  fr.out = null_u8();
+  if fr.mem_len > POOL_KEEP_BYTES { mfree(fr.mem); fr.mem = null_u8(); }
+  if fr.ret_len > POOL_KEEP_BYTES { mfree(fr.ret); fr.ret = null_u8(); }
+  if fr.out_len > POOL_KEEP_BYTES { mfree(fr.out); fr.out = null_u8(); }
   let bp: *mut PtrBox = cx.fpool;
   let bx: &mut PtrBox = unsafe { &mut bp[cx.fpool_n] };
   let fp: *mut i8 = f;
@@ -329,11 +333,10 @@ fn frame_put(c: *mut Ctx, f: *mut Frame) -> void {
 }
 
 fn tabs_free(t: *mut OpTabs) -> void {
-  let tr: &mut OpTabs = unsafe { &mut t[0u64] };
-  let g: *mut i8 = tr.gas;
-  let si: *mut i8 = tr.sin;
-  let so: *mut i8 = tr.sout;
-  let ac: *mut i8 = tr.act;
+  let g: *mut i8 = unsafe { t[0u64].gas };
+  let si: *mut i8 = unsafe { t[0u64].sin };
+  let so: *mut i8 = unsafe { t[0u64].sout };
+  let ac: *mut i8 = unsafe { t[0u64].act };
   let tp: *mut i8 = t;
   unsafe { vx_free(g); vx_free(si); vx_free(so); vx_free(ac); vx_free(tp); }
 }

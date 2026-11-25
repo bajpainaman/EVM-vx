@@ -2,7 +2,7 @@
 
 Execute ordered Ethereum transactions in parallel in [Vx](https://github.com/vx-lang/Vx), with sequential execution as the correctness reference.
 
-**Research-stage CPU implementation:** a sequential EVM, an optimistic parallel transaction executor, and a Rust harness for Ethereum fixtures, differential testing, and benchmarks. The interpreter, transaction logic, state database, and parallel scheduler live in Vx. The host supplies threads and cryptographic backends for selected precompiles.
+**Research-stage CPU implementation:** a sequential EVM, an optimistic parallel transaction executor, and a Rust harness for Ethereum fixtures, differential testing, and benchmarks. The interpreter, transaction logic, state database, and parallel scheduler live in Vx, and the parallel workers run on Vx tasks. The host supplies cryptographic backends for selected precompiles. The Keccak-f[1600] and SHA-256 permutations run on the CPU's SHA3 and SHA2 instructions through Vx `mlir!` blocks ([hash_hw_arm.vx](src/evm/hash_hw_arm.vx)); on a CPU without them the build uses the scalar Vx permutations.
 
 ## What's built
 
@@ -25,10 +25,10 @@ The first check runs generated blocks through **revm sequential, Vx sequential, 
 
 Prerequisites:
 
-- The fixed Vx compiler: upstream `dc6a460` plus the local i128-guard and struct-pointer fixes described in the [feasibility report](docs/research/feasibility.md#8-compiler-defects-fixes-and-upstream-issues). The compiler and patches are not bundled here; stock `vxc 0.0.2` is not equivalent.
-- LLVM 22 with `mlir-translate`, `opt`, and `llc`; a C compiler and archiver; Rust and Cargo.
+- The [Vx v0.0.5 release](https://github.com/vx-lang/Vx/releases/tag/v0.0.5) (`vxc 0.0.5 (5b92da4f)`). It includes the i128-guard and struct-pointer fixes that the [feasibility report](docs/research/feasibility.md#8-compiler-defects-fixes-and-upstream-issues) describes. Check the archive against its `.sha256` file.
+- LLVM 22 with `llvm-config`, `mlir-translate`, `opt` and `llc`, which `vxc` runs (on macOS, `brew install llvm@22`); a C compiler and archiver; Rust and Cargo.
 
-The scripts default to `/data/fast/vx-toolchain/vxc` for the fixed compiler and `/usr/lib/llvm-22/bin` for LLVM. Set `VXC` to your fixed compiler executable and `LLVM_BIN` to your LLVM 22 binary directory if installed elsewhere. See [Vx build notes](docs/VX_NOTES.md) for compiler workarounds.
+The scripts default to `/data/fast/vx-toolchain/vxc` for the compiler and `/usr/lib/llvm-22/bin` for LLVM. Set `VXC` to the release's `bin/vxc` and `LLVM_BIN` to your LLVM 22 binary directory (on macOS, `/opt/homebrew/opt/llvm@22/bin`). On macOS, also set `VX_LLVM_BIN` to the same directory. Cargo reads `VXC` too: the harness links the Vx task runtime, `libvx_std_core`, from the release's `lib/` directory and records that path for run time. Set `VX_LIB_DIR` to use another directory. See [Vx build notes](docs/VX_NOTES.md) for compiler workarounds.
 
 Run all commands below from the repository root:
 

@@ -98,6 +98,10 @@ struct Ctx {
   last_cold: u64,
   scratch: *mut U256,
   hacc: *mut HostAccount,
+  // One ChildOut and one word for the call in progress: op_call and take_child
+  // each use them only until they return, and calls never nest inside them.
+  call_out: *mut i8,
+  call_word: *mut u64,
   // Accounts.
   ac_n: u64,
   ac_cap: u64,
@@ -195,10 +199,9 @@ fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
   let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<Ctx>() as u64) };
   let c: *mut Ctx = raw;
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  let e: &mut VxEnv = unsafe { &mut env[0u64] };
   cx.host = host;
   cx.env = env;
-  cx.spec = e.spec;
+  cx.spec = unsafe { env[0u64].spec };
   cx.scratch = calloc_words(8u64);
   cx.rs_cap = 64u64;
   cx.rs_a = calloc_words(64u64);
@@ -214,6 +217,8 @@ fn ctx_new(host: *mut i8, env: *mut VxEnv) -> *mut Ctx {
   cx.fpool = fpr;
   let ha: *mut i8 = unsafe { vx_calloc(1u64, sizeof<HostAccount>() as u64) };
   cx.hacc = ha;
+  cx.call_out = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
+  cx.call_word = limbs_alloc(1u64);
   cx.ac_cap = 16u64;
   cx.ac_addr = calloc_words(16u64);
   cx.ac_bal = calloc_words(16u64);
@@ -399,18 +404,17 @@ fn log_len(c: *mut Ctx) -> u64 {
 // Undo journal entries back to length jn and drop logs past ln.
 fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
   let sd: bool = spec_on(c, SPEC_SPURIOUS_DRAGON);
-  let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  while cx.lg_n > ln {
-    cx.lg_n = cx.lg_n - 1u64;
-    let lp: *mut LogMeta = offset_mut(cx.lg_meta, cx.lg_n as i64);
+  while unsafe { c[0u64].lg_n } > ln {
+    unsafe { c[0u64].lg_n = c[0u64].lg_n - 1u64; }
+    let lp: *mut LogMeta = offset_mut(unsafe { c[0u64].lg_meta }, unsafe { c[0u64].lg_n } as i64);
     let l: &mut LogMeta = unsafe { &mut lp[0u64] };
     mfree(l.data);
   }
-  while cx.j_n > jn {
-    let k: u64 = cx.j_n - 1u64;
-    let jp: *mut JEntry = cx.j;
+  while unsafe { c[0u64].j_n } > jn {
+    let k: u64 = unsafe { c[0u64].j_n } - 1u64;
+    let jp: *mut JEntry = unsafe { c[0u64].j };
     let e: &mut JEntry = unsafe { &mut jp[k] };
-    let vp: *mut U256 = cx.j_val;
+    let vp: *mut U256 = unsafe { c[0u64].j_val };
     let v: U256 = unsafe { vp[k] };
     let kind: u64 = e.kind;
     let a: u64 = e.a;
@@ -442,7 +446,7 @@ fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
     } else if kind == J_STORAGE_WARMED {
       slot_set_warm(c, a, false);
     } else if kind == J_TSTORE {
-      let tv: *mut U256 = cx.ts_val;
+      let tv: *mut U256 = unsafe { c[0u64].ts_val };
       unsafe { tv[a] = v; }
     } else if kind == J_CODE_CHANGE {
       acc_set_hash_raw(c, a, v);
@@ -455,7 +459,7 @@ fn journal_revert(c: *mut Ctx, jn: u64, ln: u64) -> void {
       m.jd = none;
       m.jd_shared = 0u64;
     }
-    cx.j_n = k;
+    unsafe { c[0u64].j_n = k; }
   }
 }
 
@@ -519,8 +523,7 @@ fn acc_push(c: *mut Ctx, a: U256, bal: U256, nonce: u64, hash: U256, code: *mut 
 // access was cold. On a host error the context is marked fatal and index 0 of a
 // placeholder is still returned so callers can unwind.
 fn acc_load(c: *mut Ctx, a: U256) -> u64 {
-  let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  let found: u64 = map_get(cx.amap, a, u256_zero());
+  let found: u64 = map_get(unsafe { c[0u64].amap }, a, u256_zero());
   if found != MAP_NONE {
     if acc_has(c, found, ACC_WARM) {
       set_last_cold(c, false);
@@ -532,31 +535,32 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
     return found;
   }
   let cold: bool = !preset_warm(c, a);
-  let sp: *mut U256 = cx.scratch;
+  let sp: *mut U256 = unsafe { c[0u64].scratch };
   unsafe { sp[0u64] = a; }
-  let ha: *mut HostAccount = cx.hacc;
+  let ha: *mut HostAccount = unsafe { c[0u64].hacc };
   let mut st: u64 = HOST_MISSING;
   let mut from_mv: bool = false;
-  if !is_null_mut(cx.mv) {
+  if !is_null_mut(unsafe { c[0u64].mv }) {
     // Block mode pays the coinbase as a deferred delta, so a speculative read
     // of the coinbase is stale. Flag it: the committer re-executes this
     // transaction with the exact coinbase account once its prefix is final.
-    let ce: &mut VxEnv = unsafe { &mut (cx.env)[0u64] };
+    let cenv: *mut VxEnv = unsafe { c[0u64].env };
+    let ce: &VxEnv = unsafe { &cenv[0u64] };
     if u256_eq(a, ce.coinbase) {
-      cx.cb_read = 1u64;
-      if cx.cb_ov_on != 0u64 {
+      unsafe { c[0u64].cb_read = 1u64; }
+      if unsafe { c[0u64].cb_ov_on } != 0u64 {
         // Final re-execution at commit: the exact coinbase, no versioned read.
         from_mv = true;
-        let ov: *mut HostAccount = cx.cb_ov;
+        let ov: *mut HostAccount = unsafe { c[0u64].cb_ov };
         unsafe { ha[0u64] = ov[0u64]; }
         st = HOST_MISSING;
-        if cx.cb_ov_exists != 0u64 { st = HOST_OK; }
+        if unsafe { c[0u64].cb_ov_exists } != 0u64 { st = HOST_OK; }
       }
     }
   }
-  if !is_null_mut(cx.mv) && !from_mv {
-    let ent: *mut MvEntry = cx.mv_scratch;
-    let r: u64 = mv_read(cx.mv, true, a, u256_zero(), cx.txi, ent);
+  if !is_null_mut(unsafe { c[0u64].mv }) && !from_mv {
+    let ent: *mut MvEntry = unsafe { c[0u64].mv_scratch };
+    let r: u64 = mv_read(unsafe { c[0u64].mv }, true, a, u256_zero(), unsafe { c[0u64].txi }, ent);
     let e: &mut MvEntry = unsafe { &mut ent[0u64] };
     if r == MVR_HIT {
       from_mv = true;
@@ -570,9 +574,9 @@ fn acc_load(c: *mut Ctx, a: U256) -> u64 {
     }
   }
   if !from_mv {
-    if is_null_mut(cx.db) { st = unsafe { evmvx_host_account(cx.host, sp, ha) }; }
+    if is_null_mut(unsafe { c[0u64].db }) { st = unsafe { evmvx_host_account(c[0u64].host, sp, ha) }; }
     else {
-      st = db_account(cx.db, a, ha);
+      st = db_account(unsafe { c[0u64].db }, a, ha);
       rs_record(c, true, a, u256_zero());
     }
   }
@@ -796,8 +800,7 @@ fn slot_push(c: *mut Ctx, acct: u64, a: U256, k: U256, v: U256) -> u64 {
 // last_cold reports a cold access.
 fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
   let a: U256 = acc_addr(c, i);
-  let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  let found: u64 = map_get(cx.smap, a, k);
+  let found: u64 = map_get(unsafe { c[0u64].smap }, a, k);
   if found != MAP_NONE {
     if slot_is_warm(c, found) {
       set_last_cold(c, false);
@@ -812,19 +815,19 @@ fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
   let cold: bool = !al_has_slot(c, a, k);
   let mut v: U256 = u256_zero();
   if !acc_has(c, i, ACC_CREATED) && !acc_has(c, i, ACC_NOT_EXISTING) {
-    let sp: *mut U256 = cx.scratch;
+    let sp: *mut U256 = unsafe { c[0u64].scratch };
     unsafe { sp[0u64] = a; sp[1u64] = k; }
     let kp: *mut U256 = offset_mut(sp, 1i64);
     let vp: *mut U256 = offset_mut(sp, 2i64);
-    if is_null_mut(cx.db) {
-      let st: u64 = unsafe { evmvx_host_storage(cx.host, sp, kp, vp) };
+    if is_null_mut(unsafe { c[0u64].db }) {
+      let st: u64 = unsafe { evmvx_host_storage(c[0u64].host, sp, kp, vp) };
       if st == HOST_ERROR { set_fatal(c); }
       v = unsafe { sp[2u64] };
     } else {
       let mut from_mv: bool = false;
-      if !is_null_mut(cx.mv) {
-        let ent: *mut MvEntry = cx.mv_scratch;
-        let r: u64 = mv_read(cx.mv, false, a, k, cx.txi, ent);
+      if !is_null_mut(unsafe { c[0u64].mv }) {
+        let ent: *mut MvEntry = unsafe { c[0u64].mv_scratch };
+        let r: u64 = mv_read(unsafe { c[0u64].mv }, false, a, k, unsafe { c[0u64].txi }, ent);
         let e: &mut MvEntry = unsafe { &mut ent[0u64] };
         if r == MVR_HIT {
           from_mv = true;
@@ -833,7 +836,7 @@ fn slot_load(c: *mut Ctx, i: u64, k: U256) -> u64 {
         }
       }
       if !from_mv {
-        v = db_storage(cx.db, a, k);
+        v = db_storage(unsafe { c[0u64].db }, a, k);
         rs_record(c, false, a, k);
       }
     }
@@ -889,8 +892,7 @@ fn tload(c: *mut Ctx, a: U256, k: U256) -> U256 {
 
 fn tstore(c: *mut Ctx, a: U256, k: U256, v: U256) -> void {
   let t: u64 = tslot_find(c, a, k, true);
-  let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  let tv: *mut U256 = cx.ts_val;
+  let tv: *mut U256 = unsafe { c[0u64].ts_val };
   let old: U256 = unsafe { tv[t] };
   if !u256_eq(old, v) {
     let none: *mut u8 = null_u8();
@@ -1072,13 +1074,16 @@ fn ctx_free(c: *mut Ctx) -> void {
   unsafe { vx_free(codes); }
   let p0: *mut i8 = cx.cb_ov;
   unsafe { vx_free(p0); }
-  let p1: *mut i8 = cx.mv_scratch;
-  let p2: *mut i8 = cx.fpool;
-  let p3: *mut i8 = cx.hacc;
-  let p4: *mut i8 = cx.ac_meta;
-  let p5: *mut i8 = cx.sl_meta;
-  let p6: *mut i8 = cx.j;
-  let p7: *mut i8 = cx.lg_meta;
+  let p1: *mut i8 = unsafe { c[0u64].mv_scratch };
+  let p2: *mut i8 = unsafe { c[0u64].fpool };
+  let p3: *mut i8 = unsafe { c[0u64].hacc };
+  let pco: *mut i8 = unsafe { c[0u64].call_out };
+  unsafe { vx_free(pco); }
+  limbs_free(unsafe { c[0u64].call_word });
+  let p4: *mut i8 = unsafe { c[0u64].ac_meta };
+  let p5: *mut i8 = unsafe { c[0u64].sl_meta };
+  let p6: *mut i8 = unsafe { c[0u64].j };
+  let p7: *mut i8 = unsafe { c[0u64].lg_meta };
   let p8: *mut i8 = c;
   unsafe { vx_free(p1); vx_free(p2); vx_free(p3); vx_free(p4); vx_free(p5); vx_free(p6); vx_free(p7); vx_free(p8); }
 }

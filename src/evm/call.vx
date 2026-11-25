@@ -156,10 +156,9 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
     }
   }
   // EIP-7702 delegated code.
-  let ciu: *mut u64 = limbs_alloc(1u64);
-  if !resolve_delegated(c, f, i, ciu) { limbs_free(ciu); return R_OOG; }
+  let ciu: *mut u64 = unsafe { c[0u64].call_word };
+  if !resolve_delegated(c, f, i, ciu) { return R_OOG; }
   let code_idx: u64 = unsafe { ciu[0u64] };
-  limbs_free(ciu);
 
   // 63/64 rule and the requested limit.
   let remaining: u64 = frame_gas(f);
@@ -188,14 +187,12 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
   let is_static: bool = frame_is_static(f) || op == OP_STATICCALL;
 
   let input: *mut u8 = mem_slice_dup(f, in_off, in_len);
-  let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
-  let o: *mut ChildOut = oraw;
+  let o: *mut ChildOut = child_out_scratch(c);
 
   // Depth limit: nothing runs, gas returns, push 0.
   if frame_depth(f) + 1u64 > CALL_DEPTH_LIMIT {
     finish_call(c, f, o, false, child_gas, out_off, out_len, R_CALL_TOO_DEEP);
     mfree(input);
-    unsafe { vx_free(oraw); }
     return R_CONTINUE;
   }
 
@@ -212,7 +209,6 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
       journal_revert(c, jn, ln);
       finish_call(c, f, o, false, child_gas, out_off, out_len, R_OUT_OF_FUNDS);
       mfree(input);
-      unsafe { vx_free(oraw); }
       return R_CONTINUE;
     }
   }
@@ -241,12 +237,10 @@ fn op_call(c: *mut Ctx, f: *mut Frame, op: u64) -> u64 {
     fr.k_ln = ln;
     fr.k_buf_a = input;
     fr.k_child = child;
-    unsafe { vx_free(oraw); }
     return R_SUSPEND;
   }
   call_complete(c, f, o, jn, ln, out_off, out_len);
   mfree(input);
-  unsafe { vx_free(oraw); }
   return R_CONTINUE;
 }
 
@@ -257,11 +251,17 @@ fn call_complete(c: *mut Ctx, f: *mut Frame, o: *mut ChildOut, jn: u64, ln: u64,
   commit_call(c, f, o, out_off, out_len);
 }
 
-// Collects a finished child frame's result into a fresh ChildOut and frees
-// the child. The caller frees the ChildOut and its out buffer.
+// The context's ChildOut, cleared. Valid until the next call to this function.
+fn child_out_scratch(c: *mut Ctx) -> *mut ChildOut {
+  let o: *mut ChildOut = unsafe { c[0u64].call_out };
+  unsafe { o[0u64] = ChildOut { result: 0u64, gas_left: 0u64, refund: 0i64, out: null_u8(), out_len: 0u64, addr: u256_zero() }; }
+  return o;
+}
+
+// Collects a finished child frame's result into the context's ChildOut and
+// retires the child. The caller frees the out buffer.
 fn take_child(c: *mut Ctx, child: *mut Frame, res: u64) -> *mut ChildOut {
-  let oraw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<ChildOut>() as u64) };
-  let o: *mut ChildOut = oraw;
+  let o: *mut ChildOut = child_out_scratch(c);
   let cf: &mut Frame = unsafe { &mut child[0u64] };
   let r: &mut ChildOut = unsafe { &mut o[0u64] };
   r.result = res;
@@ -283,12 +283,11 @@ fn resume_call(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -> 
   let ln: u64 = p.k_ln;
   let out_off: u64 = p.k_out_off;
   let out_len: u64 = p.k_out_len;
-  let input: *mut u8 = p.k_buf_a;
   p.k_kind = K_NONE;
+  // Raw read after p's last use: input outlives call_complete(parent).
+  let input: *mut u8 = unsafe { parent[0u64].k_buf_a };
   call_complete(c, parent, o, jn, ln, out_off, out_len);
   mfree(input);
-  let oraw: *mut i8 = o;
-  unsafe { vx_free(oraw); }
 }
 
 // Dispatches a finished child's result to the continuation its parent saved.
@@ -426,9 +425,10 @@ fn resume_create(c: *mut Ctx, parent: *mut Frame, child: *mut Frame, res: u64) -
   if r_is_ok_or_revert(res) { gas_left = cf.gas; }
   let mut refund: i64 = 0i64;
   if r_is_ok(res) { refund = cf.refund; }
-  let outp: *mut u8 = dup_bytes(cf.out, cf.out_len);
   let outl: u64 = cf.out_len;
-  let cinput: *mut u8 = cf.input;
+  // Raw reads: both pointers outlive frame_put(child).
+  let outp: *mut u8 = dup_bytes(unsafe { child[0u64].out }, outl);
+  let cinput: *mut u8 = unsafe { child[0u64].input };
   frame_put(c, child);
   mfree(cinput);
   mfree(jd);

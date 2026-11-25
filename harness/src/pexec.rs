@@ -80,6 +80,8 @@ fn median(samples: &[Duration]) -> Duration {
 
 fn sequential(base: &Host, envs: &[env::EnvBuf]) -> (Duration, Vec<Observation>, Host) {
     let mut host = base.clone();
+    // Load state, and analyze code, before the clock starts, as `reference` does for revm.
+    host.attach_db();
     let mut observations = Vec::with_capacity(envs.len());
     let start = Instant::now();
     for environment in envs {
@@ -143,7 +145,7 @@ struct ParallelRun {
     conflicts: Vec<serde_json::Value>,
 }
 
-fn parallel(base: &Host, environments: &[VxEnv], threads: usize) -> ParallelRun {
+fn parallel(base: &Host, environments: &[VxEnv], pool: &VxPool) -> ParallelRun {
     let setup = Instant::now();
     let mut host = base.clone();
     host.attach_db();
@@ -156,24 +158,7 @@ fn parallel(base: &Host, environments: &[VxEnv], threads: usize) -> ParallelRun 
             environments.len() as u64,
         )
     });
-    let address = native.0 as usize;
-    std::thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            workers.push(
-                std::thread::Builder::new()
-                    .name("vxworker".into())
-                    .spawn_scoped(scope, move || unsafe {
-                        evmvx_block_worker(address as *mut c_void)
-                    })
-                    .expect("could not create benchmark worker"),
-            );
-        }
-        for worker in workers {
-            worker.join().expect("Vx worker panicked");
-        }
-    });
-    let committed = unsafe { evmvx_block_finish(native.0) } as usize;
+    let committed = pool.run(native.0) as usize;
     assert_eq!(committed, environments.len(), "parallel benchmark aborted");
     let mut observations = Vec::with_capacity(committed);
     for index in 0..committed {
@@ -278,6 +263,8 @@ pub fn run(ntx: usize, threads: usize, contracts: u64, reps: u32, workload: Work
         .map(|env| unsafe { std::ptr::read(&env.env) })
         .collect();
     let initial = build_state(ntx, contracts, workload);
+    // Started once, outside every timed region, as a node keeps its executor threads.
+    let pool = VxPool::new(threads);
     let mut seq_times = Vec::new();
     let mut revm_times = Vec::new();
     let mut par_times = Vec::new();
@@ -293,17 +280,17 @@ pub fn run(ntx: usize, threads: usize, contracts: u64, reps: u32, workload: Work
             0 => {
                 let s = sequential(&initial, &environments);
                 let r = reference(&initial, &transactions, &block, &cfg);
-                let p = parallel(&initial, &native_envs, threads);
+                let p = parallel(&initial, &native_envs, &pool);
                 (s, r, p)
             }
             1 => {
                 let r = reference(&initial, &transactions, &block, &cfg);
-                let p = parallel(&initial, &native_envs, threads);
+                let p = parallel(&initial, &native_envs, &pool);
                 let s = sequential(&initial, &environments);
                 (s, r, p)
             }
             _ => {
-                let p = parallel(&initial, &native_envs, threads);
+                let p = parallel(&initial, &native_envs, &pool);
                 let s = sequential(&initial, &environments);
                 let r = reference(&initial, &transactions, &block, &cfg);
                 (s, r, p)

@@ -123,8 +123,8 @@ fn op_log(c: *mut Ctx, f: *mut Frame, n: u64) -> u64 {
     if !fits(off) { return R_INVALID_OPERAND_OOG; }
     let r: u64 = mem_expand(f, off.l0, len);
     if r != R_CONTINUE { return r; }
-    let fr: &mut Frame = unsafe { &mut f[0u64] };
-    let src: *mut u8 = offset_mut(fr.mem, off.l0 as i64);
+    // Raw read: Vx 0.0.5 tracks return provenance, so dup_bytes(src) would keep a `&mut` of f alive.
+    let src: *mut u8 = offset_mut(unsafe { f[0u64].mem }, off.l0 as i64);
     mfree(data);
     data = dup_bytes(src, len);
   }

@@ -109,11 +109,10 @@ fn mv_write(m: *mut MvMem, is_acct: bool, a: U256, k: U256, e: *mut MvEntry) -> 
 }
 
 fn mv_free(m: *mut MvMem) -> void {
-  let mm: &mut MvMem = unsafe { &mut m[0u64] };
-  map_free(mm.amap);
-  map_free(mm.smap);
-  map_free(mm.resets);
-  let ep: *mut i8 = mm.entries;
+  map_free(unsafe { m[0u64].amap });
+  map_free(unsafe { m[0u64].smap });
+  map_free(unsafe { m[0u64].resets });
+  let ep: *mut i8 = unsafe { m[0u64].entries };
   let raw: *mut i8 = m;
   unsafe { vx_free(ep); vx_free(raw); }
 }

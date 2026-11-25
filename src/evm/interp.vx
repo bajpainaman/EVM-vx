@@ -16,15 +16,13 @@ fn run_frame(c: *mut Ctx, root: *mut Frame) -> u64 {
   loop {
     if unwinding { res = R_FATAL; } else { res = run_loop(c, cur, tmp, sd); }
     if res == R_SUSPEND {
-      let fr: &mut Frame = unsafe { &mut cur[0u64] };
-      let child: *mut Frame = fr.k_child;
+      let child: *mut Frame = unsafe { cur[0u64].k_child };
       let cr: &mut Frame = unsafe { &mut child[0u64] };
       cr.parent = cur;
       cur = child;
     } else {
       if frame_depth(cur) == root_depth { break; }
-      let cf: &mut Frame = unsafe { &mut cur[0u64] };
-      let parent: *mut Frame = cf.parent;
+      let parent: *mut Frame = unsafe { cur[0u64].parent };
       resume_parent(c, parent, cur, res);
       cur = parent;
       if is_fatal(c) { unwinding = true; }
@@ -41,20 +39,20 @@ fn run_frame(c: *mut Ctx, root: *mut Frame) -> u64 {
 // locals back to the frame, runs its handler, and reloads them.
 fn run_loop(c: *mut Ctx, f: *mut Frame, tmp: *mut u64, sd: *mut SdResult) -> u64 {
   let spec: u64 = ctx_spec(c);
-  let fr0: &mut Frame = unsafe { &mut f[0u64] };
-  let code: *mut u8 = fr0.code;
-  let code_len: u64 = fr0.code_len;
-  let st: *mut U256 = fr0.stack;
-  let jd: *mut u8 = fr0.jd;
-  let tp: *mut OpTabs = fr0.tabs;
+  // Raw reads: pointers copied out of a `&mut` of f would keep f borrowed for the whole loop.
+  let code: *mut u8 = unsafe { f[0u64].code };
+  let code_len: u64 = unsafe { f[0u64].code_len };
+  let st: *mut U256 = unsafe { f[0u64].stack };
+  let jd: *mut u8 = unsafe { f[0u64].jd };
+  let tp: *mut OpTabs = unsafe { f[0u64].tabs };
   let t: &mut OpTabs = unsafe { &mut tp[0u64] };
   let actp: *mut u8 = t.act;
   let gp: *mut u64 = t.gas;
   let sip: *mut u8 = t.sin;
   let sop: *mut u8 = t.sout;
-  let mut pc: u64 = fr0.pc;
-  let mut gas: u64 = fr0.gas;
-  let mut sp: u64 = fr0.sp;
+  let mut pc: u64 = unsafe { f[0u64].pc };
+  let mut gas: u64 = unsafe { f[0u64].gas };
+  let mut sp: u64 = unsafe { f[0u64].sp };
   let mut res: u64 = R_STOP;
   loop {
     if pc >= code_len { res = R_STOP; break; }
@@ -74,7 +72,14 @@ fn run_loop(c: *mut Ctx, f: *mut Frame, tmp: *mut u64, sd: *mut SdResult) -> u64
     let mut done: bool = false;
     if op >= 96u64 && op <= 127u64 {
       let n: u64 = op - 95u64;
-      unsafe { st[sp] = u256_load_be_n(code, code_len, pc, n); }
+      if n == 1u64 {
+        // PUSH1, the most common opcode, stays inline; a byte past the code reads as zero.
+        let mut b: u64 = 0u64;
+        if pc < code_len { b = (unsafe { code[pc] }) as u64; }
+        unsafe { st[sp] = U256 { l0: b, l1: 0u64, l2: 0u64, l3: 0u64 }; }
+      } else {
+        unsafe { st[sp] = u256_load_be_n(code, code_len, pc, n); }
+      }
       pc = pc + n;
       sp = sp + 1u64;
     } else if op >= 128u64 && op <= 143u64 {
@@ -100,6 +105,21 @@ fn run_loop(c: *mut Ctx, f: *mut Frame, tmp: *mut u64, sd: *mut SdResult) -> u64
         22 => { unsafe { st[sp - 2u64] = u256_and(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
         23 => { unsafe { st[sp - 2u64] = u256_or(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
         24 => { unsafe { st[sp - 2u64] = u256_xor(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        // The remaining stack-only opcodes, as op_binary/op_unary compute them, without the
+        // call to dispatch and the round trip of pc, gas and sp through the frame.
+        2 => { unsafe { st[sp - 2u64] = u256_mul(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        4 => { unsafe { st[sp - 2u64] = u256_div(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        5 => { unsafe { st[sp - 2u64] = u256_sdiv(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        6 => { unsafe { st[sp - 2u64] = u256_mod(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        7 => { unsafe { st[sp - 2u64] = u256_smod(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        11 => { unsafe { st[sp - 2u64] = u256_signextend(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        18 => { unsafe { st[sp - 2u64] = u256_from_bool(u256_slt(st[sp - 1u64], st[sp - 2u64])); } sp = sp - 1u64; }
+        19 => { unsafe { st[sp - 2u64] = u256_from_bool(u256_sgt(st[sp - 1u64], st[sp - 2u64])); } sp = sp - 1u64; }
+        25 => { unsafe { st[sp - 1u64] = u256_not(st[sp - 1u64]); } }
+        26 => { unsafe { st[sp - 2u64] = u256_byte(st[sp - 1u64], st[sp - 2u64]); } sp = sp - 1u64; }
+        27 => { unsafe { st[sp - 2u64] = u256_shl(st[sp - 2u64], st[sp - 1u64]); } sp = sp - 1u64; }
+        28 => { unsafe { st[sp - 2u64] = u256_shr(st[sp - 2u64], st[sp - 1u64]); } sp = sp - 1u64; }
+        29 => { unsafe { st[sp - 2u64] = u256_sar(st[sp - 2u64], st[sp - 1u64]); } sp = sp - 1u64; }
         80 => { sp = sp - 1u64; }
         86 => {
           let dest: U256 = unsafe { st[sp - 1u64] };

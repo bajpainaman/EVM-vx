@@ -25,3 +25,12 @@ fn evx_afetch_add(p: *mut u64, v: u64) -> u64 {
     macro.yield %r : i64
   };
 }
+
+// A read-modify-write that both publishes this thread's earlier writes and sees
+// those of the thread that last released the cell (pool job and completion counts).
+fn evx_afetch_add_acqrel(p: *mut u64, v: u64) -> u64 {
+  return mlir!(inputs: (%p = p : !llvm.ptr, %v = v : i64), returns: u64, dialects: ["llvm"]) {
+    %r = llvm.atomicrmw add %p, %v acq_rel : !llvm.ptr, i64
+    macro.yield %r : i64
+  };
+}

@@ -202,6 +202,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
     let mut total_txs = 0;
     let mut reexecs = 0u64;
     let mut cbtx = 0u64;
+    let pool = VxPool::new(threads);
     for bi in 0..blocks {
         let mut g = Gen { rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (bi as u64 + 1)), nonces: HashMap::new(), created: Vec::new() };
         let mut block = BlockEnv::default();
@@ -255,15 +256,7 @@ pub fn run(blocks: usize, txs_per: usize, seed: u64, threads: usize) -> Result<(
         hp.attach_db();
         let venvs: Vec<VxEnv> = ebs.iter().map(|eb| unsafe { std::ptr::read(&eb.env) }).collect();
         let b = unsafe { evmvx_block_new(hp.db as *mut c_void, venvs.as_ptr(), n as u64) };
-        let bp = b as usize;
-        std::thread::scope(|s| {
-            let mut workers = Vec::with_capacity(threads);
-            for _ in 0..threads {
-                workers.push(s.spawn(move || unsafe { evmvx_block_worker(bp as *mut c_void) }));
-            }
-            for worker in workers { worker.join().expect("Vx worker panicked"); }
-        });
-        let committed = unsafe { evmvx_block_finish(b) };
+        let committed = pool.run(b);
         if committed as usize != n {
             return Err(format!("block {bi}: parallel committed {committed}/{n} (aborted={})", unsafe { evmvx_block_aborted(b) }));
         }

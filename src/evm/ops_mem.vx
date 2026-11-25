@@ -47,13 +47,13 @@ fn op_copy(f: *mut Frame, src_kind: u64, tmp: *mut u64) -> u64 {
   if !fits(lenw) { return R_INVALID_OPERAND_OOG; }
   let len: u64 = lenw.l0;
   let doff: u64 = u256_sat_u64(data_off);
-  let fr: &mut Frame = unsafe { &mut f[0u64] };
-  let mut src: *mut u8 = fr.input;
-  let mut src_len: u64 = fr.input_len;
-  if src_kind == 1u64 { src = fr.code; src_len = fr.code_len; }
+  // Raw reads: `src` outlives copy_prepare(f), so it must not come from a `&mut` of f.
+  let mut src: *mut u8 = unsafe { f[0u64].input };
+  let mut src_len: u64 = unsafe { f[0u64].input_len };
+  if src_kind == 1u64 { src = unsafe { f[0u64].code }; src_len = unsafe { f[0u64].code_len }; }
   if src_kind == 2u64 {
-    src = fr.ret;
-    src_len = fr.ret_len;
+    src = unsafe { f[0u64].ret };
+    src_len = unsafe { f[0u64].ret_len };
     if sat_add(doff, len) > src_len { return R_OUT_OF_OFFSET; }
   }
   let r: u64 = copy_prepare(f, mem_off, len, tmp);

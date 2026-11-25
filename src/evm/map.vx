@@ -87,12 +87,12 @@ fn map_get(m: *mut Map, a: U256, b: U256) -> u64 {
 }
 
 fn map_grow(m: *mut Map) -> void {
-  let mr: &mut Map = unsafe { &mut m[0u64] };
-  let old_cap: u64 = mr.cap;
-  let oka: *mut U256 = mr.ka;
-  let okb: *mut U256 = mr.kb;
-  let ov: *mut u64 = mr.vals;
-  let ou: *mut u8 = mr.used;
+  // Read through the raw pointer: a pointer copied out of a `&mut` stays borrowed in Vx 0.0.5.
+  let old_cap: u64 = unsafe { m[0u64].cap };
+  let oka: *mut U256 = unsafe { m[0u64].ka };
+  let okb: *mut U256 = unsafe { m[0u64].kb };
+  let ov: *mut u64 = unsafe { m[0u64].vals };
+  let ou: *mut u8 = unsafe { m[0u64].used };
   map_alloc_arrays(m, old_cap * 2u64);
   let mut i: u64 = 0u64;
   while i < old_cap {
@@ -144,12 +144,11 @@ fn map_len(m: *mut Map) -> u64 {
 fn map_free(m: *mut Map) -> void {
   let mut current: *mut Map = m;
   while !is_null_mut(current) {
-    let mr: &mut Map = unsafe { &mut current[0u64] };
-    let previous: *mut Map = mr.previous;
-    let fa: *mut i8 = mr.ka;
-    let fb: *mut i8 = mr.kb;
-    let fv: *mut i8 = mr.vals;
-    let fu: *mut i8 = mr.used;
+    let previous: *mut Map = unsafe { current[0u64].previous };
+    let fa: *mut i8 = unsafe { current[0u64].ka };
+    let fb: *mut i8 = unsafe { current[0u64].kb };
+    let fv: *mut i8 = unsafe { current[0u64].vals };
+    let fu: *mut i8 = unsafe { current[0u64].used };
     let fm: *mut i8 = current;
     unsafe { vx_free(fa); vx_free(fb); vx_free(fv); vx_free(fu); vx_free(fm); }
     current = previous;
