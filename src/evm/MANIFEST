@@ -8,6 +8,7 @@ abi.vx
 db.vx
 mvmem.vx
 block.vx
+pool.vx
 bytecode.vx
 optables.vx
 gasfn.vx
@@ -23,6 +24,7 @@ interp.vx
 api.vx
 precompile.vx
 pc_sha256.vx
+hash_hw.vx
 pc_ripemd160.vx
 pc_blake2f.vx
 bigint.vx

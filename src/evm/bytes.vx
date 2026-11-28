@@ -7,8 +7,27 @@ fn byte_at(p: *mut u8, len: u64, off: u64) -> u64 {
   return b as u64;
 }
 
+// Eight bytes at p as a big-endian u64: one unaligned load and a byte swap.
+fn load_be64(p: *mut u8) -> u64 {
+  return mlir!( inputs : (%p = p : !llvm.ptr), returns : u64, dialects : ["llvm"]) {
+    %v = llvm.load %p {alignment = 1 : i64} : !llvm.ptr -> i64
+    %r = llvm.intr.bswap(%v) : (i64) -> i64
+    macro.yield %r : i64
+  };
+}
+
+// Writes v as eight big-endian bytes at p: a byte swap and one unaligned store.
+fn put_be64(p: *mut u8, v: u64) -> void {
+  mlir!( inputs : (%p = p : !llvm.ptr, %v = v : i64), dialects : ["llvm"]) {
+    %r = llvm.intr.bswap(%v) : (i64) -> i64
+    llvm.store %r, %p {alignment = 1 : i64} : i64, !llvm.ptr
+    macro.yield
+  };
+}
+
 // Eight bytes at p + off as a big-endian u64; bytes at or past len read as zero.
 fn load_be64_padded(p: *mut u8, len: u64, off: u64) -> u64 {
+  if off <= len && len - off >= 8u64 { return load_be64(offset_mut(p, off as i64)); }
   let mut r: u64 = 0u64;
   let mut i: u64 = 0u64;
   while i < 8u64 {
@@ -31,12 +50,7 @@ fn u256_load_padded(src: *mut u8, len: u64, off: u64) -> U256 {
 fn u256_load_be(p: *mut u8) -> U256 { return u256_load_padded(p, 32u64, 0u64); }
 
 fn store_be64(p: *mut u8, off: u64, v: u64) -> void {
-  let mut i: u64 = 0u64;
-  while i < 8u64 {
-    let b: u8 = ((v >> ((7u64 - i) * 8u64)) & 255u64) as u8;
-    unsafe { p[off + i] = b; }
-    i = i + 1u64;
-  }
+  put_be64(offset_mut(p, off as i64), v);
 }
 
 fn u256_store_be(p: *mut u8, v: U256) -> void {
@@ -49,6 +63,38 @@ fn u256_store_be(p: *mut u8, v: U256) -> void {
 // n bytes (n <= 32) at p + off as a big-endian number; bytes past len read as zero.
 // PUSHn at the end of code reads its missing immediate bytes as zero.
 fn u256_load_be_n(p: *mut u8, len: u64, off: u64, n: u64) -> U256 {
+  if n == 1u64 { return U256 { l0: byte_at(p, len, off), l1: 0u64, l2: 0u64, l3: 0u64 }; }
+  if off <= len && len - off >= n && n >= 8u64 {
+    // Whole limbs from the end; a partial top limb takes the leading bytes.
+    let end: u64 = off + n;
+    let mut r: U256 = u256_zero();
+    r.l0 = load_be64(offset_mut(p, (end - 8u64) as i64));
+    if n >= 16u64 { r.l1 = load_be64(offset_mut(p, (end - 16u64) as i64)); }
+    if n >= 24u64 { r.l2 = load_be64(offset_mut(p, (end - 24u64) as i64)); }
+    if n == 32u64 { r.l3 = load_be64(offset_mut(p, off as i64)); }
+    let rem: u64 = n % 8u64;
+    if rem != 0u64 {
+      let mut v: u64 = 0u64;
+      let mut i: u64 = 0u64;
+      while i < rem {
+        v = (v << 8u64) | ((unsafe { p[off + i] }) as u64);
+        i = i + 1u64;
+      }
+      let limb: u64 = n / 8u64;
+      if limb == 1u64 { r.l1 = v; } else if limb == 2u64 { r.l2 = v; } else { r.l3 = v; }
+    }
+    return r;
+  }
+  if off <= len && len - off >= n {
+    // PUSH2..PUSH7, all in range: the bytes fit the low limb.
+    let mut v: u64 = 0u64;
+    let mut i: u64 = 0u64;
+    while i < n {
+      v = (v << 8u64) | ((unsafe { p[off + i] }) as u64);
+      i = i + 1u64;
+    }
+    return U256 { l0: v, l1: 0u64, l2: 0u64, l3: 0u64 };
+  }
   let mut r: U256 = u256_zero();
   let mut i: u64 = 0u64;
   while i < n {
@@ -67,11 +113,10 @@ fn u256_to_address(v: U256) -> U256 {
 
 // Writes the 20 address bytes of a (big endian) to p.
 fn address_store(p: *mut u8, a: U256) -> void {
-  let t: *mut u8 = zalloc(32u64);
-  u256_store_be(t, a);
-  let src: *mut u8 = offset_mut(t, 12i64);
-  copy_bytes(p, src, 20u64);
-  mfree(t);
+  let hi: u64 = a.l2;
+  unsafe { p[0u64] = (hi >> 24u64) as u8; p[1u64] = (hi >> 16u64) as u8; p[2u64] = (hi >> 8u64) as u8; p[3u64] = hi as u8; }
+  put_be64(offset_mut(p, 4i64), a.l1);
+  put_be64(offset_mut(p, 12i64), a.l0);
 }
 
 // Converts a value to u64, saturating at u64::MAX.

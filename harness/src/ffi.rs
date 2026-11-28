@@ -197,9 +197,17 @@ extern "C" {
     pub fn evmvx_db_balance_incr(db: *mut core::ffi::c_void, addr: *const Word, amount: *const Word, eip161: u64);
     pub fn evmvx_db_free(db: *mut core::ffi::c_void);
     pub fn evmvx_transact_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
-    /// Block executor (src/evm/block.vx): host threads call evmvx_block_worker
-    /// until the block commits; finish applies it to the db.
+    /// Block executor (src/evm/block.vx): evmvx_block_run executes the block on
+    /// Vx tasks and finishes it; finish applies it to the db. Tests drive
+    /// evmvx_block_worker from their own threads.
     pub fn evmvx_block_new(db: *mut core::ffi::c_void, envs: *const VxEnv, n: u64) -> *mut core::ffi::c_void;
+    pub fn evmvx_block_run(b: *mut core::ffi::c_void, workers: u64) -> u64;
+    /// Persistent pool (src/evm/pool.vx): Vx tasks started once by evmvx_pool_serve.
+    pub fn evmvx_pool_new(workers: u64) -> *mut core::ffi::c_void;
+    pub fn evmvx_pool_serve(p: *mut core::ffi::c_void);
+    pub fn evmvx_pool_stop(p: *mut core::ffi::c_void);
+    pub fn evmvx_pool_free(p: *mut core::ffi::c_void);
+    pub fn evmvx_block_run_pool(p: *mut core::ffi::c_void, b: *mut core::ffi::c_void) -> u64;
     pub fn evmvx_block_worker(b: *mut core::ffi::c_void);
     pub fn evmvx_block_cancel(b: *mut core::ffi::c_void);
     pub fn evmvx_block_conflict(b: *mut core::ffi::c_void, i: u64, out: *mut BlockConflict) -> u64;
@@ -216,4 +224,51 @@ extern "C" {
     pub fn evmvx_system_call_db(db: *mut core::ffi::c_void, env: *const VxEnv) -> *mut VxResult;
     /// Struct sizes the Vx side sees, for a layout check at startup.
     pub fn evmvx_abi_sizes(out: *mut u64);
+}
+
+/// A persistent pool of Vx tasks for the block executor. One host thread is lent to
+/// evmvx_pool_serve, which starts the workers as Vx tasks; dropping the pool stops
+/// them. Runs one block at a time.
+pub struct VxPool {
+    pool: usize,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VxPool {
+    pub fn new(workers: usize) -> Self {
+        let pool = unsafe { evmvx_pool_new(workers as u64) } as usize;
+        let server = std::thread::Builder::new()
+            .name("vxpool".into())
+            .spawn(move || unsafe {
+                // The workers inherit this thread's QoS. macOS gives a default-QoS
+                // thread's descendants efficiency cores; the block executor needs
+                // performance cores, as the timed sequential runs get.
+                #[cfg(target_os = "macos")]
+                {
+                    extern "C" {
+                        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                    }
+                    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+                    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                }
+                evmvx_pool_serve(pool as *mut core::ffi::c_void)
+            })
+            .expect("could not start the Vx pool thread");
+        Self { pool, server: Some(server) }
+    }
+
+    /// evmvx_block_run on the pool's workers: executes, commits and publishes block b.
+    pub fn run(&self, b: *mut core::ffi::c_void) -> u64 {
+        unsafe { evmvx_block_run_pool(self.pool as *mut core::ffi::c_void, b) }
+    }
+}
+
+impl Drop for VxPool {
+    fn drop(&mut self) {
+        unsafe { evmvx_pool_stop(self.pool as *mut core::ffi::c_void) };
+        if let Some(server) = self.server.take() {
+            server.join().expect("Vx pool thread panicked");
+        }
+        unsafe { evmvx_pool_free(self.pool as *mut core::ffi::c_void) };
+    }
 }

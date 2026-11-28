@@ -79,6 +79,8 @@ def main():
             w(f'  unsafe {{ st[{x + 5 * y}] = {lane(x, y)}; }}')
     w('}')
     w('''
+// keccak_f1600_hw (hash_hw_arm.vx or hash_hw_portable.vx, chosen by build-lib.sh) runs
+// the permutation on the CPU's SHA3 instructions, or calls keccak_f.
 // XORs 136 bytes (17 little-endian lanes) at p into the state.
 fn keccak_absorb(st: *mut u64, p: *mut u8) -> void {
   let mut i: u64 = 0u64;
@@ -114,7 +116,7 @@ fn keccak256(p: *mut u8, n: u64) -> U256 {
   while n - off >= 136u64 {
     let blk: *mut u8 = offset_mut(p, off as i64);
     keccak_absorb(st, blk);
-    keccak_f(st);
+    keccak_f1600_hw(st);
     off = off + 136u64;
   }
   let last: *mut u8 = zalloc(136u64);
@@ -128,7 +130,7 @@ fn keccak256(p: *mut u8, n: u64) -> U256 {
   let b1: u8 = unsafe { last[135u64] };
   unsafe { last[135u64] = b1 ^ 128u8; }
   keccak_absorb(st, last);
-  keccak_f(st);
+  keccak_f1600_hw(st);
   let h = U256 { l0: bswap64(unsafe { st[3] }), l1: bswap64(unsafe { st[2] }),
                  l2: bswap64(unsafe { st[1] }), l3: bswap64(unsafe { st[0] }) };
   mfree(last);

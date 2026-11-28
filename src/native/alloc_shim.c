@@ -8,10 +8,11 @@
  *   thread heaps grow with an mprotect every few pages, which serializes all
  *   cores on the kernel's memory-map lock).
  * - Every block's 16-byte header holds its class and its owning heap. A block
- *   freed by another thread goes onto the owner's lock-free remote list, and
- *   the owner drains that list when a free list runs dry. So memory returns
- *   to the thread that allocates it (workers allocate results that the main
- *   thread frees), and long multi-block runs stay bounded.
+ *   freed by another thread goes onto the owner's lock-free remote list for
+ *   its class. When a free list runs dry, the owner takes that class's whole
+ *   remote list in one exchange and uses it as the free list, without walking
+ *   it. So memory returns to the thread that allocates it (workers allocate
+ *   results that the main thread frees), and long multi-block runs stay bounded.
  * - Heaps are never freed. A permanent registry has immutable links; exiting
  *   threads release ownership and new threads claim an idle heap. Registry
  *   nodes are never removed, so adoption has no ABA/reclamation problem.
@@ -26,7 +27,12 @@
 #include <string.h>
 #include <sys/mman.h>
 
-#define NCLASS 13                   /* 16 B .. 64 KiB, powers of two */
+/* Prefaulting is a Linux-only optimization; elsewhere pages fault on first touch. */
+#ifndef MAP_POPULATE
+#define MAP_POPULATE 0
+#endif
+
+#define NCLASS 13                  /* 16 B .. 64 KiB, powers of two */
 #define MAX_CLASS_SIZE (16u << 12)
 #define CHUNK (8u << 20)            /* 8 MiB per refill */
 #define LARGE 0xffu
@@ -37,7 +43,7 @@ typedef struct FreeBlock { struct FreeBlock *next; } FreeBlock;
 typedef struct Heap {
     FreeBlock *lists[NCLASS];
     uint8_t *cur, *end;
-    _Atomic(FreeBlock *) remote;     /* blocks freed by other threads */
+    _Atomic(FreeBlock *) remote[NCLASS];  /* blocks freed by other threads, per class */
     struct Heap *next;
     _Atomic unsigned claimed;
 } Heap;
@@ -69,7 +75,7 @@ static Heap *heap_init(void) {
         h = (Heap *)calloc(1, sizeof(Heap));
         if (!h) abort();
         atomic_init(&h->claimed, 1);
-        atomic_init(&h->remote, NULL);
+        for (unsigned c = 0; c < NCLASS; c++) atomic_init(&h->remote[c], NULL);
         Heap *head = atomic_load_explicit(&heaps, memory_order_acquire);
         do { h->next = head; }
         while (!atomic_compare_exchange_weak_explicit(&heaps, &head, h,
@@ -90,20 +96,6 @@ static inline unsigned class_of(uint64_t n) {
 }
 
 static inline uint64_t class_size(unsigned c) { return (uint64_t)16 << c; }
-
-/* Moves every remotely freed block onto this heap's own lists. A remote
- * block keeps its class in header word 0 and its list link in word 1. */
-static void drain_remote(Heap *h) {
-    uint64_t *b = (uint64_t *)atomic_exchange_explicit(&h->remote, NULL, memory_order_acquire);
-    while (b) {
-        uint64_t *next = (uint64_t *)(uintptr_t)b[1];
-        unsigned c = (unsigned)b[0];
-        FreeBlock *fb = (FreeBlock *)b;
-        fb->next = h->lists[c];
-        h->lists[c] = fb;
-        b = next;
-    }
-}
 
 static uint8_t *carve(Heap *h, uint64_t total) {
     if (h->cur == NULL || (uint64_t)(h->end - h->cur) < total) {
@@ -130,8 +122,9 @@ void *evx_malloc(uint64_t n) {
     }
     Heap *h = heap();
     unsigned c = class_of(n);
-    if (!h->lists[c] && atomic_load_explicit(&h->remote, memory_order_relaxed)) drain_remote(h);
     FreeBlock *b = h->lists[c];
+    if (!b && atomic_load_explicit(&h->remote[c], memory_order_relaxed))
+        b = atomic_exchange_explicit(&h->remote[c], NULL, memory_order_acquire);
     uint8_t *p;
     if (b) {
         h->lists[c] = b->next;
@@ -176,12 +169,13 @@ void evx_free(void *ptr) {
         owner->lists[c] = b;
         return;
     }
-    /* Remote free: word 0 keeps the class for the owner's drain, and the
-     * link goes in word 1 (the owner pointer, no longer needed). */
-    FreeBlock *head = atomic_load_explicit(&owner->remote, memory_order_relaxed);
+    /* Remote free: the class picks the owner's list, so the link can overwrite
+     * header word 0 exactly as a local free does. */
+    FreeBlock *b = (FreeBlock *)p;
+    FreeBlock *head = atomic_load_explicit(&owner->remote[c], memory_order_relaxed);
     do {
-        ((uint64_t *)p)[1] = (uint64_t)(uintptr_t)head;
-    } while (!atomic_compare_exchange_weak_explicit(&owner->remote, &head, (FreeBlock *)p,
+        b->next = head;
+    } while (!atomic_compare_exchange_weak_explicit(&owner->remote[c], &head, b,
                                                     memory_order_release, memory_order_relaxed));
 }
 

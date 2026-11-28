@@ -15,6 +15,11 @@ struct BlockAttempt {
   read_kind: *mut u64,
   read_n: u64,
   cb_read: u64,
+  // Fingerprints the worker computes for the light commit (see LightWrites):
+  // read_n read keys, then read_n storage-wipe keys (0 for account reads), then
+  // write_n written keys. Only valid for the worker's own attempt.
+  fps: *mut u64,
+  write_n: u64,
 }
 
 struct BlockConflict {
@@ -84,49 +89,112 @@ fn bx_result(b: *mut BlockExec, i: u64) -> *mut VxResult {
 
 // Each claimed transaction owns its result and read log. No shared arena
 // reservation, installation, validation, or retry happens on a worker.
-fn bx_execute(b: *mut BlockExec, c: *mut Ctx, i: u64, repair: bool) -> void {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+fn bx_execute(bx: &BlockExec, c: *mut Ctx, i: u64, repair: bool) -> void {
+  // Vx 0.0.5: a reference to c must not stay live across calls that take c.
   let env: *mut VxEnv = offset_mut(bx.envs, i as i64);
   ctx_reset(c, env);
+  // A repair may discover a coinbase read that speculation never took. It reads
+  // only cb_ov and mv_scratch, so it can run before mv and rs_on are set.
+  if repair { bx_coinbase_exact(bx, i, c); }
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  cx.mv = bx.base;
-  cx.rs_on = 1u64;
   if repair {
     cx.mv = bx.mv;
     cx.rs_on = 0u64;
-    // A repair may discover a coinbase read that speculation never took.
-    bx_coinbase_exact(b, i, c);
     cx.cb_ov_on = 1u64;
+  } else {
+    cx.mv = bx.base;
+    cx.rs_on = 1u64;
   }
   cx.txi = i;
   cx.tabs_shared = bx.tabs;
   let result: *mut VxResult = transact_with(c, env);
-  let a: &mut BlockAttempt = unsafe { &mut (bx.attempts)[i] };
+  let attempts: *mut BlockAttempt = bx.attempts;
+  let fees: *mut U256 = bx.fees;
+  let a: &mut BlockAttempt = unsafe { &mut attempts[i] };
   if !is_null_mut(a.result) {
     evmvx_result_free(a.result);
   }
   a.result = result;
-  a.cb_read = cx.cb_read;
-  unsafe { (bx.fees)[i] = (cx.coinbase_fee)[0u64]; }
+  let co: &mut Ctx = unsafe { &mut c[0u64] };
+  a.cb_read = co.cb_read;
+  unsafe { fees[i] = (co.coinbase_fee)[0u64]; }
   if !repair {
-    a.read_n = cx.rs_n;
-    a.read_a = calloc_words(cx.rs_n);
-    a.read_k = calloc_words(cx.rs_n);
-    a.read_kind = limbs_alloc(cx.rs_n);
+    let n: u64 = co.rs_n;
+    let rs_a: *mut U256 = co.rs_a;
+    let rs_k: *mut U256 = co.rs_k;
+    let rs_isacct: *mut u64 = co.rs_isacct;
+    a.read_n = n;
+    a.read_a = calloc_words(n);
+    a.read_k = calloc_words(n);
+    a.read_kind = limbs_alloc(n);
     let mut j: u64 = 0u64;
-    while j < cx.rs_n {
+    while j < n {
       unsafe {
-        (a.read_a)[j] = (cx.rs_a)[j];
-        (a.read_k)[j] = (cx.rs_k)[j];
-        (a.read_kind)[j] = (cx.rs_isacct)[j];
+        (a.read_a)[j] = rs_a[j];
+        (a.read_k)[j] = rs_k[j];
+        (a.read_kind)[j] = rs_isacct[j];
       }
       j = j + 1u64;
     }
+    // Hashing here keeps it off the single committing thread.
+    let rr: &VxResult = unsafe { &result[0u64] };
+    let fps: *mut u64 = limbs_alloc(2u64 * n + 2u64 * rr.account_count + rr.slot_count);
+    j = 0u64;
+    while j < n {
+      let addr: U256 = unsafe { rs_a[j] };
+      if (unsafe { rs_isacct[j] }) != 0u64 {
+        unsafe { fps[j] = lw_fp(LW_ACCOUNT, addr, u256_zero()); fps[n + j] = 0u64; }
+      } else {
+        unsafe { fps[j] = lw_fp(LW_SLOT, addr, rs_k[j]); fps[n + j] = lw_fp(LW_WIPED, addr, u256_zero()); }
+      }
+      j = j + 1u64;
+    }
+    a.write_n = bx_write_fps(result, offset_mut(fps, (2u64 * n) as i64));
+    a.fps = fps;
   }
 }
 
-pub fn evmvx_block_worker(b: *mut BlockExec) -> void {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+// Fingerprints of the keys result r writes, as bx_light_maybe_stale looks them up:
+// every touched account, every changed slot, and every account whose storage is
+// wiped. Writes at most 2 * account_count + slot_count values; returns the count.
+fn bx_write_fps(r: *mut VxResult, out: *mut u64) -> u64 {
+  let rr: &VxResult = unsafe { &r[0u64] };
+  let slots: *mut OutSlot = rr.slots;
+  let mut m: u64 = 0u64;
+  let mut ai: u64 = 0u64;
+  while ai < rr.account_count {
+    let ap: *mut OutAccount = offset_mut(rr.accounts, ai as i64);
+    let a: &OutAccount = unsafe { &ap[0u64] };
+    if (a.flags & ACC_TOUCHED) != 0u64 {
+      unsafe { out[m] = lw_fp(LW_ACCOUNT, a.address, u256_zero()); }
+      m = m + 1u64;
+      let dead: bool = bx_dead(a);
+      if dead || (a.flags & ACC_CREATED) != 0u64 {
+        unsafe { out[m] = lw_fp(LW_WIPED, a.address, u256_zero()); }
+        m = m + 1u64;
+      }
+      if !dead {
+        let mut si: u64 = a.slot_start;
+        while si < a.slot_start + a.slot_count {
+          let sl: &OutSlot = unsafe { &slots[si] };
+          if !u256_eq(sl.original, sl.present) {
+            unsafe { out[m] = lw_fp(LW_SLOT, a.address, sl.key); }
+            m = m + 1u64;
+          }
+          si = si + 1u64;
+        }
+      }
+    }
+    ai = ai + 1u64;
+  }
+  return m;
+}
+
+// Workers share the block read-only. Each writes only the attempt and fee it
+// claimed, through the pointer fields, and the atomic cursor and flags.
+unsafe impl Sync for BlockExec {}
+
+fn block_work(bx: &BlockExec) -> void {
   if bx.n == 0u64 {
     return;
   }
@@ -139,19 +207,54 @@ pub fn evmvx_block_worker(b: *mut BlockExec) -> void {
     if i >= bx.n {
       break;
     }
-    bx_execute(b, c, i, false);
+    bx_execute(bx, c, i, false);
     unsafe { evx_astore(offset_mut(bx.ready, i as i64), 1u64); }
   }
   ctx_free(c);
 }
 
+// One worker on the calling thread, for hosts that bring their own threads.
+pub fn evmvx_block_worker(b: *mut BlockExec) -> void {
+  block_work(unsafe { &b[0u64] });
+}
+
+// Runs the block on `workers` Vx tasks, then validates and commits it in order.
+// Returns what evmvx_block_finish returns.
+pub fn evmvx_block_run(b: *mut BlockExec, workers: u64) -> u64 {
+  let n: u64 = unsafe { b[0u64].n };
+  // No workers, an empty block, or a block already finished or cancelled: finish
+  // decides, as it does after host-driven workers.
+  if workers == 0u64 || n == 0u64 || (unsafe { b[0u64].finished }) != 0u64
+     || (unsafe { evx_aload(b[0u64].aborted) }) != 0u64 {
+    return evmvx_block_finish(b);
+  }
+  let bx: &BlockExec = unsafe { &b[0u64] };
+  // This thread commits tx i as soon as a worker publishes it, so the ordered
+  // commit overlaps execution instead of following it. Workers never read the
+  // fields the commit writes (mv, conflicts, counters, fold_from, pending_fees,
+  // finished), and a repair rewrites attempt i only after its worker is done.
+  let committed: bool = tasks {
+    for _w in 0..workers {
+      spawn {
+        block_work(bx);
+      };
+    }
+    bx_commit(b, true)
+  };
+  if !committed {
+    return 0u64;
+  }
+  return bx_publish(b);
+}
+
 // Every optimistic read saw the base. A final earlier semantic write makes
 // that attempt stale. Only the finalizer accesses the prefix maps.
 fn bx_validate(b: *mut BlockExec, i: u64, tmp: *mut MvEntry) -> bool {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
-  let a: &mut BlockAttempt = unsafe { &mut (bx.attempts)[i] };
+  let attempts: *mut BlockAttempt = unsafe { b[0u64].attempts };
+  let conflicts: *mut BlockConflict = unsafe { b[0u64].conflicts };
+  let a: &mut BlockAttempt = unsafe { &mut attempts[i] };
   if a.cb_read != 0u64 {
-    unsafe { (bx.conflicts)[i] = BlockConflict { address: bx_coinbase(b), key: u256_zero(),
+    unsafe { conflicts[i] = BlockConflict { address: bx_coinbase(unsafe { &b[0u64] }), key: u256_zero(),
         kind: 3u64, expected: MAP_NONE, observed: i, reason: 8u64 }; }
     return false;
   }
@@ -160,7 +263,7 @@ fn bx_validate(b: *mut BlockExec, i: u64, tmp: *mut MvEntry) -> bool {
     let addr: U256 = unsafe { (a.read_a)[j] };
     let key: U256 = unsafe { (a.read_k)[j] };
     let acct: bool = (unsafe { (a.read_kind)[j] }) != 0u64;
-    if mv_read(bx.mv, acct, addr, key, i, tmp) == MVR_HIT {
+    if mv_read(unsafe { b[0u64].mv }, acct, addr, key, i, tmp) == MVR_HIT {
       let e: &mut MvEntry = unsafe { &mut tmp[0u64] };
       let mut kind: u64 = 2u64;
       let mut reason: u64 = 2u64;
@@ -170,7 +273,7 @@ fn bx_validate(b: *mut BlockExec, i: u64, tmp: *mut MvEntry) -> bool {
       if (e.flags & MV_RESET) != 0u64 {
         reason = 4u64;
       }
-      unsafe { (bx.conflicts)[i] = BlockConflict { address: addr, key: key,
+      unsafe { conflicts[i] = BlockConflict { address: addr, key: key,
           kind: kind, expected: MAP_NONE, observed: e.txi, reason: reason }; }
       return false;
     }
@@ -200,8 +303,16 @@ fn bx_account_changed(b: *mut BlockExec, i: u64, a: *mut OutAccount, tmp: *mut M
   return !u256_eq(h.balance, oa.balance) || h.nonce != oa.nonce || !u256_eq(h.code_hash, oa.code_hash) || h.code_len != oa.code_len;
 }
 
+// A touched account ends dead when it self-destructed, or (not created by this
+// transaction) has no nonce, balance or code. bx_install and bx_light_record must
+// agree on this, so both call it.
+fn bx_dead(a: &OutAccount) -> bool {
+  let empty_code: bool = u256_eq(a.code_hash, keccak_empty()) || u256_is_zero(a.code_hash);
+  return (a.flags & ACC_SELFDESTRUCTED) != 0u64 || ((a.flags & ACC_CREATED) == 0u64 && a.nonce == 0u64 && u256_is_zero(a.balance) && empty_code);
+}
+
 fn bx_install(b: *mut BlockExec, c: *mut Ctx, i: u64) -> void {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+  let mv: *mut MvMem = unsafe { b[0u64].mv };
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
   let r: *mut VxResult = bx_result(b, i);
   let rr: &mut VxResult = unsafe { &mut r[0u64] };
@@ -209,12 +320,13 @@ fn bx_install(b: *mut BlockExec, c: *mut Ctx, i: u64) -> void {
   let mut ai: u64 = 0u64;
   while ai < rr.account_count {
     let ap: *mut OutAccount = offset_mut(rr.accounts, ai as i64);
-    let a: &mut OutAccount = unsafe { &mut ap[0u64] };
-    if (a.flags & ACC_TOUCHED) != 0u64 {
-      let empty_code: bool = u256_eq(a.code_hash, keccak_empty()) || u256_is_zero(a.code_hash);
-      let dead: bool = (a.flags & ACC_SELFDESTRUCTED) != 0u64 || ((a.flags & ACC_CREATED) == 0u64 && a.nonce == 0u64 && u256_is_zero(a.balance) && empty_code);
-      let reset: bool = dead || (a.flags & ACC_CREATED) != 0u64;
-      if reset || bx_account_changed(b, i, ap, ent, cx.hacc) {
+    let a0: &mut OutAccount = unsafe { &mut ap[0u64] };
+    if (a0.flags & ACC_TOUCHED) != 0u64 {
+      let dead: bool = bx_dead(a0);
+      let reset: bool = dead || (a0.flags & ACC_CREATED) != 0u64;
+      let changed: bool = reset || bx_account_changed(b, i, ap, ent, cx.hacc);
+      let a: &mut OutAccount = unsafe { &mut ap[0u64] };
+      if changed {
         let mut flags: u64 = MV_ACCOUNT;
         if dead {
           flags = flags | MV_DELETED;
@@ -225,7 +337,7 @@ fn bx_install(b: *mut BlockExec, c: *mut Ctx, i: u64) -> void {
         unsafe { ent[0u64] = MvEntry { txi: i, incarnation: 0u64,
             balance: a.balance, val: u256_zero(), nonce: a.nonce, code_hash: a.code_hash,
             code: a.code, code_len: a.code_len, flags: flags }; }
-        mv_write(bx.mv, true, a.address, u256_zero(), ent);
+        mv_write(mv, true, a.address, u256_zero(), ent);
       }
       if !dead {
         let mut si: u64 = a.slot_start;
@@ -235,7 +347,7 @@ fn bx_install(b: *mut BlockExec, c: *mut Ctx, i: u64) -> void {
             unsafe { ent[0u64] = MvEntry { txi: i, incarnation: 0u64,
                 balance: u256_zero(), val: sl.present, nonce: 0u64, code_hash: u256_zero(),
                 code: null_u8(), code_len: 0u64, flags: 0u64 }; }
-            mv_write(bx.mv, false, a.address, sl.key, ent);
+            mv_write(mv, false, a.address, sl.key, ent);
           }
           si = si + 1u64;
         }
@@ -245,19 +357,18 @@ fn bx_install(b: *mut BlockExec, c: *mut Ctx, i: u64) -> void {
   }
 }
 
-fn bx_coinbase(b: *mut BlockExec) -> U256 {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
-  let e0: &mut VxEnv = unsafe { &mut (bx.envs)[0u64] };
+fn bx_coinbase(bx: &BlockExec) -> U256 {
+  let envs: *mut VxEnv = bx.envs;
+  let e0: &VxEnv = unsafe { &envs[0u64] };
   return e0.coinbase;
 }
 
 // Fills the committer Ctx's coinbase override for tx k: the latest committed
 // explicit coinbase state (a versioned write below k, or the StateDb) plus
 // every fee not yet folded into a coinbase write (txs fold_from .. k-1).
-fn bx_coinbase_exact(b: *mut BlockExec, k: u64, c: *mut Ctx) -> void {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
+fn bx_coinbase_exact(bx: &BlockExec, k: u64, c: *mut Ctx) -> void {
   let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  let cb: U256 = bx_coinbase(b);
+  let cb: U256 = bx_coinbase(bx);
   let ov: *mut HostAccount = cx.cb_ov;
   let r: u64 = mv_read(bx.mv, true, cb, u256_zero(), k, cx.mv_scratch);
   let mut exists: bool = false;
@@ -269,8 +380,10 @@ fn bx_coinbase_exact(b: *mut BlockExec, k: u64, c: *mut Ctx) -> void {
   } else {
     exists = db_account(bx.db, cb, ov) == HOST_OK;
   }
-  let fees: U256 = unsafe { (bx.pending_fees)[0u64] };
-  let e0: &mut VxEnv = unsafe { &mut (bx.envs)[0u64] };
+  let pending: *mut U256 = bx.pending_fees;
+  let fees: U256 = unsafe { pending[0u64] };
+  let envs: *mut VxEnv = bx.envs;
+  let e0: &mut VxEnv = unsafe { &mut envs[0u64] };
   let eip161: bool = e0.spec >= SPEC_SPURIOUS_DRAGON;
   if !exists {
     unsafe { ov[0u64] = HostAccount { balance: u256_zero(), nonce: 0u64, code_hash: keccak_empty(),
@@ -287,6 +400,133 @@ fn bx_coinbase_exact(b: *mut BlockExec, k: u64, c: *mut Ctx) -> void {
   if exists {
     cx.cb_ov_exists = 1u64;
   }
+}
+
+// Keys that earlier transactions may have written, kept while no read can be
+// stale: a superset of what bx_install puts in mv, matching mv_read's two kinds of
+// hit. It holds every touched account (bx_install skips unchanged ones), every
+// changed slot, and every account whose storage is wiped. It keeps only 64-bit
+// fingerprints: a collision can only make a read look stale, and a stale-looking
+// read just switches to the exact path.
+struct LightWrites { fps: *mut u64, cap: u64, len: u64 }
+
+const LW_ACCOUNT: u64 = 1u64;
+const LW_SLOT: u64 = 2u64;
+const LW_WIPED: u64 = 3u64;
+
+fn lw_new(n: u64) -> *mut LightWrites {
+  let mut cap: u64 = 64u64;
+  while cap < n * 4u64 {
+    cap = cap * 2u64;
+  }
+  let raw: *mut i8 = unsafe { vx_calloc(1u64, sizeof<LightWrites>() as u64) };
+  let lw: *mut LightWrites = raw;
+  unsafe { lw[0u64].fps = limbs_alloc(cap); lw[0u64].cap = cap; }
+  return lw;
+}
+
+fn lw_free(lw: *mut LightWrites) -> void {
+  let f: *mut i8 = unsafe { lw[0u64].fps };
+  let raw: *mut i8 = lw;
+  unsafe { vx_free(f); vx_free(raw); }
+}
+
+// Never 0, which marks an empty slot. map_hash folds limbs with xor, so structured
+// keys collide (with these addresses, caller i and recipient i ^ 848); a fingerprint
+// mixes every limb instead.
+fn lw_fp(tag: u64, a: U256, b: U256) -> u64 {
+  let mut h: u64 = mix64(tag ^ a.l0);
+  h = mix64(h ^ a.l1);
+  h = mix64(h ^ a.l2);
+  h = mix64(h ^ a.l3);
+  h = mix64(h ^ b.l0);
+  h = mix64(h ^ b.l1);
+  h = mix64(h ^ b.l2);
+  h = mix64(h ^ b.l3);
+  if h == 0u64 {
+    return 1u64;
+  }
+  return h;
+}
+
+// The slot holding fp, or the empty slot where it would go.
+fn lw_probe(fps: *mut u64, cap: u64, fp: u64) -> u64 {
+  let mask: u64 = cap - 1u64;
+  let mut i: u64 = fp & mask;
+  loop {
+    let v: u64 = unsafe { fps[i] };
+    if v == 0u64 || v == fp {
+      return i;
+    }
+    i = (i + 1u64) & mask;
+  }
+  return i;
+}
+
+fn lw_add(lw: *mut LightWrites, fp: u64) -> void {
+  let cap: u64 = unsafe { lw[0u64].cap };
+  if (unsafe { lw[0u64].len } + 1u64) * 2u64 > cap {
+    let old: *mut u64 = unsafe { lw[0u64].fps };
+    let nc: u64 = cap * 2u64;
+    let fresh: *mut u64 = limbs_alloc(nc);
+    let mut i: u64 = 0u64;
+    while i < cap {
+      let v: u64 = unsafe { old[i] };
+      if v != 0u64 {
+        unsafe { fresh[lw_probe(fresh, nc, v)] = v; }
+      }
+      i = i + 1u64;
+    }
+    let f: *mut i8 = old;
+    unsafe { vx_free(f); lw[0u64].fps = fresh; lw[0u64].cap = nc; }
+  }
+  let fps: *mut u64 = unsafe { lw[0u64].fps };
+  let k: u64 = lw_probe(fps, unsafe { lw[0u64].cap }, fp);
+  if (unsafe { fps[k] }) == 0u64 {
+    unsafe { fps[k] = fp; lw[0u64].len = lw[0u64].len + 1u64; }
+  }
+}
+
+fn lw_has(lw: *mut LightWrites, fp: u64) -> bool {
+  let fps: *mut u64 = unsafe { lw[0u64].fps };
+  return (unsafe { fps[lw_probe(fps, lw[0u64].cap, fp)] }) != 0u64;
+}
+
+// The light commit only runs while no tx so far was repaired, so attempt i is
+// still its worker's, and its fingerprints are valid.
+fn bx_light_record(b: *mut BlockExec, i: u64, lw: *mut LightWrites) -> void {
+  let attempts: *mut BlockAttempt = unsafe { b[0u64].attempts };
+  let a: &BlockAttempt = unsafe { &attempts[i] };
+  let w: *mut u64 = offset_mut(a.fps, (2u64 * a.read_n) as i64);
+  let mut k: u64 = 0u64;
+  while k < a.write_n {
+    lw_add(lw, unsafe { w[k] });
+    k = k + 1u64;
+  }
+}
+
+// False only when no read of tx i, and no coinbase read, can hit in mv once txs
+// 0..i-1 are installed: then bx_validate(i) would return true.
+fn bx_light_maybe_stale(b: *mut BlockExec, i: u64, lw: *mut LightWrites) -> bool {
+  let attempts: *mut BlockAttempt = unsafe { b[0u64].attempts };
+  let a: &BlockAttempt = unsafe { &attempts[i] };
+  if a.cb_read != 0u64 {
+    return true;
+  }
+  let n: u64 = a.read_n;
+  let fps: *mut u64 = a.fps;
+  let mut j: u64 = 0u64;
+  while j < n {
+    if lw_has(lw, unsafe { fps[j] }) {
+      return true;
+    }
+    let wiped: u64 = unsafe { fps[n + j] };
+    if wiped != 0u64 && lw_has(lw, wiped) {
+      return true;
+    }
+    j = j + 1u64;
+  }
+  return false;
 }
 
 // Whether tx k's result writes account a (it is in the result, touched).
@@ -309,66 +549,126 @@ fn bx_result_writes(b: *mut BlockExec, k: u64, a: U256) -> bool {
 // The caller must join every worker first. Validate the entire block before
 // publishing anything. Repeated finish is idempotent; incomplete work aborts.
 pub fn evmvx_block_finish(b: *mut BlockExec) -> u64 {
-  let bx: &mut BlockExec = unsafe { &mut b[0u64] };
-  if bx.finished == 1u64 {
-    return bx.n;
+  // bx_execute, bx_install and evmvx_block_cancel all write b, so no `&mut` to it
+  // may live across them. These pointer fields never change after evmvx_block_new.
+  let n: u64 = unsafe { b[0u64].n };
+  let finished: u64 = unsafe { b[0u64].finished };
+  if finished == 1u64 {
+    return n;
   }
-  if bx.finished == 2u64 || (unsafe { evx_aload(bx.aborted) }) != 0u64 {
+  if finished == 2u64 || (unsafe { evx_aload(b[0u64].aborted) }) != 0u64 {
     return 0u64;
   }
+  let ready: *mut u64 = unsafe { b[0u64].ready };
   let mut i: u64 = 0u64;
-  while i < bx.n {
-    if (unsafe { evx_aload(offset_mut(bx.ready, i as i64)) }) == 0u64 {
+  while i < n {
+    if (unsafe { evx_aload(offset_mut(ready, i as i64)) }) == 0u64 {
       evmvx_block_cancel(b);
-      bx.finished = 2u64;
+      unsafe { b[0u64].finished = 2u64; }
       return 0u64;
     }
     i = i + 1u64;
   }
-  if bx.n == 0u64 {
-    bx.finished = 1u64; return 0u64;
+  if n == 0u64 {
+    unsafe { b[0u64].finished = 1u64; } return 0u64;
   }
-  let c: *mut Ctx = ctx_new_db(bx.db, bx.envs);
-  let cx: &mut Ctx = unsafe { &mut c[0u64] };
-  i = 0u64;
-  while i < bx.n {
-    if !bx_validate(b, i, cx.mv_scratch) {
-      bx_execute(b, c, i, true);
-      bx.reexecs = bx.reexecs + 1u64;
-      let a: &mut BlockAttempt = unsafe { &mut (bx.attempts)[i] };
+  if !bx_commit(b, false) {
+    return 0u64;
+  }
+  return bx_publish(b);
+}
+
+// Validates, repairs and records txs 0..n-1 in order. With stream, each tx is
+// taken as soon as a worker publishes it, while later txs still run; otherwise
+// every tx must already be ready. False when the block is abandoned.
+fn bx_commit(b: *mut BlockExec, stream: bool) -> bool {
+  let n: u64 = unsafe { b[0u64].n };
+  let ready: *mut u64 = unsafe { b[0u64].ready };
+  let aborted: *mut u64 = unsafe { b[0u64].aborted };
+  let db: *mut StateDb = unsafe { b[0u64].db };
+  let attempts: *mut BlockAttempt = unsafe { b[0u64].attempts };
+  let fees: *mut U256 = unsafe { b[0u64].fees };
+  let pending: *mut U256 = unsafe { b[0u64].pending_fees };
+  let c: *mut Ctx = ctx_new_db(db, unsafe { b[0u64].envs });
+  let scratch: *mut MvEntry = unsafe { c[0u64].mv_scratch };
+  // While light, mv stays empty and lw holds every write so far. The first read
+  // that lw cannot rule out installs txs 0..i-1 into mv, and the block then
+  // finishes exactly as before. A conflict-free block never builds mv.
+  let lw: *mut LightWrites = lw_new(n);
+  let mut light: bool = true;
+  let mut i: u64 = 0u64;
+  while i < n {
+    if stream {
+      // The release store of ready[i] publishes the attempt and fee of tx i.
+      while (unsafe { evx_aload(offset_mut(ready, i as i64)) }) == 0u64 {
+        if (unsafe { evx_aload(aborted) }) != 0u64 {
+          unsafe { b[0u64].finished = 2u64; }
+          ctx_free(c);
+          lw_free(lw);
+          return false;
+        }
+      }
+    }
+    if light && bx_light_maybe_stale(b, i, lw) {
+      let mut j: u64 = 0u64;
+      while j < i {
+        bx_install(b, c, j);
+        j = j + 1u64;
+      }
+      light = false;
+    }
+    if !light && !bx_validate(b, i, scratch) {
+      bx_execute(unsafe { &b[0u64] }, c, i, true);
+      unsafe { b[0u64].reexecs = b[0u64].reexecs + 1u64; }
+      let a: &mut BlockAttempt = unsafe { &mut attempts[i] };
       if a.cb_read != 0u64 {
-        bx.cb_txs = bx.cb_txs + 1u64;
+        unsafe { b[0u64].cb_txs = b[0u64].cb_txs + 1u64; }
       }
     }
     let result: *mut VxResult = bx_result(b, i);
     let r: &mut VxResult = unsafe { &mut result[0u64] };
     if r.status == RES_HOST_FAILURE || r.status == RES_INVALID_TX {
       evmvx_block_cancel(b);
-      bx.finished = 2u64;
+      unsafe { b[0u64].finished = 2u64; }
       ctx_free(c);
-      return 0u64;
+      lw_free(lw);
+      return false;
     }
-    bx_install(b, c, i);
-    if bx_result_writes(b, i, bx_coinbase(b)) {
-      bx.fold_from = i;
-      unsafe { (bx.pending_fees)[0u64] = u256_zero(); }
+    if light {
+      bx_light_record(b, i, lw);
+    } else {
+      bx_install(b, c, i);
+    }
+    if bx_result_writes(b, i, bx_coinbase(unsafe { &b[0u64] })) {
+      unsafe { b[0u64].fold_from = i; }
+      unsafe { pending[0u64] = u256_zero(); }
     }
     unsafe {
-      (bx.pending_fees)[0u64] = u256_add((bx.pending_fees)[0u64], (bx.fees)[i]);
+      pending[0u64] = u256_add(pending[0u64], fees[i]);
     }
     i = i + 1u64;
   }
   ctx_free(c);
-  // All attempt data stays alive until publication and block_free.
-  i = 0u64;
-  while i < bx.n {
-    db_apply(bx.db, bx_result(b, i));
+  lw_free(lw);
+  return true;
+}
+
+// Applies a committed block to the StateDb. All attempt data stays alive until
+// publication and block_free.
+fn bx_publish(b: *mut BlockExec) -> u64 {
+  let n: u64 = unsafe { b[0u64].n };
+  let db: *mut StateDb = unsafe { b[0u64].db };
+  let pending: *mut U256 = unsafe { b[0u64].pending_fees };
+  let mut i: u64 = 0u64;
+  while i < n {
+    db_apply(db, bx_result(b, i));
     i = i + 1u64;
   }
-  let e: &mut VxEnv = unsafe { &mut (bx.envs)[0u64] };
-  db_balance_incr(bx.db, e.coinbase, unsafe { (bx.pending_fees)[0u64] }, e.spec >= SPEC_SPURIOUS_DRAGON);
-  bx.finished = 1u64;
-  return bx.n;
+  let envs: *mut VxEnv = unsafe { b[0u64].envs };
+  let e: &mut VxEnv = unsafe { &mut envs[0u64] };
+  db_balance_incr(db, e.coinbase, unsafe { pending[0u64] }, e.spec >= SPEC_SPURIOUS_DRAGON);
+  unsafe { b[0u64].finished = 1u64; }
+  return n;
 }
 
 pub fn evmvx_block_cancel(b: *mut BlockExec) -> void {
@@ -431,6 +731,7 @@ pub fn evmvx_block_free(b: *mut BlockExec) -> void {
     free_words(a.read_a);
     free_words(a.read_k);
     limbs_free(a.read_kind);
+    limbs_free(a.fps);
     i = i + 1u64;
   }
   mv_free(bx.base);
@@ -441,8 +742,8 @@ pub fn evmvx_block_free(b: *mut BlockExec) -> void {
   limbs_free(bx.aborted);
   free_words(bx.fees);
   free_words(bx.pending_fees);
-  let a: *mut i8 = bx.attempts;
-  let cf: *mut i8 = bx.conflicts;
+  let a: *mut i8 = unsafe { b[0u64].attempts };
+  let cf: *mut i8 = unsafe { b[0u64].conflicts };
   let raw: *mut i8 = b;
   unsafe { vx_free(a); vx_free(cf); vx_free(raw); }
 }
