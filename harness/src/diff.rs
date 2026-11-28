@@ -204,7 +204,11 @@ pub fn check_state(db: &State<revm::database::EmptyDB>, post: &Host) -> Result<(
     let mut expected = Host::default();
     for (a, acc) in db.cache.trie_account() {
         let hash = if acc.info.code_hash == B256::ZERO { KECCAK_EMPTY } else { acc.info.code_hash };
-        let code = db.cache.contracts.get(&hash).map(|b| b.original_bytes()).unwrap_or_default();
+        // CacheState records code in `contracts` only for created accounts; an EIP-7702
+        // authority keeps its new delegation code in `info.code` alone.
+        let code = acc.info.code.as_ref().filter(|b| !b.is_empty())
+            .or_else(|| db.cache.contracts.get(&hash))
+            .map(|b| b.original_bytes()).unwrap_or_default();
         expected.insert(a, acc.info.balance, acc.info.nonce, code,
             acc.storage.iter().map(|(k, v)| (*k, *v)).collect());
     }
